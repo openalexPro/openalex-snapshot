@@ -1,0 +1,22 @@
+site_name: openalex-convert
+theme:
+  name: material
+nav:
+  - Home: README.md
+  - Quickstart: quickstart.md
+  - Commands:
+      - convert: commands/convert.md
+      - verify: commands/verify.md
+      - schema: commands/schema.md
+      - index: commands/index.md
+      - repair: commands/repair.md
+      - download: commands/download.md
+      - verify_download: commands/verify_download.md
+      - skills: commands/skills.md
+      - check: commands/check.md
+  - Operations:
+      - Low memory: operations/low-memory.md
+      - Cache precompute: operations/cache-precompute.md
+      - Recovery: operations/recovery.md
+  - Troubleshooting: troubleshooting.md
+  - Separate repo migration: migration-to-separate-repo.md

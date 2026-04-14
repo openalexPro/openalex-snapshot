@@ -1,0 +1,9180 @@
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{Local, TimeZone};
+use clap::{Parser, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::io::stdout;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use walkdir::WalkDir;
+
+const CLI_LONG_ABOUT: &str = "\
+Standalone OpenAlex snapshot tooling.
+
+This binary provides:
+- config: create or verify YAML configuration
+- all: run full config-driven pipeline
+- download: sync OpenAlex snapshot from S3-compatible source (AWS CLI wrapper)
+- verify_download: strict integrity validation for downloaded snapshot
+- convert: snapshot .json.gz -> parquet
+- verify_convert: structural and file-level data checks between snapshot and parquet
+- schema: inspect schema from source/cache/parquet, including arrow-r JSON
+- verify_schema: assert schema parity across schema sources
+- index: build *_id_idx.parquet lookup index (R build_corpus_index equivalent)
+- verify_index: validate index integrity and coverage
+- repair_convert: re-convert files that failed prior verify runs
+- report: view stored reports
+- prune-reports: remove old report files
+- progress: monitor live status from reports/logs
+- skills: create AI skills starter pack under root_dir/skills
+- check: run dependency/path/disk/memory preflight checks
+
+convert (detailed):
+  - reads <snapshot_dir>/data/<dataset>/**/*.gz
+  - writes <parquet_dir>/<dataset>/... with preserved relative structure
+  - infers unified dataset schema and uses cache
+  - optional post-conversion verify
+
+verify_convert (detailed):
+  - checks .gz -> .parquet mapping and folder structure parity
+  - checks per-file row count parity
+
+schema (detailed):
+  - supports sources: auto|source|cache|parquet
+  - supports formats: table|json|yaml|arrow-r
+  - supports source-vs-source diff via --diff-with
+
+verify_schema (detailed):
+  - compares schema sources and exits non-zero on differences
+  - default comparison: source vs parquet
+
+index (detailed):
+  - stage 1: per-file shard index build (resumable)
+  - stage 2: shard combine into *_id_idx.parquet
+  - outputs columns: id, id_block, parquet_file, file_row_number
+
+repair_convert (detailed):
+  - reads a verify report JSON
+  - selects file-level verify failures (phase=verify_metrics)
+  - deletes failed parquet files and re-converts only those files
+  - runs targeted re-verify for repaired files
+
+download/verify_download (detailed):
+  - default sync command:
+    aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+  - disk preflight:
+    required free space = remote manifest size + 10%
+  - strict validation compares remote manifest vs local files
+  - validates file presence, size parity, and gzip integrity for .json.gz
+
+Examples:
+  openalex-snapshot convert --root-dir /data --dataset works
+  openalex-snapshot verify_convert --root-dir /data --dataset works --scope dataset --metadata-level both
+  openalex-snapshot schema --root-dir /data --dataset works --format arrow-r
+  openalex-snapshot verify_schema --root-dir /data --dataset works
+  openalex-snapshot index --root-dir /data --dataset works --profile balanced
+  openalex-snapshot verify_index --root-dir /data --dataset works
+  openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  openalex-snapshot report --root-dir /data --latest
+  openalex-snapshot prune-reports --root-dir /data
+  openalex-snapshot skills --root-dir /data
+  openalex-snapshot check --root-dir /data --dataset all
+  openalex-snapshot download --root-dir /data
+  openalex-snapshot verify_download --root-dir /data
+  openalex-snapshot convert --root-dir /data --dataset all
+  openalex-snapshot verify_convert --root-dir /data --dataset all --scope snapshot
+  openalex-snapshot progress --root-dir /data
+  openalex-snapshot config --create complete
+  openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
+";
+
+const REPAIR_LONG_ABOUT: &str = "\
+Repair parquet outputs based on verify report failures.
+
+Behavior:
+1) Reads a verify report JSON from --from-verify-report
+2) Selects actionable file failures with phase=verify_metrics
+3) Deletes mapped parquet output files (if present)
+4) Re-converts only selected source .gz files to parquet
+5) Re-verifies repaired files and records outcome
+
+Selection rules:
+  - only failures with phase=verify_metrics are eligible
+  - requires actionable source/output paths (or resolvable rel_path)
+  - deduplicates by output parquet file path
+  - optional --dataset filter limits selected repairs
+
+Output:
+  - shared run report schema written to:
+    <root>/.openalex-snapshot_metadata/reports/repair_convert-<timestamp>.json
+    <root>/.openalex-snapshot_metadata/datasets/<dataset>/reports/repair_convert-<timestamp>.json
+  - non-zero exit if any repair/delete/re-verify failures remain
+";
+
+const DOWNLOAD_LONG_ABOUT: &str = "\
+Download OpenAlex snapshot via AWS CLI sync and run strict validation.
+
+Defaults (zero-config):
+  aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+  dataset scope: all
+  auto-validate: enabled
+  disk preflight: remote manifest size + 10% free space required
+
+Optional overrides:
+  --root-dir, --s3-uri, --endpoint-url, --region, --profile, --aws-bin
+  --signed/--no-sign-request
+  --delete/--no-delete
+  --dataset <name|all>
+  --skip-validate
+";
+
+const VALIDATE_DOWNLOAD_LONG_ABOUT: &str = "\
+Strictly validate downloaded snapshot integrity.
+
+Validation checks:
+  - remote manifest fetch via aws s3api list-objects-v2
+  - missing local files
+  - local size mismatch
+  - unexpected local files under validated scope
+  - gzip integrity check for every .json.gz
+
+Defaults:
+  root_dir: .
+  s3_uri: s3://openalex
+  dataset: all
+  no-sign-request: true
+";
+
+const VERIFY_INDEX_LONG_ABOUT: &str = "\
+Verify index integrity for a parquet corpus index file.
+
+Checks:
+  - index parquet exists and is readable
+  - required columns exist: id, id_block, parquet_file, file_row_number
+  - index row count matches total rows across corpus parquet files
+  - parquet_file references in index resolve to existing files
+";
+
+const CONFIG_LONG_ABOUT: &str = "\
+Manage openalex-snapshot YAML configuration.
+
+Modes:
+  --create <simple|complete|expert>  Generate annotated config template
+  --verify  Validate an existing config file strictly
+
+Defaults:
+  config path: ./openalex-snapshot.yaml
+";
+
+const CONVERT_MIN_FREE_BYTES: u64 = 900u64 * 1024u64 * 1024u64 * 1024u64;
+
+const REPORT_LONG_ABOUT: &str = "\
+View stored report files from parquet and/or download metadata roots.
+
+By default this lists report summaries. Use --full to print JSON payloads.
+Use --latest to show only newest report per command type.
+";
+
+const PRUNE_REPORTS_LONG_ABOUT: &str = "\
+Prune old report files and keep only newest reports per command type.
+
+Defaults:
+  keep_per_command: 1
+  source: all (parquet + download report roots)
+";
+
+const PROGRESS_LONG_ABOUT: &str = "\
+Monitor run progress from report and log files.
+
+Behavior:
+  - selects latest active run (unfinished report) by default
+  - falls back to newest run with fresh logs in the last 5 minutes
+  - shows totals, per-dataset summary, and latest log lines
+
+Defaults:
+  watch: true
+  interval_sec: 2
+";
+
+const SKILLS_LONG_ABOUT: &str = "\
+Bootstrap AI skills scaffolding for this project.
+
+Behavior:
+  - creates <root_dir>/skills
+  - writes command-focused starter skill files
+  - default safe mode: create missing files only
+  - use --overwrite to rewrite generated files
+";
+
+const CHECK_LONG_ABOUT: &str = "\
+Run environment and capacity preflight checks.
+
+Checks:
+  - required binaries (duckdb, aws)
+  - root/snapshot/parquet/metadata path writability
+  - download disk estimate from remote manifest (+10%)
+  - convert disk estimate from source inventory (precise)
+  - tuning/memory risk hints from profile/workers/memory
+
+Exit behavior:
+  - default: warn-only (non-zero only on hard failures)
+  - --strict: non-zero on warnings and failures
+";
+
+const ALL_LONG_ABOUT: &str = "\
+Run the end-to-end pipeline from config.
+
+Behavior:
+  - Requires explicit --config (no auto-discovery fallback)
+  - Runs enabled stages from config in pipeline order
+  - Applies bounded verify/repair loop controlled by --retry
+
+Default stage order:
+  1) download
+  2) verify_download
+  3) convert
+  4) verify_convert
+  5) repair_convert (loop action)
+  6) index
+  7) verify_index
+";
+
+const INDEX_LONG_ABOUT: &str = "\
+Build a parquet lookup index for a parquet dataset corpus.
+
+Behavior matches the R build_corpus_index() approach:
+1) Stage 1 creates per-file shard indexes in <index_file>_tmp/
+2) Stage 2 combines shards into a single <dataset>_id_idx.parquet
+
+Index columns:
+  id, id_block, parquet_file, file_row_number
+
+Defaults:
+  corpus path: <root_dir>/parquet/<dataset>
+  index path: <root_dir>/parquet/<dataset>_id_idx.parquet
+  existing index: skip (use --overwrite to rebuild)
+";
+
+const CONVERT_LONG_ABOUT: &str = "\
+Convert OpenAlex snapshot JSON.GZ files into parquet files.
+
+Behavior:
+1) Discovers source files under <root_dir>/openalex-snapshot/data/<dataset>/**/*.gz
+2) Infers a unified schema per dataset (with cache + optional refresh)
+3) Converts each source file to one parquet file
+4) Preserves dataset-relative folder/file structure in output
+5) Optionally runs verify step unless --skip-verify is set
+
+Output:
+  parquet root: <root_dir>/parquet
+  dataset path: <root_dir>/parquet/<dataset>/...
+  mapping: every input .gz maps to exactly one output .parquet
+  optional: limit conversion to selected files via --input-file
+
+Defaults:
+  profile: balanced
+  verify scope: dataset
+  verification enabled unless --skip-verify is set
+  memory: auto-detected from system RAM unless --max-memory-mb is provided
+  disk preflight: requires at least 900 GiB free at <root_dir>/parquet
+
+Tuning:
+  profile, workers, and max-memory-mb share semantics with index
+";
+
+const VERIFY_LONG_ABOUT: &str = "\
+Verify snapshot/parquet consistency.
+
+Checks include:
+1) Structure parity:
+   - .gz -> .parquet mapping exists for all expected files
+   - relative folder structure is preserved
+   - no unexpected extra parquet files for selected dataset(s)
+2) Per-file data parity:
+   - row count in each input .gz equals row count in mapped .parquet
+Defaults:
+  seed: 42
+
+Scope:
+  - file: sampled file-pair row-count checks
+  - dataset: full structure + full file-pair row-count
+  - snapshot: same as dataset, intended for --dataset all
+";
+
+const VERIFY_SCHEMA_LONG_ABOUT: &str = "\
+Verify schema parity across schema sources.
+
+Behavior:
+  - loads left schema from --from
+  - loads right schema from --diff-with
+  - reports added/removed/changed fields
+  - exits non-zero when any difference exists
+
+Defaults:
+  from: source
+  diff-with: parquet
+";
+
+const SCHEMA_LONG_ABOUT: &str = "\
+Inspect and compare schemas.
+
+Sources:
+  source: infer from snapshot JSON.GZ
+  cache: read cached source schema
+  parquet: infer from parquet files
+  auto: source > cache > parquet
+
+Formats:
+  table: human-readable overview
+  json: machine-readable schema document
+  yaml: machine-readable YAML representation
+  arrow-r: stable JSON shape for R Arrow comparisons
+
+Comparison:
+  use --diff-with <source> to compare schema variants
+  output reports added/removed fields and changed types
+
+Defaults:
+  from: auto
+  format: table
+  output: stdout
+
+Cache contract:
+  canonical cache artifact is .<dataset>_metadata/schemata/unified_schema.csv
+  source_schema.json is optional derived metadata and is not authoritative
+";
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "openalex-snapshot")]
+#[command(about = "Standalone OpenAlex snapshot conversion and validation tool")]
+#[command(long_about = CLI_LONG_ABOUT)]
+#[command(version)]
+struct Cli {
+    #[arg(long)]
+    #[arg(
+        help = "Optional path to config YAML (auto-discovers ./openalex-snapshot.yaml if omitted)"
+    )]
+    config: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print effective resolved arguments for selected subcommand and exit")]
+    print_effective_config: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum Commands {
+    #[command(about = "Run full pipeline from config.", long_about = ALL_LONG_ABOUT)]
+    All(AllArgs),
+    #[command(about = "Download snapshot from S3 using AWS CLI sync.", long_about = DOWNLOAD_LONG_ABOUT)]
+    Download(DownloadArgs),
+    #[command(
+        about = "Strictly validate downloaded snapshot integrity.",
+        long_about = VALIDATE_DOWNLOAD_LONG_ABOUT,
+        name = "verify_download"
+    )]
+    ValidateDownload(ValidateDownloadArgs),
+    #[command(about = "Convert snapshot .json.gz files to parquet", long_about = CONVERT_LONG_ABOUT)]
+    Convert(ConvertArgs),
+    #[command(
+        about = "Verify structure and data parity between snapshot and parquet",
+        long_about = VERIFY_LONG_ABOUT,
+        name = "verify_convert"
+    )]
+    Verify(VerifyArgs),
+    #[command(
+        about = "Inspect schema from source/cache/parquet and compare schema variants",
+        long_about = SCHEMA_LONG_ABOUT
+    )]
+    Schema(SchemaArgs),
+    #[command(about = "Verify schema parity across sources.", long_about = VERIFY_SCHEMA_LONG_ABOUT, name = "verify_schema")]
+    VerifySchema(VerifySchemaArgs),
+    #[command(about = "Build a parquet lookup index for a parquet corpus.", long_about = INDEX_LONG_ABOUT)]
+    Index(IndexArgs),
+    #[command(
+        about = "Verify index integrity for a parquet corpus.",
+        long_about = VERIFY_INDEX_LONG_ABOUT,
+        name = "verify_index"
+    )]
+    VerifyIndex(VerifyIndexArgs),
+    #[command(
+        about = "Repair failed files from a verify report.",
+        long_about = REPAIR_LONG_ABOUT,
+        name = "repair_convert"
+    )]
+    Repair(RepairArgs),
+    #[command(about = "View stored reports.", long_about = REPORT_LONG_ABOUT)]
+    Report(ReportArgs),
+    #[command(about = "Prune old reports.", long_about = PRUNE_REPORTS_LONG_ABOUT)]
+    PruneReports(PruneReportsArgs),
+    #[command(about = "Monitor live run progress.", long_about = PROGRESS_LONG_ABOUT)]
+    Progress(ProgressArgs),
+    #[command(about = "Bootstrap project AI skills folder.", long_about = SKILLS_LONG_ABOUT)]
+    Skills(SkillsArgs),
+    #[command(about = "Run environment and capacity preflight checks.", long_about = CHECK_LONG_ABOUT)]
+    Check(CheckArgs),
+    #[command(about = "Create or verify config YAML.", long_about = CONFIG_LONG_ABOUT)]
+    Config(ConfigArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Run full pipeline from config")]
+#[command(long_about = ALL_LONG_ABOUT)]
+struct AllArgs {
+    #[arg(long)]
+    #[arg(help = "Required config file path for pipeline execution")]
+    config: PathBuf,
+
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(long, default_value_t = 1)]
+    #[arg(help = "Max number of repair_convert attempts after verify_convert failures")]
+    retry: usize,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain resolved execution plan and exit")]
+    explain: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Create or verify config YAML")]
+#[command(long_about = CONFIG_LONG_ABOUT)]
+struct ConfigArgs {
+    #[arg(long, value_enum)]
+    #[arg(help = "Create config template: simple, complete, or expert")]
+    create: Option<ConfigTemplateMode>,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Verify config file syntax and schema")]
+    verify: bool,
+
+    #[arg(long, default_value = "./openalex-snapshot.yaml")]
+    #[arg(help = "Config file path")]
+    config: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Write template to stdout instead of file (create mode)")]
+    stdout: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Overwrite existing config file (create mode)")]
+    overwrite: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain action and exit without executing")]
+    explain: bool,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum ConfigTemplateMode {
+    Simple,
+    Complete,
+    Expert,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+struct SharedArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
+
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Dataset name (works, authors, ...) or 'all'")]
+    dataset: String,
+
+    #[arg(long, default_value_t = 4)]
+    #[arg(help = "Number of worker threads")]
+    workers: usize,
+
+    #[arg(long)]
+    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
+    duckdb_bin: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Profile {
+    Safe,
+    Balanced,
+    Fast,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VerifyScope {
+    File,
+    Dataset,
+    Snapshot,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VerifyMetadataLevel {
+    RowCount,
+    IdHash,
+    Both,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SchemaFrom {
+    Auto,
+    Source,
+    Cache,
+    Parquet,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SchemaFormat {
+    Table,
+    Json,
+    Yaml,
+    ArrowR,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReportSource {
+    All,
+    Parquet,
+    Download,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum DiskCheckScope {
+    Dataset,
+    File,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Convert snapshot .json.gz files to parquet")]
+#[command(long_about = CONVERT_LONG_ABOUT)]
+struct ConvertArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, default_value_t = 100_000)]
+    #[arg(help = "Parquet row group size")]
+    row_group_rows: usize,
+
+    #[arg(long, default_value_t = 5_000)]
+    #[arg(help = "Batch rows hint (reserved for future streaming backend)")]
+    batch_rows: usize,
+
+    #[arg(long, default_value = "snappy")]
+    #[arg(help = "Parquet compression codec (e.g., snappy, zstd)")]
+    compression: String,
+
+    #[arg(long, default_value_t = 100)]
+    #[arg(help = "Number of source files sampled for schema inference")]
+    sample_size: usize,
+
+    #[arg(long = "input-file")]
+    #[arg(
+        help = "Convert only selected source .gz file(s); can be repeated (absolute path or dataset-relative path)"
+    )]
+    input_files: Vec<PathBuf>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, value_enum, default_value = "dataset")]
+    #[arg(help = "Post-conversion verification scope: file|dataset|snapshot")]
+    verify_scope: VerifyScope,
+
+    #[arg(long, value_enum, default_value = "both")]
+    #[arg(help = "Post-conversion metadata level: row_count|id_hash|both")]
+    verify_metadata_level: VerifyMetadataLevel,
+
+    #[arg(long, default_value_t = 50)]
+    #[arg(help = "Sample size for file verify scope")]
+    verify_file_sample_n: usize,
+
+    #[arg(long, default_value_t = 42)]
+    #[arg(help = "Random seed for random verify mode")]
+    seed: u64,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Skip post-conversion verification")]
+    skip_verify: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Skip free disk space preflight checks")]
+    skip_disk_check: bool,
+
+    #[arg(long, value_enum, default_value = "dataset")]
+    #[arg(help = "Disk check scope: dataset preflight or per-file")]
+    disk_check_scope: DiskCheckScope,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Refresh schema cache before conversion")]
+    refresh_cache: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Verify structure and data parity between snapshot and parquet")]
+#[command(long_about = VERIFY_LONG_ABOUT)]
+struct VerifyArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, value_enum, default_value = "dataset")]
+    #[arg(help = "Verification scope: file|dataset|snapshot")]
+    scope: VerifyScope,
+
+    #[arg(long, value_enum, default_value = "both")]
+    #[arg(help = "Metadata level: row_count|id_hash|both")]
+    metadata_level: VerifyMetadataLevel,
+
+    #[arg(long, default_value_t = 50)]
+    #[arg(help = "Sample size for file scope")]
+    file_sample_n: usize,
+
+    #[arg(long, default_value_t = 42)]
+    #[arg(help = "Random seed for random mode")]
+    seed: u64,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Inspect schema from source/cache/parquet and compare schema variants")]
+#[command(long_about = SCHEMA_LONG_ABOUT)]
+struct SchemaArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, value_enum, default_value = "auto")]
+    #[arg(help = "Schema source: auto|source|cache|parquet")]
+    from: SchemaFrom,
+
+    #[arg(long, value_enum, default_value = "table")]
+    #[arg(help = "Output format: table|json|yaml|arrow-r")]
+    format: SchemaFormat,
+
+    #[arg(long, value_enum)]
+    #[arg(help = "Compare selected --from schema against this source")]
+    diff_with: Option<SchemaFrom>,
+
+    #[arg(long)]
+    #[arg(help = "Output path (stdout if omitted)")]
+    output: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 100)]
+    #[arg(help = "Source sampling size when inferring schema")]
+    sample_size: usize,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Refresh schema cache before reading schema")]
+    refresh_cache: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush schema inference state every N sampled files (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Verify schema parity across sources")]
+#[command(long_about = VERIFY_SCHEMA_LONG_ABOUT)]
+struct VerifySchemaArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as schema)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, value_enum, default_value = "source")]
+    #[arg(help = "Left schema source")]
+    from: SchemaFrom,
+
+    #[arg(long, value_enum, default_value = "parquet")]
+    #[arg(help = "Right schema source")]
+    diff_with: SchemaFrom,
+
+    #[arg(long, default_value_t = 100)]
+    #[arg(help = "Source sampling size when inferring schema")]
+    sample_size: usize,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Refresh schema cache before reading schema")]
+    refresh_cache: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush schema inference state every N sampled files (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(long_about = INDEX_LONG_ABOUT)]
+struct IndexArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(long, default_value = "works")]
+    #[arg(help = "Dataset name to index (e.g. works, authors, sources)")]
+    dataset: String,
+
+    #[arg(long)]
+    #[arg(help = "Optional output index file path")]
+    index_file: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 4)]
+    #[arg(help = "Number of workers (same semantics as convert)")]
+    workers: usize,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as convert)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(help = "Per-worker memory cap override in MB (same semantics as convert)")]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long)]
+    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
+    duckdb_bin: Option<PathBuf>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show stage progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Overwrite existing index file")]
+    overwrite: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Repair failed files from a verify report")]
+#[command(long_about = REPAIR_LONG_ABOUT)]
+struct RepairArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long)]
+    #[arg(help = "Path to verify report JSON (RunReport format)")]
+    from_verify_report: PathBuf,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as convert/verify/index)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Download snapshot from S3 using AWS CLI sync")]
+#[command(long_about = DOWNLOAD_LONG_ABOUT)]
+struct DownloadArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(long, default_value = "s3://openalex")]
+    #[arg(help = "Source S3 URI")]
+    s3_uri: String,
+
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Dataset name (works, authors, ...) or 'all'")]
+    dataset: String,
+
+    #[arg(long, default_value = "aws")]
+    #[arg(help = "Path to aws executable (default: aws in PATH)")]
+    aws_bin: PathBuf,
+
+    #[arg(long)]
+    #[arg(help = "Optional custom S3 endpoint URL")]
+    endpoint_url: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS region")]
+    region: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS profile name")]
+    profile_name: Option<String>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Use --no-sign-request for public OpenAlex access")]
+    no_sign_request: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Use signed AWS requests (overrides --no-sign-request)")]
+    signed: bool,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Mirror remote content by deleting local files not present remotely")]
+    delete_files: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Disable remote-delete mirroring")]
+    no_delete: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Skip validation after sync")]
+    skip_validate: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Skip free disk space preflight checks")]
+    skip_disk_check: bool,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile for validation phase")]
+    profile: Profile,
+
+    #[arg(long, default_value_t = 4)]
+    #[arg(help = "Number of worker threads for validation phase")]
+    workers: usize,
+
+    #[arg(long)]
+    #[arg(help = "Per-worker memory cap override in MB (validation phase)")]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Strictly validate downloaded snapshot integrity")]
+#[command(long_about = VALIDATE_DOWNLOAD_LONG_ABOUT)]
+struct ValidateDownloadArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(long, default_value = "s3://openalex")]
+    #[arg(help = "Source S3 URI for remote manifest")]
+    s3_uri: String,
+
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Dataset name (works, authors, ...) or 'all'")]
+    dataset: String,
+
+    #[arg(long, default_value = "aws")]
+    #[arg(help = "Path to aws executable (default: aws in PATH)")]
+    aws_bin: PathBuf,
+
+    #[arg(long)]
+    #[arg(help = "Optional custom S3 endpoint URL")]
+    endpoint_url: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS region")]
+    region: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS profile name")]
+    profile_name: Option<String>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Use --no-sign-request for public OpenAlex access")]
+    no_sign_request: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Use signed AWS requests (overrides --no-sign-request)")]
+    signed: bool,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Detect extra local files not present remotely")]
+    check_extra: bool,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile for local integrity checks")]
+    profile: Profile,
+
+    #[arg(long, default_value_t = 4)]
+    #[arg(help = "Number of worker threads for local integrity checks")]
+    workers: usize,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Verify index integrity for a parquet corpus")]
+#[command(long_about = VERIFY_INDEX_LONG_ABOUT)]
+struct VerifyIndexArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(long, default_value = "works")]
+    #[arg(help = "Dataset name to verify index for (e.g. works, authors, sources)")]
+    dataset: String,
+
+    #[arg(long)]
+    #[arg(help = "Optional index file path (default: <parquet_dir>/<dataset>_id_idx.parquet)")]
+    index_file: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 4)]
+    #[arg(help = "Number of workers")]
+    workers: usize,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(help = "Per-worker memory cap override in MB")]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long)]
+    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
+    duckdb_bin: Option<PathBuf>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "View stored reports")]
+#[command(long_about = REPORT_LONG_ABOUT)]
+struct ReportArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
+
+    #[arg(long, value_enum, default_value = "all")]
+    #[arg(help = "Report source to scan")]
+    source: ReportSource,
+
+    #[arg(long)]
+    #[arg(help = "Filter to a command name (e.g., verify, convert, download)")]
+    command: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Show only the latest report per command")]
+    latest: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print full pretty JSON after each summary line")]
+    full: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Prune old reports")]
+#[command(long_about = PRUNE_REPORTS_LONG_ABOUT)]
+struct PruneReportsArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
+
+    #[arg(long, value_enum, default_value = "all")]
+    #[arg(help = "Report source to scan")]
+    source: ReportSource,
+
+    #[arg(long)]
+    #[arg(help = "Filter to a command name (e.g., verify, convert, download)")]
+    command: Option<String>,
+
+    #[arg(long, default_value_t = 1)]
+    #[arg(help = "Number of newest reports to keep per command")]
+    keep_per_command: usize,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Show what would be pruned without deleting files")]
+    dry_run: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Monitor live run progress")]
+#[command(long_about = PROGRESS_LONG_ABOUT)]
+struct ProgressArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    snapshot_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
+
+    #[arg(long)]
+    #[arg(help = "Filter by command")]
+    command: Option<String>,
+
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Filter by dataset or 'all'")]
+    dataset: String,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Continuously watch for updates")]
+    watch: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print once and exit")]
+    once: bool,
+
+    #[arg(long, default_value_t = 2)]
+    #[arg(help = "Refresh interval in seconds while watching")]
+    interval_sec: u64,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print machine-readable JSON output")]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Bootstrap project AI skills folder")]
+#[command(long_about = SKILLS_LONG_ABOUT)]
+struct SkillsArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(
+        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+    )]
+    root_dir: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Rewrite generated template files")]
+    overwrite: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print generated file manifest/content preview")]
+    stdout: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Run environment and capacity preflight checks")]
+#[command(long_about = CHECK_LONG_ABOUT)]
+struct CheckArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long, default_value = "aws")]
+    #[arg(help = "Path to aws executable (default: aws in PATH)")]
+    aws_bin: PathBuf,
+
+    #[arg(long, default_value = "s3://openalex")]
+    #[arg(help = "Source S3 URI used for download preflight estimate")]
+    s3_uri: String,
+
+    #[arg(long)]
+    #[arg(help = "Optional custom S3 endpoint URL")]
+    endpoint_url: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS region")]
+    region: Option<String>,
+
+    #[arg(long)]
+    #[arg(help = "Optional AWS profile name")]
+    profile_name: Option<String>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Use --no-sign-request for public OpenAlex access")]
+    no_sign_request: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Use signed AWS requests (overrides --no-sign-request)")]
+    signed: bool,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(help = "Per-worker memory cap override in MB")]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Precise source inventory estimate for convert checks")]
+    precise: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Fail on warnings as well as errors")]
+    strict: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Print machine-readable JSON output")]
+    json: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppConfig {
+    defaults: Option<ConfigDefaults>,
+    all: Option<AllConfig>,
+    convert: Option<ConvertConfig>,
+    verify_convert: Option<VerifyConfig>,
+    schema: Option<SchemaConfig>,
+    index: Option<IndexConfig>,
+    repair_convert: Option<RepairConfig>,
+    download: Option<DownloadConfig>,
+    verify_download: Option<ValidateDownloadConfig>,
+    verify_index: Option<VerifyIndexConfig>,
+    report: Option<ReportConfig>,
+    prune_reports: Option<PruneReportsConfig>,
+    progress: Option<ProgressConfig>,
+    check: Option<CheckConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllConfig {
+    enable_download: Option<bool>,
+    enable_verify_download: Option<bool>,
+    enable_convert: Option<bool>,
+    enable_verify_convert: Option<bool>,
+    enable_repair_convert: Option<bool>,
+    enable_index: Option<bool>,
+    enable_verify_index: Option<bool>,
+    retry: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDefaults {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConvertConfig {
+    row_group_rows: Option<usize>,
+    batch_rows: Option<usize>,
+    compression: Option<String>,
+    sample_size: Option<usize>,
+    verify_scope: Option<VerifyScope>,
+    verify_metadata_level: Option<VerifyMetadataLevel>,
+    verify_file_sample_n: Option<usize>,
+    seed: Option<u64>,
+    skip_verify: Option<bool>,
+    refresh_cache: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyConfig {
+    scope: Option<VerifyScope>,
+    metadata_level: Option<VerifyMetadataLevel>,
+    file_sample_n: Option<usize>,
+    seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaConfig {
+    from: Option<SchemaFrom>,
+    format: Option<SchemaFormat>,
+    diff_with: Option<SchemaFrom>,
+    output: Option<PathBuf>,
+    sample_size: Option<usize>,
+    refresh_cache: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    index_file: Option<PathBuf>,
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairConfig {
+    from_verify_report: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DownloadConfig {
+    root_dir: Option<PathBuf>,
+    s3_uri: Option<String>,
+    dataset: Option<String>,
+    aws_bin: Option<PathBuf>,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    profile_name: Option<String>,
+    no_sign_request: Option<bool>,
+    signed: Option<bool>,
+    delete_files: Option<bool>,
+    no_delete: Option<bool>,
+    skip_validate: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidateDownloadConfig {
+    root_dir: Option<PathBuf>,
+    s3_uri: Option<String>,
+    dataset: Option<String>,
+    aws_bin: Option<PathBuf>,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    profile_name: Option<String>,
+    no_sign_request: Option<bool>,
+    signed: Option<bool>,
+    check_extra: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyIndexConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    index_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportConfig {
+    root_dir: Option<PathBuf>,
+    source: Option<ReportSource>,
+    command: Option<String>,
+    latest: Option<bool>,
+    full: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PruneReportsConfig {
+    root_dir: Option<PathBuf>,
+    source: Option<ReportSource>,
+    command: Option<String>,
+    keep_per_command: Option<usize>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressConfig {
+    root_dir: Option<PathBuf>,
+    command: Option<String>,
+    dataset: Option<String>,
+    interval_sec: Option<u64>,
+    watch: Option<bool>,
+    json: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    aws_bin: Option<PathBuf>,
+    s3_uri: Option<String>,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    profile_name: Option<String>,
+    no_sign_request: Option<bool>,
+    signed: Option<bool>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    precise: Option<bool>,
+    strict: Option<bool>,
+    json: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FieldDef {
+    name: String,
+    r#type: String,
+    nullable: bool,
+    children: Vec<FieldDef>,
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SchemaDoc {
+    dataset: String,
+    source: String,
+    generated_at_unix: i64,
+    fields: Vec<FieldDef>,
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct FilePair {
+    input_gz: PathBuf,
+    output_parquet: PathBuf,
+    rel: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RepairTarget {
+    dataset: String,
+    source_path: PathBuf,
+    output_path: PathBuf,
+    rel: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteObject {
+    key: String,
+    size: u64,
+    etag: String,
+    last_modified: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceMetricRow {
+    rel_path: String,
+    source_size: u64,
+    source_mtime_unix: i64,
+    row_count: u64,
+    id_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParquetMetricRow {
+    rel_path: String,
+    parquet_size: u64,
+    parquet_mtime_unix: i64,
+    row_count: u64,
+    id_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DatasetReportSummary {
+    dataset: String,
+    items_scanned: u64,
+    succeeded: u64,
+    failed: u64,
+    skipped: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailureEntry {
+    dataset: String,
+    phase: String,
+    rel_path: Option<String>,
+    source_path: Option<String>,
+    output_path: Option<String>,
+    error_message: String,
+    suggested_recovery: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepRunSummary {
+    step: String,
+    status: String,
+    report_path: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunReport {
+    command: String,
+    #[serde(default)]
+    cli_version: String,
+    started_at_unix: i64,
+    finished_at_unix: Option<i64>,
+    duration_seconds: Option<f64>,
+    args: BTreeMap<String, String>,
+    totals_items_scanned: u64,
+    totals_succeeded: u64,
+    totals_failed: u64,
+    totals_skipped: u64,
+    datasets: Vec<DatasetReportSummary>,
+    failures: Vec<FailureEntry>,
+    #[serde(default)]
+    step_runs: Vec<StepRunSummary>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Commands::Config(args) = cli.command.clone() {
+        return run_config(args);
+    }
+    let cfg = load_optional_config(cli.config.as_deref())?;
+    match cli.command {
+        Commands::All(mut args) => {
+            let all_cfg = load_optional_config(Some(&args.config))?
+                .ok_or_else(|| anyhow!("all requires --config <path>"))?;
+            if let Some(c) = all_cfg.defaults.as_ref() {
+                if args.root_dir == PathBuf::from(".") {
+                    if let Some(v) = &c.root_dir {
+                        args.root_dir = v.clone();
+                    }
+                }
+            }
+            try_migrate_metadata_root(&args.root_dir);
+            run_all(args, &all_cfg)
+        }
+        Commands::Convert(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_convert_config(&mut args, cfg.as_ref());
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            if cli.print_effective_config {
+                explain_convert(
+                    &args,
+                    &resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?,
+                    &duckdb_bin(&args.shared),
+                    &resolve_tuning(
+                        args.profile.clone(),
+                        args.shared.workers,
+                        args.max_memory_mb,
+                    ),
+                );
+                return Ok(());
+            }
+            run_convert(args)
+        }
+        Commands::Verify(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_verify_config(&mut args, cfg.as_ref());
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            if cli.print_effective_config {
+                explain_verify(
+                    &args,
+                    &resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?,
+                    &duckdb_bin(&args.shared),
+                    &resolve_tuning(
+                        args.profile.clone(),
+                        args.shared.workers,
+                        args.max_memory_mb,
+                    ),
+                );
+                return Ok(());
+            }
+            run_verify(args)
+        }
+        Commands::Schema(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_schema_config(&mut args, cfg.as_ref());
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            if cli.print_effective_config {
+                explain_schema(
+                    &args,
+                    &resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?,
+                    &duckdb_bin(&args.shared),
+                    &resolve_tuning(
+                        args.profile.clone(),
+                        args.shared.workers,
+                        args.max_memory_mb,
+                    ),
+                );
+                return Ok(());
+            }
+            run_schema(args)
+        }
+        Commands::VerifySchema(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            run_verify_schema(args)
+        }
+        Commands::Index(mut args) => {
+            apply_index_config(&mut args, cfg.as_ref());
+            try_migrate_metadata_root(&args.root_dir);
+            if cli.print_effective_config {
+                let corpus_dir = args.root_dir.join("parquet").join(&args.dataset);
+                explain_index(
+                    &args,
+                    &duckdb_bin_from_option(&args.duckdb_bin),
+                    &corpus_dir,
+                    &args
+                        .index_file
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("auto")),
+                    &resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb),
+                );
+                return Ok(());
+            }
+            run_index(args)
+        }
+        Commands::Repair(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_repair_config(&mut args, cfg.as_ref());
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            run_repair(args)
+        }
+        Commands::Download(mut args) => {
+            fill_download_dirs(&mut args);
+            apply_download_config(&mut args, cfg.as_ref());
+            fill_download_dirs(&mut args);
+            try_migrate_metadata_root(&args.root_dir);
+            run_download(args)
+        }
+        Commands::ValidateDownload(mut args) => {
+            fill_validate_download_dirs(&mut args);
+            apply_validate_download_config(&mut args, cfg.as_ref());
+            fill_validate_download_dirs(&mut args);
+            try_migrate_metadata_root(&args.root_dir);
+            run_validate_download(args)
+        }
+        Commands::VerifyIndex(mut args) => {
+            apply_verify_index_config(&mut args, cfg.as_ref());
+            try_migrate_metadata_root(&args.root_dir);
+            run_verify_index(args)
+        }
+        Commands::Report(mut args) => {
+            fill_report_dirs(&mut args);
+            apply_report_config(&mut args, cfg.as_ref());
+            fill_report_dirs(&mut args);
+            try_migrate_metadata_root(&args.root_dir);
+            run_report(args)
+        }
+        Commands::PruneReports(mut args) => {
+            fill_prune_report_dirs(&mut args);
+            apply_prune_reports_config(&mut args, cfg.as_ref());
+            fill_prune_report_dirs(&mut args);
+            try_migrate_metadata_root(&args.root_dir);
+            run_prune_reports(args)
+        }
+        Commands::Progress(mut args) => {
+            fill_progress_dirs(&mut args);
+            apply_progress_config(&mut args, cfg.as_ref());
+            fill_progress_dirs(&mut args);
+            try_migrate_metadata_root(&args.root_dir);
+            run_progress(args)
+        }
+        Commands::Skills(args) => run_skills(args),
+        Commands::Check(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_check_config(&mut args, cfg.as_ref());
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            run_check(args)
+        }
+        Commands::Config(_) => unreachable!(),
+    }
+}
+
+fn load_optional_config(explicit: Option<&Path>) -> Result<Option<AppConfig>> {
+    let path = if let Some(p) = explicit {
+        Some(p.to_path_buf())
+    } else {
+        let p = PathBuf::from("./openalex-snapshot.yaml");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let txt = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let cfg: AppConfig = serde_yaml::from_str(&txt)
+        .with_context(|| format!("invalid config YAML {}", path.display()))?;
+    Ok(Some(cfg))
+}
+
+fn fill_shared_dirs(shared: &mut SharedArgs) {
+    shared.snapshot_dir = shared.root_dir.join("openalex-snapshot");
+    shared.parquet_dir = shared.root_dir.join("parquet");
+}
+
+fn fill_download_dirs(args: &mut DownloadArgs) {
+    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+}
+
+fn fill_validate_download_dirs(args: &mut ValidateDownloadArgs) {
+    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+}
+
+fn fill_report_dirs(args: &mut ReportArgs) {
+    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.parquet_dir = args.root_dir.join("parquet");
+}
+
+fn fill_prune_report_dirs(args: &mut PruneReportsArgs) {
+    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.parquet_dir = args.root_dir.join("parquet");
+}
+
+fn fill_progress_dirs(args: &mut ProgressArgs) {
+    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.parquet_dir = args.root_dir.join("parquet");
+}
+
+fn try_migrate_metadata_root(root_dir: &Path) {
+    let new_root = root_dir.join(".openalex-snapshot_metadata");
+    let _ = fs::create_dir_all(&new_root);
+    let parquet = root_dir.join("parquet");
+    let snapshot = root_dir.join("openalex-snapshot");
+    let old_global = parquet.join(".openalex_metadata");
+    if old_global.exists() {
+        let target = new_root.join("reports");
+        let _ = merge_dir_with_fallback(&old_global.join("reports"), &target);
+    }
+    if parquet.exists() {
+        if let Ok(entries) = fs::read_dir(&parquet) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with('.') && name.ends_with("_metadata") {
+                        let ds = name
+                            .trim_start_matches('.')
+                            .trim_end_matches("_metadata")
+                            .to_string();
+                        let target = new_root.join("datasets").join(&ds);
+                        let _ = merge_dir_with_fallback(&p, &target);
+                    }
+                }
+            }
+        }
+    }
+    let old_download = snapshot.join(".openalex_download_metadata");
+    if old_download.exists() {
+        let target = new_root.join("download");
+        let _ = merge_dir_with_fallback(&old_download, &target);
+    }
+}
+
+fn apply_shared_defaults(shared: &mut SharedArgs, d: &ConfigDefaults) {
+    if shared.root_dir == PathBuf::from(".") {
+        if let Some(v) = &d.root_dir {
+            shared.root_dir = v.clone();
+        }
+    }
+    if shared.dataset == "all" {
+        if let Some(v) = &d.dataset {
+            shared.dataset = v.clone();
+        }
+    }
+    if shared.workers == 4 {
+        if let Some(v) = d.workers {
+            shared.workers = v;
+        }
+    }
+    if shared.duckdb_bin.is_none() {
+        if let Some(v) = &d.duckdb_bin {
+            shared.duckdb_bin = Some(v.clone());
+        }
+    }
+}
+
+fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        apply_shared_defaults(&mut args.shared, d);
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.convert {
+        if args.row_group_rows == 100_000 {
+            if let Some(v) = c.row_group_rows {
+                args.row_group_rows = v;
+            }
+        }
+        if args.batch_rows == 5_000 {
+            if let Some(v) = c.batch_rows {
+                args.batch_rows = v;
+            }
+        }
+        if args.compression == "snappy" {
+            if let Some(v) = &c.compression {
+                args.compression = v.clone();
+            }
+        }
+        if args.sample_size == 100 {
+            if let Some(v) = c.sample_size {
+                args.sample_size = v;
+            }
+        }
+        if args.verify_scope == VerifyScope::Dataset {
+            if let Some(v) = &c.verify_scope {
+                args.verify_scope = v.clone();
+            }
+        }
+        if args.verify_metadata_level == VerifyMetadataLevel::Both {
+            if let Some(v) = &c.verify_metadata_level {
+                args.verify_metadata_level = v.clone();
+            }
+        }
+        if args.verify_file_sample_n == 50 {
+            if let Some(v) = c.verify_file_sample_n {
+                args.verify_file_sample_n = v;
+            }
+        }
+        if args.seed == 42 {
+            if let Some(v) = c.seed {
+                args.seed = v;
+            }
+        }
+        if !args.skip_verify {
+            if let Some(v) = c.skip_verify {
+                args.skip_verify = v;
+            }
+        }
+        if !args.refresh_cache {
+            if let Some(v) = c.refresh_cache {
+                args.refresh_cache = v;
+            }
+        }
+    }
+}
+
+fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        apply_shared_defaults(&mut args.shared, d);
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.verify_convert {
+        if args.scope == VerifyScope::Dataset {
+            if let Some(v) = &c.scope {
+                args.scope = v.clone();
+            }
+        }
+        if args.metadata_level == VerifyMetadataLevel::Both {
+            if let Some(v) = &c.metadata_level {
+                args.metadata_level = v.clone();
+            }
+        }
+        if args.file_sample_n == 50 {
+            if let Some(v) = c.file_sample_n {
+                args.file_sample_n = v;
+            }
+        }
+        if args.seed == 42 {
+            if let Some(v) = c.seed {
+                args.seed = v;
+            }
+        }
+    }
+}
+
+fn apply_schema_config(args: &mut SchemaArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        apply_shared_defaults(&mut args.shared, d);
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.schema {
+        if args.from == SchemaFrom::Auto {
+            if let Some(v) = &c.from {
+                args.from = v.clone();
+            }
+        }
+        if args.format == SchemaFormat::Table {
+            if let Some(v) = &c.format {
+                args.format = v.clone();
+            }
+        }
+        if args.diff_with.is_none() {
+            args.diff_with = c.diff_with.clone();
+        }
+        if args.output.is_none() {
+            args.output = c.output.clone();
+        }
+        if args.sample_size == 100 {
+            if let Some(v) = c.sample_size {
+                args.sample_size = v;
+            }
+        }
+        if !args.refresh_cache {
+            if let Some(v) = c.refresh_cache {
+                args.refresh_cache = v;
+            }
+        }
+    }
+}
+
+fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &d.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "works" {
+            if let Some(v) = &d.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.workers == 4 {
+            if let Some(v) = d.workers {
+                args.workers = v;
+            }
+        }
+        if args.duckdb_bin.is_none() {
+            if let Some(v) = &d.duckdb_bin {
+                args.duckdb_bin = Some(v.clone());
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.index {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "works" {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.index_file.is_none() {
+            args.index_file = c.index_file.clone();
+        }
+        if !args.overwrite {
+            if let Some(v) = c.overwrite {
+                args.overwrite = v;
+            }
+        }
+    }
+}
+
+fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        apply_shared_defaults(&mut args.shared, d);
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.repair_convert {
+        if args.from_verify_report == PathBuf::new() {
+            if let Some(v) = &c.from_verify_report {
+                args.from_verify_report = v.clone();
+            }
+        }
+    }
+}
+
+fn apply_download_config(args: &mut DownloadArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &d.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "all" {
+            if let Some(v) = &d.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.workers == 4 {
+            if let Some(v) = d.workers {
+                args.workers = v;
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.download {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.s3_uri == "s3://openalex" {
+            if let Some(v) = &c.s3_uri {
+                args.s3_uri = v.clone();
+            }
+        }
+        if args.dataset == "all" {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.aws_bin == PathBuf::from("aws") {
+            if let Some(v) = &c.aws_bin {
+                args.aws_bin = v.clone();
+            }
+        }
+        if args.endpoint_url.is_none() {
+            args.endpoint_url = c.endpoint_url.clone();
+        }
+        if args.region.is_none() {
+            args.region = c.region.clone();
+        }
+        if args.profile_name.is_none() {
+            args.profile_name = c.profile_name.clone();
+        }
+        if args.no_sign_request {
+            if let Some(v) = c.no_sign_request {
+                args.no_sign_request = v;
+            }
+        }
+        if !args.signed {
+            if let Some(v) = c.signed {
+                args.signed = v;
+            }
+        }
+        if args.delete_files {
+            if let Some(v) = c.delete_files {
+                args.delete_files = v;
+            }
+        }
+        if !args.no_delete {
+            if let Some(v) = c.no_delete {
+                args.no_delete = v;
+            }
+        }
+        if !args.skip_validate {
+            if let Some(v) = c.skip_validate {
+                args.skip_validate = v;
+            }
+        }
+    }
+}
+
+fn apply_validate_download_config(args: &mut ValidateDownloadArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &d.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "all" {
+            if let Some(v) = &d.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.workers == 4 {
+            if let Some(v) = d.workers {
+                args.workers = v;
+            }
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+        if args.state_flush_every == 25 {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.verify_download {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.s3_uri == "s3://openalex" {
+            if let Some(v) = &c.s3_uri {
+                args.s3_uri = v.clone();
+            }
+        }
+        if args.dataset == "all" {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.aws_bin == PathBuf::from("aws") {
+            if let Some(v) = &c.aws_bin {
+                args.aws_bin = v.clone();
+            }
+        }
+        if args.endpoint_url.is_none() {
+            args.endpoint_url = c.endpoint_url.clone();
+        }
+        if args.region.is_none() {
+            args.region = c.region.clone();
+        }
+        if args.profile_name.is_none() {
+            args.profile_name = c.profile_name.clone();
+        }
+        if args.no_sign_request {
+            if let Some(v) = c.no_sign_request {
+                args.no_sign_request = v;
+            }
+        }
+        if !args.signed {
+            if let Some(v) = c.signed {
+                args.signed = v;
+            }
+        }
+        if args.check_extra {
+            if let Some(v) = c.check_extra {
+                args.check_extra = v;
+            }
+        }
+    }
+}
+
+fn apply_verify_index_config(args: &mut VerifyIndexArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &d.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "works" {
+            if let Some(v) = &d.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.workers == 4 {
+            if let Some(v) = d.workers {
+                args.workers = v;
+            }
+        }
+        if args.duckdb_bin.is_none() {
+            if let Some(v) = &d.duckdb_bin {
+                args.duckdb_bin = Some(v.clone());
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if args.progress && d.progress == Some(false) {
+            args.progress = false;
+        }
+    }
+    if let Some(c) = &cfg.verify_index {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.dataset == "works" {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.index_file.is_none() {
+            args.index_file = c.index_file.clone();
+        }
+    }
+}
+
+fn apply_report_config(args: &mut ReportArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(c) = &cfg.report {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.source == ReportSource::All {
+            if let Some(v) = &c.source {
+                args.source = v.clone();
+            }
+        }
+        if args.command.is_none() {
+            args.command = c.command.clone();
+        }
+        if !args.latest {
+            if let Some(v) = c.latest {
+                args.latest = v;
+            }
+        }
+        if !args.full {
+            if let Some(v) = c.full {
+                args.full = v;
+            }
+        }
+    }
+}
+
+fn apply_prune_reports_config(args: &mut PruneReportsArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(c) = &cfg.prune_reports {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.source == ReportSource::All {
+            if let Some(v) = &c.source {
+                args.source = v.clone();
+            }
+        }
+        if args.command.is_none() {
+            args.command = c.command.clone();
+        }
+        if args.keep_per_command == 1 {
+            if let Some(v) = c.keep_per_command {
+                args.keep_per_command = v;
+            }
+        }
+        if !args.dry_run {
+            if let Some(v) = c.dry_run {
+                args.dry_run = v;
+            }
+        }
+    }
+}
+
+fn apply_progress_config(args: &mut ProgressArgs, cfg: Option<&AppConfig>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(c) = &cfg.progress {
+        if args.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if args.command.is_none() {
+            args.command = c.command.clone();
+        }
+        if args.dataset == "all" {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if args.interval_sec == 2 {
+            if let Some(v) = c.interval_sec {
+                args.interval_sec = v;
+            }
+        }
+        if args.watch {
+            if let Some(v) = c.watch {
+                args.watch = v;
+            }
+        }
+        if !args.json {
+            if let Some(v) = c.json {
+                args.json = v;
+            }
+        }
+    }
+}
+
+fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>) {
+    if let Some(d) = cfg.and_then(|c| c.defaults.as_ref()) {
+        if args.shared.root_dir == PathBuf::from(".") {
+            if let Some(v) = &d.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if args.shared.dataset == "all" {
+            if let Some(v) = &d.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if args.shared.workers == 4 {
+            if let Some(v) = d.workers {
+                args.shared.workers = v;
+            }
+        }
+        if args.shared.duckdb_bin.is_none() {
+            if let Some(v) = &d.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            if let Some(v) = d.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+    }
+    if let Some(c) = cfg.and_then(|x| x.check.as_ref()) {
+        if args.shared.root_dir == PathBuf::from(".") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if args.shared.dataset == "all" {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if args.shared.workers == 4 {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if args.shared.duckdb_bin.is_none() {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if args.aws_bin == PathBuf::from("aws") {
+            if let Some(v) = &c.aws_bin {
+                args.aws_bin = v.clone();
+            }
+        }
+        if args.s3_uri == "s3://openalex" {
+            if let Some(v) = &c.s3_uri {
+                args.s3_uri = v.clone();
+            }
+        }
+        if args.endpoint_url.is_none() {
+            if let Some(v) = &c.endpoint_url {
+                args.endpoint_url = Some(v.clone());
+            }
+        }
+        if args.region.is_none() {
+            if let Some(v) = &c.region {
+                args.region = Some(v.clone());
+            }
+        }
+        if args.profile_name.is_none() {
+            if let Some(v) = &c.profile_name {
+                args.profile_name = Some(v.clone());
+            }
+        }
+        if args.no_sign_request {
+            if let Some(v) = c.no_sign_request {
+                args.no_sign_request = v;
+            }
+        }
+        if !args.signed {
+            if let Some(v) = c.signed {
+                args.signed = v;
+            }
+        }
+        if args.profile == Profile::Balanced {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if args.max_memory_mb.is_none() {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if args.precise {
+            if let Some(v) = c.precise {
+                args.precise = v;
+            }
+        }
+        if !args.strict {
+            if let Some(v) = c.strict {
+                args.strict = v;
+            }
+        }
+        if !args.json {
+            if let Some(v) = c.json {
+                args.json = v;
+            }
+        }
+    }
+}
+
+fn config_template(mode: ConfigTemplateMode) -> String {
+    match mode {
+        ConfigTemplateMode::Simple => config_template_simple(),
+        ConfigTemplateMode::Complete => config_template_complete(),
+        ConfigTemplateMode::Expert => config_template_expert(),
+    }
+}
+
+fn config_template_simple() -> String {
+    r#"# openalex-snapshot.yaml (simple)
+# Beginner template for the standard OpenAlex pipeline.
+# Precedence:
+#   1) built-in defaults
+#   2) defaults section below
+#   3) command-specific section below
+#   4) explicit CLI flags (highest precedence)
+#
+# Root layout (when root_dir is "."):
+#   ./openalex-snapshot
+#   ./parquet
+#   ./.openalex-snapshot_metadata
+
+defaults:
+  root_dir: .
+  dataset: all
+  workers: 4
+  profile: balanced
+  progress: true
+  state_flush_every: 25
+
+all:
+  retry: 1
+  enable_download: true
+  enable_verify_download: true
+  enable_convert: true
+  enable_verify_convert: true
+  enable_repair_convert: true
+  enable_index: true
+  enable_verify_index: true
+
+download:
+  root_dir: .
+  s3_uri: s3://openalex
+  dataset: all
+  no_sign_request: true
+  delete_files: true
+  skip_validate: false
+
+verify_download:
+  root_dir: .
+  dataset: all
+  no_sign_request: true
+  check_extra: true
+
+convert:
+  row_group_rows: 100000
+  batch_rows: 5000
+  compression: snappy
+  verify_scope: dataset
+  verify_metadata_level: both
+  verify_file_sample_n: 50
+  seed: 42
+  skip_verify: false
+
+verify_convert:
+  scope: dataset
+  metadata_level: both
+  file_sample_n: 50
+  seed: 42
+
+index:
+  root_dir: .
+  dataset: works
+  overwrite: false
+
+verify_index:
+  root_dir: .
+  dataset: works
+
+check:
+  root_dir: .
+  dataset: all
+  profile: balanced
+  precise: true
+  strict: false
+  json: false
+"#
+    .to_string()
+}
+
+fn config_template_complete() -> String {
+    r#"# openalex-snapshot.yaml
+# Generated template for openalex-snapshot.
+# Precedence:
+#   1) built-in defaults
+#   2) defaults section below
+#   3) command-specific section below
+#   4) explicit CLI flags (highest precedence)
+#
+# Root layout (when root_dir is "."):
+#   ./openalex-snapshot
+#   ./parquet
+#   ./.openalex-snapshot_metadata
+
+defaults:
+  # Global default root for root-based commands.
+  root_dir: .
+
+  # Default dataset scope where supported.
+  # Use "all" or a single dataset name (works, authors, ...).
+  dataset: all
+
+  # Shared runtime defaults.
+  workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  profile: balanced
+  # max_memory_mb: 8192
+  progress: true
+
+  # Crash-resilience: flush state/report every N items.
+  state_flush_every: 25
+
+all:
+  # Max number of repair_convert attempts in verify/repair loop.
+  retry: 1
+
+  # Stage toggles (default pipeline shown below).
+  enable_download: true
+  enable_verify_download: true
+  enable_convert: true
+  enable_verify_convert: true
+  enable_repair_convert: true
+  enable_index: true
+  enable_verify_index: true
+
+convert:
+  # Parquet write behavior.
+  row_group_rows: 100000
+  batch_rows: 5000
+  compression: snappy
+
+  # Schema inference behavior.
+  sample_size: 100
+  refresh_cache: false
+
+  # Post-convert verification behavior.
+  verify_scope: dataset
+  verify_metadata_level: both
+  verify_file_sample_n: 50
+  seed: 42
+  skip_verify: false
+
+verify_convert:
+  # Verification scope:
+  # - file: sample of file pairs
+  # - dataset: all files in dataset
+  # - snapshot: all selected datasets
+  scope: dataset
+  metadata_level: both
+  file_sample_n: 50
+  seed: 42
+
+schema:
+  # Schema source preference: auto|source|cache|parquet
+  from: auto
+
+  # Output format: table|json|yaml|arrow-r
+  format: table
+
+  # Optional comparison source.
+  # diff_with: parquet
+
+  # Optional output file (stdout if omitted).
+  # output: ./schema.json
+
+  sample_size: 100
+  refresh_cache: false
+
+index:
+  root_dir: .
+  dataset: works
+
+  # Optional index output file.
+  # index_file: ./parquet/works_id_idx.parquet
+
+  overwrite: false
+
+verify_index:
+  root_dir: .
+  dataset: works
+  # index_file: ./parquet/works_id_idx.parquet
+
+repair_convert:
+  # Repair is driven by an existing verify_convert report.
+  # No corpus_dir here by design (root_dir + dataset model).
+  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
+
+download:
+  # Defaults mirror OpenAlex recommendation.
+  root_dir: .
+  s3_uri: s3://openalex
+  dataset: all
+  aws_bin: aws
+  # endpoint_url: https://s3.amazonaws.com
+  # region: us-east-1
+  # profile_name: default
+  no_sign_request: true
+  signed: false
+  delete_files: true
+  no_delete: false
+  skip_validate: false
+
+verify_download:
+  root_dir: .
+  # s3_uri: s3://openalex
+  dataset: all
+  aws_bin: aws
+  no_sign_request: true
+  signed: false
+  check_extra: true
+
+report:
+  root_dir: .
+  source: all
+  # command: verify_convert
+  latest: false
+  full: false
+
+prune_reports:
+  root_dir: .
+  source: all
+  # command: verify_convert
+  keep_per_command: 1
+  dry_run: false
+
+progress:
+  root_dir: .
+  # command: convert
+  dataset: all
+  interval_sec: 2
+  watch: true
+  json: false
+
+check:
+  root_dir: .
+  dataset: all
+  profile: balanced
+  precise: true
+  strict: false
+  json: false
+
+# Typical pipeline:
+# 1) download
+# 2) verify_download
+# 3) convert
+# 4) verify_convert
+# 5) repair_convert (when verify_convert reports file failures)
+# 6) index
+# 7) verify_index
+"#
+    .to_string()
+}
+
+fn config_template_expert() -> String {
+    r#"# openalex-snapshot.yaml (expert)
+# Exhaustive template for advanced operators.
+# Every known configuration key is listed explicitly.
+# Precedence:
+#   1) built-in defaults
+#   2) defaults section below
+#   3) command-specific section below
+#   4) explicit CLI flags (highest precedence)
+#
+# Root layout (when root_dir is "."):
+#   ./openalex-snapshot
+#   ./parquet
+#   ./.openalex-snapshot_metadata
+
+defaults:
+  root_dir: .
+  dataset: all
+  workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  profile: balanced
+  # max_memory_mb: 8192
+  progress: true
+  state_flush_every: 25
+
+all:
+  retry: 1
+  enable_download: true
+  enable_verify_download: true
+  enable_convert: true
+  enable_verify_convert: true
+  enable_repair_convert: true
+  enable_index: true
+  enable_verify_index: true
+
+convert:
+  row_group_rows: 100000
+  batch_rows: 5000
+  compression: snappy
+  sample_size: 100
+  refresh_cache: false
+  verify_scope: dataset
+  verify_metadata_level: both
+  verify_file_sample_n: 50
+  seed: 42
+  skip_verify: false
+
+verify_convert:
+  scope: dataset
+  metadata_level: both
+  file_sample_n: 50
+  seed: 42
+
+schema:
+  from: auto
+  format: table
+  # diff_with: parquet
+  # output: ./schema.json
+  sample_size: 100
+  refresh_cache: false
+
+index:
+  root_dir: .
+  dataset: works
+  # index_file: ./parquet/works_id_idx.parquet
+  overwrite: false
+
+verify_index:
+  root_dir: .
+  dataset: works
+  # index_file: ./parquet/works_id_idx.parquet
+
+repair_convert:
+  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
+
+download:
+  root_dir: .
+  s3_uri: s3://openalex
+  dataset: all
+  aws_bin: aws
+  # endpoint_url: https://s3.amazonaws.com
+  # region: us-east-1
+  # profile_name: default
+  no_sign_request: true
+  signed: false
+  delete_files: true
+  no_delete: false
+  skip_validate: false
+
+verify_download:
+  root_dir: .
+  # s3_uri: s3://openalex
+  dataset: all
+  aws_bin: aws
+  # endpoint_url: https://s3.amazonaws.com
+  # region: us-east-1
+  # profile_name: default
+  no_sign_request: true
+  signed: false
+  check_extra: true
+
+report:
+  root_dir: .
+  source: all
+  # command: verify_convert
+  latest: false
+  full: false
+
+prune_reports:
+  root_dir: .
+  source: all
+  # command: verify_convert
+  keep_per_command: 1
+  dry_run: false
+
+progress:
+  root_dir: .
+  # command: convert
+  dataset: all
+  interval_sec: 2
+  watch: true
+  json: false
+
+check:
+  root_dir: .
+  dataset: all
+  aws_bin: aws
+  s3_uri: s3://openalex
+  no_sign_request: true
+  signed: false
+  profile: balanced
+  precise: true
+  strict: false
+  json: false
+"#
+    .to_string()
+}
+
+fn run_config(args: ConfigArgs) -> Result<()> {
+    let modes = (args.create.is_some() as u8) + (args.verify as u8);
+    if modes != 1 {
+        bail!("config requires exactly one mode: use --create <simple|complete|expert> or --verify");
+    }
+    if args.explain {
+        let create_mode = args
+            .create
+            .as_ref()
+            .map(|m| match m {
+                ConfigTemplateMode::Simple => "simple",
+                ConfigTemplateMode::Complete => "complete",
+                ConfigTemplateMode::Expert => "expert",
+            })
+            .unwrap_or("-");
+        println!(
+            "--explain: config mode={} create_template={} path={} stdout={} overwrite={}",
+            if args.create.is_some() {
+                "create"
+            } else {
+                "verify"
+            },
+            create_mode,
+            args.config.display(),
+            args.stdout,
+            args.overwrite
+        );
+        return Ok(());
+    }
+    if let Some(mode) = args.create {
+        let tpl = config_template(mode);
+        if args.stdout {
+            print!("{tpl}");
+            return Ok(());
+        }
+        if args.config.exists() && !args.overwrite {
+            bail!(
+                "config file already exists: {} (use --overwrite)",
+                args.config.display()
+            );
+        }
+        if let Some(parent) = args.config.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&args.config, tpl)
+            .with_context(|| format!("failed to write {}", args.config.display()))?;
+        println!("[config] created {}", args.config.display());
+        return Ok(());
+    }
+
+    let txt = fs::read_to_string(&args.config)
+        .with_context(|| format!("failed to read {}", args.config.display()))?;
+    let raw: serde_yaml::Value = serde_yaml::from_str(&txt)
+        .with_context(|| format!("invalid YAML {}", args.config.display()))?;
+    let _parsed: AppConfig = serde_yaml::from_str(&txt)
+        .with_context(|| format!("schema validation failed {}", args.config.display()))?;
+
+    let sections = raw
+        .as_mapping()
+        .map(|m| {
+            let mut v = m
+                .keys()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+    println!(
+        "[config] path={} sections=[{}] status=ok",
+        args.config.display(),
+        sections.join(", ")
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CheckFinding {
+    name: String,
+    status: String,
+    details: String,
+    recommendation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CheckJsonOutput {
+    status: String,
+    strict: bool,
+    warnings: usize,
+    failures: usize,
+    findings: Vec<CheckFinding>,
+    report_paths: Vec<String>,
+}
+
+fn run_skills(args: SkillsArgs) -> Result<()> {
+    let skills_dir = args.root_dir.join("skills");
+    let files = skills_templates(&args.root_dir);
+    if args.explain {
+        println!(
+            "--explain: skills root_dir={} overwrite={} stdout={} files={}",
+            args.root_dir.display(),
+            args.overwrite,
+            args.stdout,
+            files.len()
+        );
+        for (p, _) in &files {
+            println!("would_write: {}", p.display());
+        }
+        return Ok(());
+    }
+    if args.stdout {
+        for (p, content) in &files {
+            println!("### {}", p.display());
+            println!("{content}");
+            println!();
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(&skills_dir)?;
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    let mut overwritten = 0usize;
+    for (path, content) in files {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            if args.overwrite {
+                fs::write(&path, content)?;
+                overwritten += 1;
+            } else {
+                skipped += 1;
+            }
+        } else {
+            fs::write(&path, content)?;
+            created += 1;
+        }
+    }
+    eprintln!(
+        "[skills] root={} created={} overwritten={} skipped={}",
+        skills_dir.display(),
+        created,
+        overwritten,
+        skipped
+    );
+    Ok(())
+}
+
+fn run_check(args: CheckArgs) -> Result<()> {
+    if args.explain {
+        println!("--explain: check");
+        println!("root_dir: {}", args.shared.root_dir.display());
+        println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+        println!("parquet_dir: {}", args.shared.parquet_dir.display());
+        println!("dataset: {}", args.shared.dataset);
+        println!("duckdb_bin: {}", duckdb_bin(&args.shared).display());
+        println!("aws_bin: {}", args.aws_bin.display());
+        println!("s3_uri: {}", args.s3_uri);
+        println!("strict: {}", args.strict);
+        println!("precise: {}", args.precise);
+        return Ok(());
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "root_dir".to_string(),
+        args.shared.root_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert("strict".to_string(), args.strict.to_string());
+    report_args.insert("precise".to_string(), args.precise.to_string());
+    report_args.insert("workers".to_string(), args.shared.workers.to_string());
+    report_args.insert("profile".to_string(), format!("{:?}", args.profile));
+    report_args.insert(
+        "memory_mb".to_string(),
+        format!("{:?}", args.max_memory_mb.clone()),
+    );
+    let mut report = report_new("check", report_args);
+
+    let mut findings: Vec<CheckFinding> = Vec::new();
+    let mut warns = 0usize;
+    let mut fails = 0usize;
+
+    let duck = duckdb_bin(&args.shared);
+    match ensure_duckdb_bin(&duck) {
+        Ok(()) => findings.push(CheckFinding {
+            name: "duckdb".to_string(),
+            status: "ok".to_string(),
+            details: format!("available at {}", duck.display()),
+            recommendation: None,
+        }),
+        Err(e) => {
+            fails += 1;
+            findings.push(CheckFinding {
+                name: "duckdb".to_string(),
+                status: "fail".to_string(),
+                details: format!("{e:#}"),
+                recommendation: Some("install duckdb or use --duckdb-bin".to_string()),
+            });
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "check_dependency".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: Some(duck.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("install duckdb or use --duckdb-bin".to_string()),
+            });
+        }
+    }
+    match ensure_aws_cli(&args.aws_bin) {
+        Ok(()) => findings.push(CheckFinding {
+            name: "aws".to_string(),
+            status: "ok".to_string(),
+            details: format!("available at {}", args.aws_bin.display()),
+            recommendation: None,
+        }),
+        Err(e) => {
+            fails += 1;
+            findings.push(CheckFinding {
+                name: "aws".to_string(),
+                status: "fail".to_string(),
+                details: format!("{e:#}"),
+                recommendation: Some("install aws cli or use --aws-bin".to_string()),
+            });
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "check_dependency".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: Some(args.aws_bin.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("install aws cli or use --aws-bin".to_string()),
+            });
+        }
+    }
+
+    let meta_dir = args.shared.root_dir.join(".openalex-snapshot_metadata");
+    for (name, p) in [
+        ("root_dir", args.shared.root_dir.clone()),
+        ("snapshot_dir", args.shared.snapshot_dir.clone()),
+        ("parquet_dir", args.shared.parquet_dir.clone()),
+        ("metadata_dir", meta_dir.clone()),
+    ] {
+        match check_path_writable(&p) {
+            Ok(()) => findings.push(CheckFinding {
+                name: name.to_string(),
+                status: "ok".to_string(),
+                details: format!("writable {}", p.display()),
+                recommendation: None,
+            }),
+            Err(e) => {
+                fails += 1;
+                findings.push(CheckFinding {
+                    name: name.to_string(),
+                    status: "fail".to_string(),
+                    details: format!("{e:#}"),
+                    recommendation: Some("fix path permissions or choose another --root-dir".to_string()),
+                });
+                report.failures.push(FailureEntry {
+                    dataset: args.shared.dataset.clone(),
+                    phase: "check_path".to_string(),
+                    rel_path: None,
+                    source_path: None,
+                    output_path: Some(p.to_string_lossy().to_string()),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some(
+                        "fix path permissions or choose another --root-dir".to_string(),
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Ok(remote) = fetch_remote_manifest(
+        &ValidateDownloadArgs {
+            root_dir: args.shared.root_dir.clone(),
+            snapshot_dir: args.shared.snapshot_dir.clone(),
+            s3_uri: args.s3_uri.clone(),
+            dataset: args.shared.dataset.clone(),
+            aws_bin: args.aws_bin.clone(),
+            endpoint_url: args.endpoint_url.clone(),
+            region: args.region.clone(),
+            profile_name: args.profile_name.clone(),
+            no_sign_request: args.no_sign_request,
+            signed: args.signed,
+            check_extra: true,
+            profile: args.profile.clone(),
+            workers: args.shared.workers,
+            progress: false,
+            explain: false,
+            state_flush_every: 25,
+        },
+        false,
+    ) {
+        let remote_total_bytes: u64 = remote.iter().map(|o| o.size).sum();
+        let required_bytes = remote_total_bytes.saturating_mul(11).saturating_div(10);
+        match available_disk_bytes(&args.shared.snapshot_dir) {
+            Ok(free) if free >= required_bytes => findings.push(CheckFinding {
+                name: "download_disk".to_string(),
+                status: "ok".to_string(),
+                details: format!(
+                    "available={} GiB required={} GiB (remote={} GiB +10%)",
+                    bytes_to_gib(free),
+                    bytes_to_gib(required_bytes),
+                    bytes_to_gib(remote_total_bytes)
+                ),
+                recommendation: None,
+            }),
+            Ok(free) => {
+                fails += 1;
+                let msg = format!(
+                    "available={} GiB required={} GiB (remote={} GiB +10%)",
+                    bytes_to_gib(free),
+                    bytes_to_gib(required_bytes),
+                    bytes_to_gib(remote_total_bytes)
+                );
+                findings.push(CheckFinding {
+                    name: "download_disk".to_string(),
+                    status: "fail".to_string(),
+                    details: msg.clone(),
+                    recommendation: Some("free disk space or use download --skip-disk-check".to_string()),
+                });
+                report.failures.push(FailureEntry {
+                    dataset: args.shared.dataset.clone(),
+                    phase: "check_download_disk".to_string(),
+                    rel_path: None,
+                    source_path: Some(args.s3_uri.clone()),
+                    output_path: Some(args.shared.snapshot_dir.to_string_lossy().to_string()),
+                    error_message: msg,
+                    suggested_recovery: Some(
+                        "free disk space or use download --skip-disk-check".to_string(),
+                    ),
+                });
+            }
+            Err(e) => {
+                warns += 1;
+                findings.push(CheckFinding {
+                    name: "download_disk".to_string(),
+                    status: "warn".to_string(),
+                    details: format!("cannot evaluate disk: {e:#}"),
+                    recommendation: Some("check disk manually before download".to_string()),
+                });
+            }
+        }
+    } else {
+        warns += 1;
+        findings.push(CheckFinding {
+            name: "download_manifest".to_string(),
+            status: "warn".to_string(),
+            details: "remote manifest unavailable for estimate".to_string(),
+            recommendation: Some("check aws connectivity/settings and rerun check".to_string()),
+        });
+    }
+
+    let convert_estimate = if args.precise {
+        estimate_convert_input_bytes_precise(&args.shared.snapshot_dir, &args.shared.dataset)?
+    } else {
+        0
+    };
+    let convert_required = if args.precise {
+        convert_estimate.saturating_mul(12).saturating_div(10)
+    } else {
+        convert_min_free_bytes(&args.shared.parquet_dir)
+    };
+    match available_disk_bytes(&args.shared.parquet_dir) {
+        Ok(free) if free >= convert_required => findings.push(CheckFinding {
+            name: "convert_disk".to_string(),
+            status: "ok".to_string(),
+            details: format!(
+                "available={} GiB required={} GiB{}",
+                bytes_to_gib(free),
+                bytes_to_gib(convert_required),
+                if args.precise {
+                    format!(" (source={} GiB +20%)", bytes_to_gib(convert_estimate))
+                } else {
+                    "".to_string()
+                }
+            ),
+            recommendation: None,
+        }),
+        Ok(free) => {
+            fails += 1;
+            let msg = format!(
+                "available={} GiB required={} GiB{}",
+                bytes_to_gib(free),
+                bytes_to_gib(convert_required),
+                if args.precise {
+                    format!(" (source={} GiB +20%)", bytes_to_gib(convert_estimate))
+                } else {
+                    "".to_string()
+                }
+            );
+            findings.push(CheckFinding {
+                name: "convert_disk".to_string(),
+                status: "fail".to_string(),
+                details: msg.clone(),
+                recommendation: Some("free disk space or use convert --skip-disk-check".to_string()),
+            });
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "check_convert_disk".to_string(),
+                rel_path: None,
+                source_path: Some(args.shared.snapshot_dir.to_string_lossy().to_string()),
+                output_path: Some(args.shared.parquet_dir.to_string_lossy().to_string()),
+                error_message: msg,
+                suggested_recovery: Some(
+                    "free disk space or use convert --skip-disk-check".to_string(),
+                ),
+            });
+        }
+        Err(e) => {
+            warns += 1;
+            findings.push(CheckFinding {
+                name: "convert_disk".to_string(),
+                status: "warn".to_string(),
+                details: format!("cannot evaluate disk: {e:#}"),
+                recommendation: Some("check disk manually before convert".to_string()),
+            });
+        }
+    }
+
+    let tuning = resolve_tuning(args.profile.clone(), args.shared.workers, args.max_memory_mb);
+    let total = detect_total_memory_mb();
+    if let Some(total_mb) = total {
+        let mem = tuning.memory_mb.unwrap_or(0);
+        let ratio = if total_mb > 0 {
+            mem as f64 / total_mb as f64
+        } else {
+            0.0
+        };
+        if ratio > 0.7 {
+            warns += 1;
+            findings.push(CheckFinding {
+                name: "memory_tuning".to_string(),
+                status: "warn".to_string(),
+                details: format!(
+                    "configured memory={} MB on system={} MB (high ratio)",
+                    mem, total_mb
+                ),
+                recommendation: Some(
+                    "reduce --workers or --max-memory-mb, or use --profile safe".to_string(),
+                ),
+            });
+        } else {
+            findings.push(CheckFinding {
+                name: "memory_tuning".to_string(),
+                status: "ok".to_string(),
+                details: format!("configured memory={} MB on system={} MB", mem, total_mb),
+                recommendation: None,
+            });
+        }
+    } else {
+        warns += 1;
+        findings.push(CheckFinding {
+            name: "memory_tuning".to_string(),
+            status: "warn".to_string(),
+            details: "system memory could not be detected".to_string(),
+            recommendation: Some("set --max-memory-mb explicitly".to_string()),
+        });
+    }
+
+    report.datasets.push(DatasetReportSummary {
+        dataset: args.shared.dataset.clone(),
+        items_scanned: findings.len() as u64,
+        succeeded: findings
+            .iter()
+            .filter(|f| f.status == "ok")
+            .count() as u64,
+        failed: fails as u64,
+        skipped: 0,
+    });
+    report.totals_items_scanned = findings.len() as u64;
+    report.totals_succeeded = findings.iter().filter(|f| f.status == "ok").count() as u64;
+    report.totals_failed = fails as u64;
+    report.totals_skipped = 0;
+    report.args.insert("warnings".to_string(), warns.to_string());
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+
+    if args.json {
+        let payload = CheckJsonOutput {
+            status: if fails > 0 || (args.strict && warns > 0) {
+                "failed".to_string()
+            } else if warns > 0 {
+                "warn".to_string()
+            } else {
+                "ok".to_string()
+            },
+            strict: args.strict,
+            warnings: warns,
+            failures: fails,
+            findings,
+            report_paths: report_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "{:<20} {:<8} {:<70} {}",
+            "check", "status", "details", "recommendation"
+        );
+        println!("{}", "-".repeat(140));
+        for f in &findings {
+            println!(
+                "{:<20} {:<8} {:<70} {}",
+                f.name,
+                f.status,
+                f.details,
+                f.recommendation.clone().unwrap_or_default()
+            );
+        }
+        eprintln!(
+            "[check] summary ok={} warn={} failed={} reports={}",
+            findings.iter().filter(|f| f.status == "ok").count(),
+            warns,
+            fails,
+            report_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if fails > 0 {
+        bail!("[check] failures detected: {fails}");
+    }
+    if args.strict && warns > 0 {
+        bail!("[check] strict mode failed due to warnings: {warns}");
+    }
+    Ok(())
+}
+
+fn run_report(args: ReportArgs) -> Result<()> {
+    let mut records = load_report_records(&args.snapshot_dir, &args.parquet_dir, &args.source)?;
+    if let Some(cmd_filter) = &args.command {
+        records.retain(|r| r.report.command == *cmd_filter);
+    }
+    if args.latest {
+        let mut newest: BTreeMap<String, ReportRecord> = BTreeMap::new();
+        for rec in records {
+            let cmd = rec.report.command.clone();
+            match newest.get(&cmd) {
+                Some(existing) => {
+                    if rec.timestamp > existing.timestamp {
+                        newest.insert(cmd, rec);
+                    }
+                }
+                None => {
+                    newest.insert(cmd, rec);
+                }
+            }
+        }
+        records = newest.into_values().collect();
+    }
+    records.sort_by(|a, b| {
+        command_flow_rank(&a.report.command)
+            .cmp(&command_flow_rank(&b.report.command))
+            .then_with(|| b.timestamp.cmp(&a.timestamp))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    if records.is_empty() {
+        println!("[report] no matching reports found");
+        return Ok(());
+    }
+
+    println!(
+        "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
+        "source",
+        "command",
+        "status",
+        "failed",
+        "succeeded",
+        "skipped",
+        "started_local",
+        "runtime",
+        "path"
+    );
+    println!("{}", "-".repeat(140));
+    for rec in &records {
+        let status = if rec.report.totals_failed == 0 {
+            "ok"
+        } else {
+            "failed"
+        };
+        let started_local = Local
+            .timestamp_opt(rec.report.started_at_unix, 0)
+            .single()
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| rec.report.started_at_unix.to_string());
+        let runtime = rec
+            .report
+            .duration_seconds
+            .map(format_duration)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
+            rec.source_kind,
+            rec.report.command,
+            status,
+            rec.report.totals_failed,
+            rec.report.totals_succeeded,
+            rec.report.totals_skipped,
+            started_local,
+            runtime,
+            rec.path.display(),
+        );
+        if args.full {
+            println!("{}", serde_json::to_string_pretty(&rec.report)?);
+        }
+    }
+    println!("[report] listed {} report file(s)", records.len());
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProgressView {
+    command: String,
+    report_path: String,
+    started_at_unix: i64,
+    finished_at_unix: Option<i64>,
+    runtime_seconds: f64,
+    totals_items_scanned: u64,
+    totals_succeeded: u64,
+    totals_failed: u64,
+    totals_skipped: u64,
+    datasets: Vec<DatasetReportSummary>,
+    last_logs: Vec<String>,
+}
+
+fn canonical_command_name(s: &str) -> String {
+    match s {
+        "verify_convert" | "verify-convert" | "verify" => "verify".to_string(),
+        "verify_download" | "verify-download" | "validate-download" => {
+            "verify_download".to_string()
+        }
+        "verify_schema" | "verify-schema" => "verify_schema".to_string(),
+        "verify_index" | "verify-index" => "verify-index".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn read_last_log_lines(path: &Path, n: usize) -> Vec<String> {
+    let Ok(txt) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = txt.lines().map(|s| s.to_string()).collect();
+    if lines.len() > n {
+        lines = lines.split_off(lines.len() - n);
+    }
+    lines
+}
+
+fn log_paths_for_report(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    report: &RunReport,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if report.command == "download" || report.command == "verify_download" {
+        out.push(download_logs_dir(snapshot_dir).join(format!("{}.log", report.command)));
+        return out;
+    }
+    for ds in &report.datasets {
+        out.push(
+            dataset_logs_dir(parquet_dir, &ds.dataset).join(format!("{}.log", report.command)),
+        );
+    }
+    out
+}
+
+fn select_progress_record(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    records: Vec<ReportRecord>,
+    command: &Option<String>,
+    dataset: &str,
+) -> Option<ReportRecord> {
+    let cmd_filter = command.as_ref().map(|c| canonical_command_name(c));
+    let dataset_filter = if dataset == "all" {
+        None
+    } else {
+        Some(dataset.to_string())
+    };
+
+    let filtered: Vec<ReportRecord> = records
+        .into_iter()
+        .filter(|r| {
+            if let Some(cf) = &cmd_filter {
+                canonical_command_name(&r.report.command) == *cf
+            } else {
+                true
+            }
+        })
+        .filter(|r| {
+            if let Some(df) = &dataset_filter {
+                r.report.datasets.iter().any(|d| &d.dataset == df)
+                    || r.report.failures.iter().any(|f| &f.dataset == df)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return None;
+    }
+
+    let mut active: Vec<ReportRecord> = filtered
+        .iter()
+        .filter(|r| r.report.finished_at_unix.is_none())
+        .cloned()
+        .collect();
+    active.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    if let Some(r) = active.into_iter().next() {
+        return Some(r);
+    }
+
+    let now = now_unix();
+    let mut recent: Vec<ReportRecord> = filtered
+        .into_iter()
+        .filter(|r| {
+            let logs = log_paths_for_report(snapshot_dir, parquet_dir, &r.report);
+            logs.iter().any(|p| {
+                fs::metadata(p)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| now.saturating_sub(d.as_secs() as i64) <= 300)
+                    .unwrap_or(false)
+            })
+        })
+        .collect();
+    recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    recent.into_iter().next()
+}
+
+fn progress_snapshot(args: &ProgressArgs) -> Result<ProgressView> {
+    let records = load_report_records(&args.snapshot_dir, &args.parquet_dir, &ReportSource::All)?;
+    let rec = select_progress_record(
+        &args.snapshot_dir,
+        &args.parquet_dir,
+        records,
+        &args.command,
+        &args.dataset,
+    )
+    .ok_or_else(|| anyhow!("no matching active/recent run found"))?;
+    let runtime_seconds = rec
+        .report
+        .duration_seconds
+        .unwrap_or_else(|| (now_unix() - rec.report.started_at_unix).max(0) as f64);
+    let mut last_logs = Vec::new();
+    for lp in log_paths_for_report(&args.snapshot_dir, &args.parquet_dir, &rec.report) {
+        for line in read_last_log_lines(&lp, 2) {
+            last_logs.push(format!("{} | {}", lp.display(), line));
+        }
+    }
+    Ok(ProgressView {
+        command: rec.report.command.clone(),
+        report_path: rec.path.display().to_string(),
+        started_at_unix: rec.report.started_at_unix,
+        finished_at_unix: rec.report.finished_at_unix,
+        runtime_seconds,
+        totals_items_scanned: rec.report.totals_items_scanned,
+        totals_succeeded: rec.report.totals_succeeded,
+        totals_failed: rec.report.totals_failed,
+        totals_skipped: rec.report.totals_skipped,
+        datasets: rec.report.datasets.clone(),
+        last_logs,
+    })
+}
+
+fn print_progress_human(view: &ProgressView) {
+    println!(
+        "[progress] command={} started={} runtime={} report={}",
+        view.command,
+        view.started_at_unix,
+        format_duration(view.runtime_seconds),
+        view.report_path
+    );
+    println!(
+        "[progress] totals scanned={} ok={} failed={} skipped={}",
+        view.totals_items_scanned, view.totals_succeeded, view.totals_failed, view.totals_skipped
+    );
+    for ds in &view.datasets {
+        println!(
+            "[progress] dataset={} scanned={} ok={} failed={} skipped={}",
+            ds.dataset, ds.items_scanned, ds.succeeded, ds.failed, ds.skipped
+        );
+    }
+    for l in &view.last_logs {
+        println!("[progress] log {}", l);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AllResolved {
+    root_dir: PathBuf,
+    retry: usize,
+    enable_download: bool,
+    enable_verify_download: bool,
+    enable_convert: bool,
+    enable_verify_convert: bool,
+    enable_repair_convert: bool,
+    enable_index: bool,
+    enable_verify_index: bool,
+}
+
+fn resolve_all_settings(args: &AllArgs, cfg: &AppConfig) -> AllResolved {
+    let c = cfg.all.clone().unwrap_or_default();
+    AllResolved {
+        root_dir: args.root_dir.clone(),
+        retry: c.retry.unwrap_or(args.retry),
+        enable_download: c.enable_download.unwrap_or(true),
+        enable_verify_download: c.enable_verify_download.unwrap_or(true),
+        enable_convert: c.enable_convert.unwrap_or(true),
+        enable_verify_convert: c.enable_verify_convert.unwrap_or(true),
+        enable_repair_convert: c.enable_repair_convert.unwrap_or(true),
+        enable_index: c.enable_index.unwrap_or(true),
+        enable_verify_index: c.enable_verify_index.unwrap_or(true),
+    }
+}
+
+fn record_all_step(
+    report: &mut RunReport,
+    step_failed: &mut bool,
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    name: &str,
+    res: Result<()>,
+    msg: Option<String>,
+) {
+    let rp = latest_report_path_for_command(snapshot_dir, parquet_dir, name)
+        .map(|p| p.to_string_lossy().to_string());
+    match res {
+        Ok(()) => report.step_runs.push(StepRunSummary {
+            step: name.to_string(),
+            status: "ok".to_string(),
+            report_path: rp,
+            message: msg,
+        }),
+        Err(e) => {
+            *step_failed = true;
+            report.step_runs.push(StepRunSummary {
+                step: name.to_string(),
+                status: "failed".to_string(),
+                report_path: rp.clone(),
+                message: Some(format!("{e:#}")),
+            });
+            report.failures.push(FailureEntry {
+                dataset: "all".to_string(),
+                phase: format!("all_{name}"),
+                rel_path: None,
+                source_path: None,
+                output_path: rp,
+                error_message: format!("{e:#}"),
+                suggested_recovery: None,
+            });
+        }
+    }
+}
+
+fn latest_report_path_for_command(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    cmd: &str,
+) -> Option<PathBuf> {
+    let records = load_report_records(snapshot_dir, parquet_dir, &ReportSource::All).ok()?;
+    records
+        .into_iter()
+        .filter(|r| canonical_command_name(&r.report.command) == canonical_command_name(cmd))
+        .max_by_key(|r| r.timestamp)
+        .map(|r| r.path)
+}
+
+fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
+    let resolved = resolve_all_settings(&args, cfg);
+    let snapshot_dir = resolved.root_dir.join("openalex-snapshot");
+    let parquet_dir = resolved.root_dir.join("parquet");
+    fs::create_dir_all(&parquet_dir)?;
+
+    if args.explain {
+        println!("--explain: all");
+        println!("root_dir: {}", resolved.root_dir.display());
+        println!("retry: {}", resolved.retry);
+        println!(
+            "steps: download={} verify_download={} convert={} verify_convert={} repair_convert={} index={} verify_index={}",
+            resolved.enable_download,
+            resolved.enable_verify_download,
+            resolved.enable_convert,
+            resolved.enable_verify_convert,
+            resolved.enable_repair_convert,
+            resolved.enable_index,
+            resolved.enable_verify_index
+        );
+        return Ok(());
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert("root_dir".to_string(), resolved.root_dir.to_string_lossy().to_string());
+    report_args.insert("retry".to_string(), resolved.retry.to_string());
+    let mut report = report_new("all", report_args);
+    report.datasets.push(DatasetReportSummary {
+        dataset: "all".to_string(),
+        items_scanned: 0,
+        succeeded: 0,
+        failed: 0,
+        skipped: 0,
+    });
+
+    let mut step_failed = false;
+
+    if resolved.enable_download {
+        let mut da = DownloadArgs {
+            root_dir: resolved.root_dir.clone(),
+            snapshot_dir: PathBuf::new(),
+            s3_uri: "s3://openalex".to_string(),
+            dataset: "all".to_string(),
+            aws_bin: PathBuf::from("aws"),
+            endpoint_url: None,
+            region: None,
+            profile_name: None,
+            no_sign_request: true,
+            signed: false,
+            delete_files: true,
+            no_delete: false,
+            skip_validate: false,
+            skip_disk_check: false,
+            profile: Profile::Balanced,
+            workers: 4,
+            max_memory_mb: None,
+            progress: true,
+            explain: false,
+            state_flush_every: 25,
+        };
+        fill_download_dirs(&mut da);
+        apply_download_config(&mut da, Some(cfg));
+        fill_download_dirs(&mut da);
+        record_all_step(
+            &mut report,
+            &mut step_failed,
+            &snapshot_dir,
+            &parquet_dir,
+            "download",
+            run_download(da),
+            None,
+        );
+        if step_failed {
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            bail!("[all] aborting after download failure");
+        }
+    }
+
+    if resolved.enable_verify_download {
+        let mut va = ValidateDownloadArgs {
+            root_dir: resolved.root_dir.clone(),
+            snapshot_dir: PathBuf::new(),
+            s3_uri: "s3://openalex".to_string(),
+            dataset: "all".to_string(),
+            aws_bin: PathBuf::from("aws"),
+            endpoint_url: None,
+            region: None,
+            profile_name: None,
+            no_sign_request: true,
+            signed: false,
+            check_extra: true,
+            profile: Profile::Balanced,
+            workers: 4,
+            progress: true,
+            explain: false,
+            state_flush_every: 25,
+        };
+        fill_validate_download_dirs(&mut va);
+        apply_validate_download_config(&mut va, Some(cfg));
+        fill_validate_download_dirs(&mut va);
+        record_all_step(
+            &mut report,
+            &mut step_failed,
+            &snapshot_dir,
+            &parquet_dir,
+            "verify_download",
+            run_validate_download(va),
+            None,
+        );
+        if step_failed {
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            bail!("[all] aborting after verify_download failure");
+        }
+    }
+
+    if resolved.enable_convert {
+        let mut ca = ConvertArgs {
+            shared: SharedArgs {
+                root_dir: resolved.root_dir.clone(),
+                snapshot_dir: PathBuf::new(),
+                parquet_dir: PathBuf::new(),
+                dataset: "all".to_string(),
+                workers: 4,
+                duckdb_bin: None,
+            },
+            profile: Profile::Balanced,
+            max_memory_mb: None,
+            row_group_rows: 100_000,
+            batch_rows: 5_000,
+            compression: "snappy".to_string(),
+            sample_size: 100,
+            input_files: Vec::new(),
+            progress: true,
+            verify_scope: VerifyScope::Dataset,
+            verify_metadata_level: VerifyMetadataLevel::Both,
+            verify_file_sample_n: 50,
+            seed: 42,
+            skip_verify: true,
+            skip_disk_check: false,
+            disk_check_scope: DiskCheckScope::Dataset,
+            refresh_cache: false,
+            explain: false,
+            state_flush_every: 25,
+        };
+        fill_shared_dirs(&mut ca.shared);
+        apply_convert_config(&mut ca, Some(cfg));
+        fill_shared_dirs(&mut ca.shared);
+        ca.skip_verify = true;
+        record_all_step(
+            &mut report,
+            &mut step_failed,
+            &snapshot_dir,
+            &parquet_dir,
+            "convert",
+            run_convert(ca),
+            None,
+        );
+        if step_failed {
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            bail!("[all] aborting after convert failure");
+        }
+    }
+
+    if resolved.enable_verify_convert {
+        let mut verify_ok = false;
+        let mut attempts = 0usize;
+        loop {
+            let mut va = VerifyArgs {
+                shared: SharedArgs {
+                    root_dir: resolved.root_dir.clone(),
+                    snapshot_dir: PathBuf::new(),
+                    parquet_dir: PathBuf::new(),
+                    dataset: "all".to_string(),
+                    workers: 4,
+                    duckdb_bin: None,
+                },
+                profile: Profile::Balanced,
+                max_memory_mb: None,
+                scope: VerifyScope::Snapshot,
+                metadata_level: VerifyMetadataLevel::Both,
+                file_sample_n: 50,
+                seed: 42,
+                progress: true,
+                explain: false,
+                state_flush_every: 25,
+            };
+            fill_shared_dirs(&mut va.shared);
+            apply_verify_config(&mut va, Some(cfg));
+            fill_shared_dirs(&mut va.shared);
+            let verify_res = run_verify(va);
+            let verify_failed = verify_res.is_err();
+            record_all_step(
+                &mut report,
+                &mut step_failed,
+                &snapshot_dir,
+                &parquet_dir,
+                "verify_convert",
+                verify_res,
+                Some(format!("attempt={}", attempts + 1)),
+            );
+            if !verify_failed {
+                verify_ok = true;
+                break;
+            }
+            if !resolved.enable_repair_convert || attempts >= resolved.retry {
+                break;
+            }
+            attempts += 1;
+            let report_path = latest_report_path_for_command(&snapshot_dir, &parquet_dir, "verify_convert")
+                .ok_or_else(|| anyhow!("[all] cannot locate latest verify_convert report for repair loop"))?;
+            let mut ra = RepairArgs {
+                shared: SharedArgs {
+                    root_dir: resolved.root_dir.clone(),
+                    snapshot_dir: PathBuf::new(),
+                    parquet_dir: PathBuf::new(),
+                    dataset: "all".to_string(),
+                    workers: 4,
+                    duckdb_bin: None,
+                },
+                from_verify_report: report_path,
+                profile: Profile::Balanced,
+                max_memory_mb: None,
+                progress: true,
+                explain: false,
+                state_flush_every: 25,
+            };
+            fill_shared_dirs(&mut ra.shared);
+            apply_repair_config(&mut ra, Some(cfg));
+            fill_shared_dirs(&mut ra.shared);
+            // Always repair from loop-selected verify report.
+            let loop_report = ra.from_verify_report.clone();
+            ra.from_verify_report = loop_report;
+            record_all_step(
+                &mut report,
+                &mut step_failed,
+                &snapshot_dir,
+                &parquet_dir,
+                "repair_convert",
+                run_repair(ra),
+                Some(format!("attempt={}", attempts)),
+            );
+        }
+        if !verify_ok {
+            report.failures.push(FailureEntry {
+                dataset: "all".to_string(),
+                phase: "all_verify_repair_loop".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: None,
+                error_message: format!(
+                    "verify_convert did not pass after {} repair attempt(s)",
+                    resolved.retry
+                ),
+                suggested_recovery: Some("rerun repair_convert manually with higher memory profile".to_string()),
+            });
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            bail!("[all] verify/repair loop exhausted");
+        }
+    }
+
+    if resolved.enable_index {
+        let mut ia = IndexArgs {
+            root_dir: resolved.root_dir.clone(),
+            dataset: "works".to_string(),
+            index_file: None,
+            workers: 4,
+            profile: Profile::Balanced,
+            max_memory_mb: None,
+            duckdb_bin: None,
+            progress: true,
+            overwrite: false,
+            explain: false,
+            state_flush_every: 25,
+        };
+        apply_index_config(&mut ia, Some(cfg));
+        record_all_step(
+            &mut report,
+            &mut step_failed,
+            &snapshot_dir,
+            &parquet_dir,
+            "index",
+            run_index(ia),
+            None,
+        );
+        if step_failed {
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            bail!("[all] aborting after index failure");
+        }
+    }
+
+    if resolved.enable_verify_index {
+        let mut via = VerifyIndexArgs {
+            root_dir: resolved.root_dir.clone(),
+            dataset: "works".to_string(),
+            index_file: None,
+            workers: 4,
+            profile: Profile::Balanced,
+            max_memory_mb: None,
+            duckdb_bin: None,
+            progress: true,
+            explain: false,
+        };
+        apply_verify_index_config(&mut via, Some(cfg));
+        record_all_step(
+            &mut report,
+            &mut step_failed,
+            &snapshot_dir,
+            &parquet_dir,
+            "verify_index",
+            run_verify_index(via),
+            None,
+        );
+    }
+
+    if step_failed {
+        report.datasets[0].failed = 1;
+    } else {
+        report.datasets[0].succeeded = 1;
+    }
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&parquet_dir, &report)?;
+    eprintln!(
+        "[all] summary ok={} failed={} reports={}",
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if step_failed {
+        bail!("[all] pipeline failed");
+    }
+    Ok(())
+}
+
+fn run_progress(mut args: ProgressArgs) -> Result<()> {
+    if args.once {
+        args.watch = false;
+    }
+    if !args.watch {
+        let view = progress_snapshot(&args)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        } else {
+            print_progress_human(&view);
+        }
+        return Ok(());
+    }
+
+    loop {
+        let view = progress_snapshot(&args)?;
+        if args.json {
+            println!("{}", serde_json::to_string(&view)?);
+        } else {
+            print!("\x1B[2J\x1B[H");
+            print_progress_human(&view);
+            stdout().flush()?;
+        }
+        if view.finished_at_unix.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(args.interval_sec.max(1)));
+    }
+}
+
+fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
+    let bin = duckdb_bin_from_option(&args.duckdb_bin);
+    ensure_duckdb_bin(&bin)?;
+    let parquet_dir = args.root_dir.join("parquet");
+    let dataset = args.dataset.clone();
+    let corpus_dir = parquet_dir.join(&dataset);
+    if !corpus_dir.exists() {
+        bail!("corpus_dir does not exist: {}", corpus_dir.display());
+    }
+    let index_file = args
+        .index_file
+        .clone()
+        .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
+    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
+    if args.explain {
+        println!("--explain: verify-index");
+        println!("duckdb_bin: {}", bin.display());
+        println!("root_dir: {}", args.root_dir.display());
+        println!("dataset: {}", dataset);
+        println!("corpus_dir: {}", corpus_dir.display());
+        println!("index_file: {}", index_file.display());
+        println!("workers: {}", tuning.workers);
+        println!("memory_mb: {:?}", tuning.memory_mb);
+        return Ok(());
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "root_dir".to_string(),
+        args.root_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("dataset".to_string(), dataset.clone());
+    report_args.insert(
+        "index_file".to_string(),
+        index_file.to_string_lossy().to_string(),
+    );
+    let mut report = report_new("verify-index", report_args);
+    let mut ds = DatasetReportSummary {
+        dataset: dataset.clone(),
+        items_scanned: 1,
+        ..Default::default()
+    };
+    let pb = make_progress_bar(args.progress, 4, "verify-index");
+
+    if !index_file.exists() {
+        ds.failed += 1;
+        report.failures.push(FailureEntry {
+            dataset: dataset.clone(),
+            phase: "verify_index_exists".to_string(),
+            rel_path: None,
+            source_path: Some(index_file.to_string_lossy().to_string()),
+            output_path: None,
+            error_message: "index file missing".to_string(),
+            suggested_recovery: Some("run index subcommand first".to_string()),
+        });
+    }
+    pb.inc(1);
+
+    if report.failures.is_empty() {
+        let cols = describe_parquet_glob(&bin, &index_file.to_string_lossy(), tuning.memory_mb)?;
+        for req in ["id", "id_block", "parquet_file", "file_row_number"] {
+            if !cols.contains_key(req) {
+                ds.failed += 1;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "verify_index_schema".to_string(),
+                    rel_path: None,
+                    source_path: Some(index_file.to_string_lossy().to_string()),
+                    output_path: None,
+                    error_message: format!("required column missing: {req}"),
+                    suggested_recovery: Some(
+                        "rebuild index with `openalex-snapshot index --overwrite`".to_string(),
+                    ),
+                });
+            }
+        }
+    }
+    pb.inc(1);
+
+    let parquet_files = list_parquet_files(&corpus_dir)?;
+    if parquet_files.is_empty() {
+        ds.failed += 1;
+        report.failures.push(FailureEntry {
+            dataset: dataset.clone(),
+            phase: "verify_index_corpus".to_string(),
+            rel_path: None,
+            source_path: Some(corpus_dir.to_string_lossy().to_string()),
+            output_path: None,
+            error_message: "no parquet files found in corpus".to_string(),
+            suggested_recovery: None,
+        });
+    } else if report.failures.is_empty() {
+        let count_sql = with_session_settings(
+            &format!(
+                "SELECT (SELECT COUNT(*) FROM read_parquet({})) AS idx_count, (SELECT COUNT(*) FROM read_parquet({})) AS corpus_count;",
+                sql_quote(&index_file.to_string_lossy()),
+                sql_quote(&corpus_dir.join("**/*.parquet").to_string_lossy()),
+            ),
+            tuning.memory_mb,
+            Some(tuning.workers),
+        );
+        let row = query_one_row(&bin, &count_sql)?;
+        let idx_count = row
+            .get("idx_count")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let corpus_count = row
+            .get("corpus_count")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if idx_count != corpus_count {
+            ds.failed += 1;
+            report.failures.push(FailureEntry {
+                dataset: dataset.clone(),
+                phase: "verify_index_count".to_string(),
+                rel_path: None,
+                source_path: Some(index_file.to_string_lossy().to_string()),
+                output_path: Some(corpus_dir.to_string_lossy().to_string()),
+                error_message: format!(
+                    "row count mismatch: index={idx_count} corpus={corpus_count}"
+                ),
+                suggested_recovery: Some(
+                    "rebuild index with `openalex-snapshot index --overwrite`".to_string(),
+                ),
+            });
+        }
+    }
+    pb.inc(1);
+
+    if report.failures.is_empty() {
+        let refs_sql = with_session_settings(
+            &format!(
+                "SELECT DISTINCT parquet_file FROM read_parquet({});",
+                sql_quote(&index_file.to_string_lossy())
+            ),
+            tuning.memory_mb,
+            Some(tuning.workers),
+        );
+        let refs = run_duckdb_csv(&bin, &refs_sql)?;
+        for r in refs {
+            if let Some(rel) = r.get("parquet_file") {
+                let p = parquet_dir.join(rel);
+                if !p.exists() {
+                    ds.failed += 1;
+                    report.failures.push(FailureEntry {
+                        dataset: dataset.clone(),
+                        phase: "verify_index_path".to_string(),
+                        rel_path: Some(rel.clone()),
+                        source_path: Some(index_file.to_string_lossy().to_string()),
+                        output_path: Some(p.to_string_lossy().to_string()),
+                        error_message: "index references missing parquet file".to_string(),
+                        suggested_recovery: Some(
+                            "re-run convert for missing files then rebuild index".to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    pb.inc(1);
+    pb.finish_with_message("verify-index complete");
+
+    if ds.failed == 0 {
+        ds.succeeded = 1;
+    }
+    report.datasets = vec![ds];
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&parquet_dir, &report)?;
+    eprintln!(
+        "[verify-index] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[verify-index] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn format_duration(seconds: f64) -> String {
+    let s = seconds.round().max(0.0) as u64;
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{sec:02}s")
+    } else if m > 0 {
+        format!("{m}m{sec:02}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+fn run_prune_reports(args: PruneReportsArgs) -> Result<()> {
+    let mut records = load_report_records(&args.snapshot_dir, &args.parquet_dir, &args.source)?;
+    if let Some(cmd_filter) = &args.command {
+        records.retain(|r| r.report.command == *cmd_filter);
+    }
+    if records.is_empty() {
+        println!("[prune-reports] no matching reports found");
+        return Ok(());
+    }
+
+    let keep_n = args.keep_per_command.max(1);
+    let roots = report_roots(&args.snapshot_dir, &args.parquet_dir, &args.source);
+    let mut by_command: BTreeMap<String, Vec<ReportRecord>> = BTreeMap::new();
+    for rec in records {
+        by_command
+            .entry(rec.report.command.clone())
+            .or_default()
+            .push(rec);
+    }
+
+    let mut prune_names: BTreeSet<String> = BTreeSet::new();
+    let mut kept = 0usize;
+    for (_cmd, mut items) in by_command {
+        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        kept += items.len().min(keep_n);
+        for rec in items.into_iter().skip(keep_n) {
+            if let Some(name) = rec.path.file_name().and_then(|s| s.to_str()) {
+                prune_names.insert(name.to_string());
+            }
+        }
+    }
+
+    if prune_names.is_empty() {
+        println!("[prune-reports] nothing to prune (keep_per_command={keep_n})");
+        return Ok(());
+    }
+
+    let mut deleted = 0usize;
+    let mut missing = 0usize;
+    for root in roots {
+        for name in &prune_names {
+            let p = root.join(name);
+            if p.exists() {
+                if args.dry_run {
+                    println!("[prune-reports] would delete {}", p.display());
+                } else {
+                    fs::remove_file(&p)
+                        .with_context(|| format!("failed to delete {}", p.display()))?;
+                    println!("[prune-reports] deleted {}", p.display());
+                }
+                deleted += 1;
+            } else {
+                missing += 1;
+            }
+        }
+    }
+
+    println!(
+        "[prune-reports] kept={} pruned_names={} deleted_files={} missing={} dry_run={}",
+        kept,
+        prune_names.len(),
+        deleted,
+        missing,
+        args.dry_run
+    );
+    Ok(())
+}
+
+fn run_convert(args: ConvertArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    fs::create_dir_all(&args.shared.parquet_dir)?;
+    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
+    let duckdb_bin = duckdb_bin(&args.shared);
+
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+    if args.explain {
+        explain_convert(&args, &datasets, &duckdb_bin, &tuning);
+        return Ok(());
+    }
+    let mut report_args = BTreeMap::new();
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert("compression".to_string(), args.compression.clone());
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("convert", report_args);
+    let flush_every = args.state_flush_every.max(1);
+    if !args.skip_disk_check && args.disk_check_scope == DiskCheckScope::Dataset {
+        let free_bytes = available_disk_bytes(&args.shared.parquet_dir)?;
+        let required_min_bytes = convert_min_free_bytes(&args.shared.parquet_dir);
+        if free_bytes < required_min_bytes {
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "convert_disk_space".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: Some(args.shared.parquet_dir.to_string_lossy().to_string()),
+                error_message: format!(
+                    "insufficient free disk space: available={} GiB required_min={} GiB",
+                    bytes_to_gib(free_bytes),
+                    bytes_to_gib(required_min_bytes)
+                ),
+                suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+            });
+            report_finalize(&mut report);
+            let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+            eprintln!(
+                "[convert] summary scanned={} ok={} failed={} reports={}",
+                report.totals_items_scanned,
+                report.totals_succeeded,
+                report.totals_failed,
+                report_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            bail!(
+                "[convert] insufficient disk space at {}: available {} GiB, required at least {} GiB (or use --skip-disk-check)",
+                args.shared.parquet_dir.display(),
+                bytes_to_gib(free_bytes),
+                bytes_to_gib(required_min_bytes)
+            );
+        }
+    }
+
+    for dataset in &datasets {
+        let dataset_start = Instant::now();
+        let mut ds = DatasetReportSummary {
+            dataset: dataset.clone(),
+            ..Default::default()
+        };
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "convert",
+            &format!(
+                "start workers={} memory_mb={:?} compression={} row_group_rows={} verify_scope={:?}",
+                tuning.workers, tuning.memory_mb, args.compression, args.row_group_rows, args.verify_scope
+            ),
+        );
+        eprintln!("[convert] dataset={dataset} scanning input files ...");
+        let mut pairs =
+            enumerate_pairs(&args.shared.snapshot_dir, &args.shared.parquet_dir, dataset)?;
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "convert",
+            &format!("scanned source_files={}", pairs.len()),
+        );
+        if !args.input_files.is_empty() {
+            pairs = filter_pairs_by_input_files(
+                &pairs,
+                &args.input_files,
+                &args.shared.snapshot_dir,
+                dataset,
+            )?;
+            if pairs.is_empty() {
+                eprintln!("[convert] dataset={dataset} no matching --input-file entries");
+                try_log_dataset(
+                    &args.shared.parquet_dir,
+                    dataset,
+                    "convert",
+                    "no matching --input-file entries",
+                );
+                continue;
+            }
+        }
+        if pairs.is_empty() {
+            eprintln!("[convert] dataset={dataset} no source files found");
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                "no source files found",
+            );
+            report.datasets.push(ds);
+            continue;
+        }
+        let pairs_len = pairs.len();
+
+        let todo: Vec<FilePair> = pairs
+            .into_iter()
+            .filter(|p| !p.output_parquet.exists())
+            .collect();
+
+        if todo.is_empty() {
+            eprintln!("[convert] dataset={dataset} all files already converted");
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                "all files already converted",
+            );
+            ds.skipped = pairs_len as u64;
+            report.datasets.push(ds);
+            continue;
+        }
+        ds.items_scanned = todo.len() as u64;
+
+        eprintln!(
+            "[convert] dataset={dataset} todo_files={} (starting schema inference)",
+            todo.len()
+        );
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "convert",
+            &format!("todo_files={} schema_inference_start", todo.len()),
+        );
+        fs::create_dir_all(dataset_cache_dir(&args.shared.parquet_dir, dataset))?;
+        let schema = match load_or_infer_source_schema(
+            &duckdb_bin,
+            &args.shared.snapshot_dir,
+            &args.shared.parquet_dir,
+            dataset,
+            args.sample_size,
+            args.refresh_cache,
+            tuning.memory_mb,
+            args.state_flush_every,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                ds.failed += ds.items_scanned;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "schema_infer".to_string(),
+                    rel_path: None,
+                    source_path: Some(
+                        args.shared
+                            .snapshot_dir
+                            .join("data")
+                            .join(dataset)
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    output_path: Some(
+                        args.shared
+                            .parquet_dir
+                            .join(dataset)
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some(
+                        "refresh schema cache or reduce sample size".to_string(),
+                    ),
+                });
+                ds.succeeded = 0;
+                report.datasets.push(ds);
+                report_finalize(&mut report);
+                let _ = write_run_reports(&args.shared.parquet_dir, &report);
+                continue;
+            }
+        };
+        eprintln!("[convert] dataset={dataset} schema inference complete");
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "convert",
+            "schema inference complete",
+        );
+        let columns_clause = to_duckdb_columns_clause(&schema.fields);
+
+        let start = Instant::now();
+        let pb = make_progress_bar(
+            args.progress,
+            todo.len() as u64,
+            &format!("convert:{dataset}"),
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tuning.workers)
+            .build()
+            .context("failed to build rayon thread pool")?;
+
+        let schema_arc = Arc::new(columns_clause);
+        let duckdb_arc = Arc::new(duckdb_bin.clone());
+        let compression = args.compression.clone();
+        let row_group_rows = args.row_group_rows;
+        let memory_mb = tuning.memory_mb;
+        let parquet_root = Arc::new(args.shared.parquet_dir.clone());
+        let dataset_name = dataset.clone();
+        let extra_json_options = if dataset == "works" {
+            ", maximum_object_size=1000000000".to_string()
+        } else {
+            "".to_string()
+        };
+
+        for chunk in todo.chunks(flush_every) {
+            let results: Vec<Option<FailureEntry>> = pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|pair| {
+                        if !args.skip_disk_check && args.disk_check_scope == DiskCheckScope::File {
+                            match available_disk_bytes(parquet_root.as_path()) {
+                                Ok(free_bytes) => {
+                                    let input_size = fs::metadata(&pair.input_gz).map(|m| m.len()).unwrap_or(0);
+                                    let required_bytes = input_size.saturating_add(64 * 1024 * 1024);
+                                    if free_bytes < required_bytes {
+                                        pb.inc(1);
+                                        return Some(FailureEntry {
+                                            dataset: dataset.clone(),
+                                            phase: "convert_disk_space".to_string(),
+                                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                                            error_message: format!(
+                                                "insufficient free disk space for file preflight: available={} GiB required={} GiB",
+                                                bytes_to_gib(free_bytes),
+                                                bytes_to_gib(required_bytes)
+                                            ),
+                                            suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    pb.inc(1);
+                                    return Some(FailureEntry {
+                                        dataset: dataset.clone(),
+                                        phase: "convert_disk_space".to_string(),
+                                        rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                        source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                        output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                                        error_message: format!("disk space check failed: {e:#}"),
+                                        suggested_recovery: Some("retry with --skip-disk-check".to_string()),
+                                    });
+                                }
+                            }
+                        }
+                        let out = convert_one(
+                            &duckdb_arc,
+                            pair,
+                            &schema_arc,
+                            &compression,
+                            row_group_rows,
+                            memory_mb,
+                            &extra_json_options,
+                        );
+                        pb.inc(1);
+                        match out {
+                            Ok(()) => {
+                                try_log_dataset(
+                                    parquet_root.as_path(),
+                                    &dataset_name,
+                                    "convert",
+                                    &format!("file converted {}", pair.rel.to_string_lossy()),
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                let suggestion = if msg.contains("Out of Memory Error") {
+                                    Some(format!(
+                                        "./target/release/openalex-snapshot convert --root-dir {} --dataset {} --profile safe --workers 1 --max-memory-mb 4096",
+                                        args.shared.root_dir.display(),
+                                        dataset
+                                    ))
+                                } else {
+                                    Some("retry converting this single file via --input-file".to_string())
+                                };
+                                Some(FailureEntry {
+                                    dataset: dataset.clone(),
+                                    phase: "convert_file".to_string(),
+                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                    output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                                    error_message: msg,
+                                    suggested_recovery: suggestion,
+                                })
+                            }
+                        }
+                    })
+                    .collect()
+            });
+            for f in results.into_iter().flatten() {
+                ds.failed += 1;
+                report.failures.push(f);
+            }
+            ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+            let mut preview = report.clone();
+            preview.datasets.retain(|d| d.dataset != *dataset);
+            preview.datasets.push(ds.clone());
+            report_finalize(&mut preview);
+            let _ = write_run_reports(&args.shared.parquet_dir, &preview);
+        }
+
+        pb.finish_with_message(format!(
+            "convert:{dataset} done in {:.1}s",
+            start.elapsed().as_secs_f64()
+        ));
+        eprintln!("[convert] dataset={dataset} conversion stage complete");
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "convert",
+            &format!(
+                "conversion stage complete elapsed_s={:.2}",
+                dataset_start.elapsed().as_secs_f64()
+            ),
+        );
+        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+        report.datasets.push(ds);
+        report_finalize(&mut report);
+        let _ = write_run_reports(&args.shared.parquet_dir, &report);
+    }
+
+    if !args.skip_verify {
+        eprintln!("[convert] conversion complete, starting verify stage ...");
+        let verify_args = VerifyArgs {
+            shared: args.shared.clone(),
+            profile: args.profile.clone(),
+            max_memory_mb: args.max_memory_mb,
+            scope: args.verify_scope,
+            metadata_level: args.verify_metadata_level,
+            file_sample_n: args.verify_file_sample_n,
+            seed: args.seed,
+            progress: args.progress,
+            explain: false,
+            state_flush_every: args.state_flush_every,
+        };
+        if let Err(e) = run_verify(verify_args) {
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "post_verify".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: None,
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("run verify separately for detailed report".to_string()),
+            });
+        }
+    }
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    eprintln!(
+        "[convert] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[convert] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn run_index(args: IndexArgs) -> Result<()> {
+    let bin = duckdb_bin_from_option(&args.duckdb_bin);
+    ensure_duckdb_bin(&bin)?;
+    let parquet_dir = args.root_dir.join("parquet");
+    let dataset = args.dataset.clone();
+    let corpus_dir = parquet_dir.join(&dataset);
+    if !corpus_dir.exists() {
+        bail!("corpus_dir does not exist: {}", corpus_dir.display());
+    }
+
+    let index_file = args
+        .index_file
+        .clone()
+        .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
+    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
+    if args.explain {
+        explain_index(&args, &bin, &corpus_dir, &index_file, &tuning);
+        return Ok(());
+    }
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "root_dir".to_string(),
+        args.root_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("dataset".to_string(), dataset.clone());
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("index", report_args);
+    let mut ds = DatasetReportSummary {
+        dataset: dataset.clone(),
+        ..Default::default()
+    };
+    let flush_every = args.state_flush_every.max(1);
+
+    if index_file.exists() {
+        if args.overwrite {
+            fs::remove_file(&index_file)
+                .with_context(|| format!("failed to remove {}", index_file.display()))?;
+        } else {
+            eprintln!(
+                "[index] index_file exists - skipped (use --overwrite): {}",
+                index_file.display()
+            );
+            try_log_dataset(
+                &parquet_dir,
+                &dataset,
+                "index",
+                &format!("index_file exists skipped {}", index_file.display()),
+            );
+            ds.skipped = 1;
+            report.datasets.push(ds);
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            return Ok(());
+        }
+    }
+
+    let files = list_parquet_files(&corpus_dir)?;
+    if files.is_empty() {
+        bail!("no parquet files found under {}", corpus_dir.display());
+    }
+    try_log_dataset(
+        &parquet_dir,
+        &dataset,
+        "index",
+        &format!(
+            "start files={} workers={} memory_mb={:?}",
+            files.len(),
+            tuning.workers,
+            tuning.memory_mb
+        ),
+    );
+    ds.items_scanned = files.len() as u64;
+
+    let start = Instant::now();
+    let temp_dir = PathBuf::from(format!("{}_tmp", index_file.to_string_lossy()));
+    fs::create_dir_all(&temp_dir)?;
+    let _ = fs::write(temp_dir.join(".metadata_never_index"), b"");
+
+    let stage1 = make_progress_bar(args.progress, files.len() as u64, "index:stage1");
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(tuning.workers)
+        .build()
+        .context("failed to build rayon thread pool")?;
+
+    let bin_arc = Arc::new(bin.clone());
+    let temp_arc = Arc::new(temp_dir.clone());
+    let base_arc = Arc::new(parquet_dir.clone());
+
+    for (chunk_idx, chunk) in files.chunks(flush_every).enumerate() {
+        let outcomes: Vec<(bool, Option<FailureEntry>)> = pool.install(|| {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(offset, pf)| {
+                    let i = chunk_idx * flush_every + offset;
+                    let out_file = temp_arc.join(format!("idx_{:05}.parquet", i + 1));
+                    if out_file.exists() {
+                        stage1.inc(1);
+                        return (true, None);
+                    }
+
+                    let rel = match pf.strip_prefix(base_arc.as_path()) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(e) => {
+                            stage1.inc(1);
+                            return (false, Some(FailureEntry {
+                                dataset: dataset.clone(),
+                                phase: "index_stage1".to_string(),
+                                rel_path: None,
+                                source_path: Some(pf.to_string_lossy().to_string()),
+                                output_path: Some(out_file.to_string_lossy().to_string()),
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: None,
+                            }));
+                        }
+                    };
+                    let rel_s = rel.to_string_lossy().replace('\\', "/");
+
+                    let mut sql = String::new();
+                    sql.push_str("SET preserve_insertion_order = false;");
+                    sql.push_str("SET threads = 1;");
+                    if let Some(mb) = tuning.memory_mb {
+                        sql.push_str(&format!("SET memory_limit='{}MB';", mb));
+                    }
+                    sql.push_str(&format!(
+                        "COPY (SELECT id, \
+                         CAST(FLOOR(CAST(regexp_extract(CAST(id AS VARCHAR), '([0-9]+)$', 1) AS BIGINT) / 10000) AS INTEGER) AS id_block, \
+                         '{}' AS parquet_file, \
+                         file_row_number \
+                         FROM read_parquet({}, file_row_number = true)) \
+                         TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
+                        rel_s.replace('\'', "''"),
+                        sql_quote(&pf.to_string_lossy()),
+                        sql_quote(&out_file.to_string_lossy())
+                    ));
+                    stage1.inc(1);
+                    match run_duckdb_sql(&bin_arc, &sql) {
+                        Ok(()) => (false, None),
+                        Err(e) => (false, Some(FailureEntry {
+                            dataset: dataset.clone(),
+                            phase: "index_stage1".to_string(),
+                            rel_path: Some(rel_s),
+                            source_path: Some(pf.to_string_lossy().to_string()),
+                            output_path: Some(out_file.to_string_lossy().to_string()),
+                            error_message: format!("{e:#}"),
+                            suggested_recovery: Some("repair/reconvert parquet file and rerun index".to_string()),
+                        })),
+                    }
+                })
+                .collect()
+        });
+        for (skipped, failure) in outcomes {
+            if skipped {
+                ds.skipped += 1;
+            }
+            if let Some(f) = failure {
+                ds.failed += 1;
+                report.failures.push(f);
+            }
+        }
+        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed + ds.skipped);
+        let mut preview = report.clone();
+        preview.datasets = vec![ds.clone()];
+        report_finalize(&mut preview);
+        let _ = write_run_reports(&parquet_dir, &preview);
+    }
+    stage1.finish_with_message("index:stage1 complete");
+
+    if ds.failed == 0 {
+        let stage2 = make_progress_bar(args.progress, 1, "index:stage2");
+        let combine_sql = format!(
+            "COPY (SELECT * FROM read_parquet({})) TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
+            sql_quote(&temp_dir.join("*.parquet").to_string_lossy()),
+            sql_quote(&index_file.to_string_lossy())
+        );
+        if let Err(e) = run_duckdb_sql(&bin, &combine_sql) {
+            ds.failed += 1;
+            report.failures.push(FailureEntry {
+                dataset: dataset.clone(),
+                phase: "index_stage2".to_string(),
+                rel_path: None,
+                source_path: Some(temp_dir.to_string_lossy().to_string()),
+                output_path: Some(index_file.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("fix stage1 failures and rerun index".to_string()),
+            });
+        } else {
+            stage2.inc(1);
+            stage2.finish_with_message("index:stage2 complete");
+        }
+    } else {
+        report.failures.push(FailureEntry {
+            dataset: dataset.clone(),
+            phase: "index_stage2".to_string(),
+            rel_path: None,
+            source_path: Some(temp_dir.to_string_lossy().to_string()),
+            output_path: Some(index_file.to_string_lossy().to_string()),
+            error_message: format!("stage1 failed for {} shard(s), stage2 skipped", ds.failed),
+            suggested_recovery: Some("fix/reconvert failed files and rerun index".to_string()),
+        });
+    }
+
+    fs::remove_dir_all(&temp_dir)
+        .with_context(|| format!("failed to remove temp dir {}", temp_dir.display()))?;
+
+    let sz = fs::metadata(&index_file).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[index] done in {:.1}s, size {:.2} MB, file={}",
+        start.elapsed().as_secs_f64(),
+        (sz as f64) / (1024.0 * 1024.0),
+        index_file.display()
+    );
+    try_log_dataset(
+        &parquet_dir,
+        &dataset,
+        "index",
+        &format!(
+            "done elapsed_s={:.2} size_mb={:.2} file={}",
+            start.elapsed().as_secs_f64(),
+            (sz as f64) / (1024.0 * 1024.0),
+            index_file.display()
+        ),
+    );
+    ds.succeeded = ds.items_scanned.saturating_sub(ds.failed + ds.skipped);
+    report.datasets = vec![ds];
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&parquet_dir, &report)?;
+    eprintln!(
+        "[index] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[index] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn run_verify(args: VerifyArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
+    let duckdb_bin = duckdb_bin(&args.shared);
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+    if args.explain {
+        explain_verify(&args, &datasets, &duckdb_bin, &tuning);
+        return Ok(());
+    }
+    let mut report_args = BTreeMap::new();
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert("scope".to_string(), format!("{:?}", args.scope));
+    report_args.insert(
+        "metadata_level".to_string(),
+        format!("{:?}", args.metadata_level),
+    );
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("verify_convert", report_args);
+
+    let flush_every = args.state_flush_every.max(1);
+
+    for dataset in &datasets {
+        let dataset_start = Instant::now();
+        let mut ds = DatasetReportSummary {
+            dataset: dataset.clone(),
+            ..Default::default()
+        };
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "verify",
+            &format!(
+                "start scope={:?} file_sample_n={} metadata_level={:?}",
+                args.scope, args.file_sample_n, args.metadata_level
+            ),
+        );
+        let pairs = enumerate_pairs(&args.shared.snapshot_dir, &args.shared.parquet_dir, dataset)?;
+        if pairs.is_empty() {
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "verify",
+                "no file pairs found",
+            );
+            report.datasets.push(ds);
+            continue;
+        }
+        let mut source_metrics = load_source_metrics_cache(&args.shared.parquet_dir, dataset)?;
+        let mut parquet_metrics = load_parquet_metrics_cache(&args.shared.parquet_dir, dataset)?;
+
+        match args.scope {
+            VerifyScope::File => {
+                let mut candidates: Vec<&FilePair> = pairs.iter().collect();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
+                candidates.shuffle(&mut rng);
+                let n = args.file_sample_n.min(candidates.len());
+                let sample = &candidates[..n];
+                ds.items_scanned = sample.len() as u64;
+
+                let pb = make_progress_bar(
+                    args.progress,
+                    sample.len() as u64,
+                    &format!("verify-file:{dataset}"),
+                );
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(tuning.workers)
+                    .build()
+                    .context("failed to build rayon thread pool")?;
+                let source_metrics_arc = Arc::new(std::sync::Mutex::new(source_metrics));
+                let parquet_metrics_arc = Arc::new(std::sync::Mutex::new(parquet_metrics));
+
+                for chunk in sample.chunks(flush_every) {
+                    let failures: Vec<Option<FailureEntry>> = pool.install(|| {
+                        chunk
+                            .par_iter()
+                            .map(|p| {
+                                if !p.output_parquet.exists() {
+                                    pb.inc(1);
+                                    return Some(FailureEntry {
+                                        dataset: dataset.clone(),
+                                        phase: "verify_metrics".to_string(),
+                                        rel_path: Some(p.rel.to_string_lossy().to_string()),
+                                        source_path: Some(p.input_gz.to_string_lossy().to_string()),
+                                        output_path: Some(
+                                            p.output_parquet.to_string_lossy().to_string(),
+                                        ),
+                                        error_message: "missing parquet file".to_string(),
+                                        suggested_recovery: Some(
+                                            "re-run convert for this file".to_string(),
+                                        ),
+                                    });
+                                }
+                                let out = verify_file_metrics(
+                                    &duckdb_bin,
+                                    p,
+                                    args.metadata_level.clone(),
+                                    &source_metrics_arc,
+                                    &parquet_metrics_arc,
+                                    tuning.memory_mb,
+                                );
+                                pb.inc(1);
+                                match out {
+                                    Ok(()) => None,
+                                    Err(e) => Some(FailureEntry {
+                                        dataset: dataset.clone(),
+                                        phase: "verify_metrics".to_string(),
+                                        rel_path: Some(p.rel.to_string_lossy().to_string()),
+                                        source_path: Some(p.input_gz.to_string_lossy().to_string()),
+                                        output_path: Some(
+                                            p.output_parquet.to_string_lossy().to_string(),
+                                        ),
+                                        error_message: format!("{e:#}"),
+                                        suggested_recovery: Some(
+                                            "reconvert file and re-run verify".to_string(),
+                                        ),
+                                    }),
+                                }
+                            })
+                            .collect()
+                    });
+                    for f in failures.into_iter().flatten() {
+                        ds.failed += 1;
+                        report.failures.push(f);
+                    }
+                    ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+                    source_metrics = source_metrics_arc
+                        .lock()
+                        .map_err(|_| anyhow!("verify metrics cache lock poisoned"))?
+                        .clone();
+                    parquet_metrics = parquet_metrics_arc
+                        .lock()
+                        .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?
+                        .clone();
+                    save_source_metrics_cache(&args.shared.parquet_dir, dataset, &source_metrics)?;
+                    save_parquet_metrics_cache(
+                        &args.shared.parquet_dir,
+                        dataset,
+                        &parquet_metrics,
+                    )?;
+                    let mut preview = report.clone();
+                    preview.datasets.retain(|d| d.dataset != *dataset);
+                    preview.datasets.push(ds.clone());
+                    report_finalize(&mut preview);
+                    let _ = write_run_reports(&args.shared.parquet_dir, &preview);
+                }
+                pb.finish_with_message(format!("verify-file:{dataset} ok"));
+            }
+            VerifyScope::Dataset | VerifyScope::Snapshot => {
+                let mut missing = Vec::new();
+                for p in &pairs {
+                    if !p.output_parquet.exists() {
+                        missing.push(p.rel.clone());
+                    }
+                }
+                if !missing.is_empty() {
+                    for rel in missing {
+                        ds.failed += 1;
+                        report.failures.push(FailureEntry {
+                            dataset: dataset.clone(),
+                            phase: "structure".to_string(),
+                            rel_path: Some(rel.to_string_lossy().to_string()),
+                            source_path: None,
+                            output_path: Some(
+                                args.shared
+                                    .parquet_dir
+                                    .join(dataset)
+                                    .join(rel.with_extension("parquet"))
+                                    .to_string_lossy()
+                                    .to_string(),
+                            ),
+                            error_message: "missing parquet file".to_string(),
+                            suggested_recovery: Some(
+                                "re-run convert for missing files".to_string(),
+                            ),
+                        });
+                    }
+                }
+
+                let expected_rel: BTreeSet<PathBuf> = pairs
+                    .iter()
+                    .map(|p| p.rel.with_extension("parquet"))
+                    .collect();
+                let actual_rel: BTreeSet<PathBuf> =
+                    list_parquet_rel(&args.shared.parquet_dir.join(dataset))?;
+                if expected_rel != actual_rel {
+                    let extra = actual_rel.difference(&expected_rel).count();
+                    let miss = expected_rel.difference(&actual_rel).count();
+                    report.failures.push(FailureEntry {
+                        dataset: dataset.clone(),
+                        phase: "structure".to_string(),
+                        rel_path: None,
+                        source_path: None,
+                        output_path: Some(
+                            args.shared
+                                .parquet_dir
+                                .join(dataset)
+                                .to_string_lossy()
+                                .to_string(),
+                        ),
+                        error_message: format!(
+                            "structure mismatch (missing={miss}, extra={extra})"
+                        ),
+                        suggested_recovery: Some(
+                            "re-run convert and clean unexpected parquet files".to_string(),
+                        ),
+                    });
+                    ds.failed += 1;
+                }
+
+                ds.items_scanned = pairs.len() as u64;
+                let pb = make_progress_bar(
+                    args.progress,
+                    pairs.len() as u64,
+                    &format!("verify-count:{dataset}"),
+                );
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(tuning.workers)
+                    .build()
+                    .context("failed to build rayon thread pool")?;
+                let source_metrics_arc = Arc::new(std::sync::Mutex::new(source_metrics));
+                let parquet_metrics_arc = Arc::new(std::sync::Mutex::new(parquet_metrics));
+
+                for chunk in pairs.chunks(flush_every) {
+                    let failures: Vec<Option<FailureEntry>> = pool.install(|| {
+                        chunk
+                            .par_iter()
+                            .map(|p| {
+                                let out = verify_file_metrics(
+                                    &duckdb_bin,
+                                    p,
+                                    args.metadata_level.clone(),
+                                    &source_metrics_arc,
+                                    &parquet_metrics_arc,
+                                    tuning.memory_mb,
+                                );
+                                pb.inc(1);
+                                match out {
+                                    Ok(()) => None,
+                                    Err(e) => Some(FailureEntry {
+                                        dataset: dataset.clone(),
+                                        phase: "verify_metrics".to_string(),
+                                        rel_path: Some(p.rel.to_string_lossy().to_string()),
+                                        source_path: Some(p.input_gz.to_string_lossy().to_string()),
+                                        output_path: Some(
+                                            p.output_parquet.to_string_lossy().to_string(),
+                                        ),
+                                        error_message: format!("{e:#}"),
+                                        suggested_recovery: Some(
+                                            "reconvert file and re-run verify".to_string(),
+                                        ),
+                                    }),
+                                }
+                            })
+                            .collect()
+                    });
+                    for f in failures.into_iter().flatten() {
+                        ds.failed += 1;
+                        report.failures.push(f);
+                    }
+                    ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+                    source_metrics = source_metrics_arc
+                        .lock()
+                        .map_err(|_| anyhow!("verify metrics cache lock poisoned"))?
+                        .clone();
+                    parquet_metrics = parquet_metrics_arc
+                        .lock()
+                        .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?
+                        .clone();
+                    save_source_metrics_cache(&args.shared.parquet_dir, dataset, &source_metrics)?;
+                    save_parquet_metrics_cache(
+                        &args.shared.parquet_dir,
+                        dataset,
+                        &parquet_metrics,
+                    )?;
+                    let mut preview = report.clone();
+                    preview.datasets.retain(|d| d.dataset != *dataset);
+                    preview.datasets.push(ds.clone());
+                    report_finalize(&mut preview);
+                    let _ = write_run_reports(&args.shared.parquet_dir, &preview);
+                }
+                pb.finish_with_message(format!("verify-count:{dataset} ok"));
+            }
+        }
+        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+        report.datasets.push(ds.clone());
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            dataset,
+            "verify",
+            &format!(
+                "done pairs={} elapsed_s={:.2}",
+                pairs.len(),
+                dataset_start.elapsed().as_secs_f64()
+            ),
+        );
+        report_finalize(&mut report);
+        let _ = write_run_reports(&args.shared.parquet_dir, &report);
+    }
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    eprintln!(
+        "[verify] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!(
+            "[verify] failures detected: {} files/conditions failed",
+            report.totals_failed
+        );
+    }
+    Ok(())
+}
+
+fn run_schema(args: SchemaArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
+    let duckdb_bin = duckdb_bin(&args.shared);
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+    if args.explain {
+        explain_schema(&args, &datasets, &duckdb_bin, &tuning);
+        return Ok(());
+    }
+    let mut report_args = BTreeMap::new();
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert("from".to_string(), format!("{:?}", args.from));
+    report_args.insert("format".to_string(), format!("{:?}", args.format));
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("schema", report_args);
+
+    for dataset in datasets {
+        let dataset_start = Instant::now();
+        let mut ds = DatasetReportSummary {
+            dataset: dataset.clone(),
+            items_scanned: 1,
+            ..Default::default()
+        };
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            &dataset,
+            "schema",
+            &format!("start from={:?} format={:?}", args.from, args.format),
+        );
+        let schema = match load_schema_by_policy(
+            &duckdb_bin,
+            &args.shared.snapshot_dir,
+            &args.shared.parquet_dir,
+            &dataset,
+            args.from.clone(),
+            args.sample_size,
+            args.refresh_cache,
+            tuning.memory_mb,
+            args.state_flush_every,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                ds.failed = 1;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "schema_load".to_string(),
+                    rel_path: None,
+                    source_path: Some(
+                        args.shared
+                            .snapshot_dir
+                            .join("data")
+                            .join(&dataset)
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    output_path: Some(
+                        args.shared
+                            .parquet_dir
+                            .join(&dataset)
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some(
+                        "check schema cache/source availability and retry".to_string(),
+                    ),
+                });
+                report.datasets.push(ds);
+                report_finalize(&mut report);
+                let _ = write_run_reports(&args.shared.parquet_dir, &report);
+                continue;
+            }
+        };
+
+        let rendered = if let Some(diff_with) = &args.diff_with {
+            let right = match load_schema_by_policy(
+                &duckdb_bin,
+                &args.shared.snapshot_dir,
+                &args.shared.parquet_dir,
+                &dataset,
+                diff_with.clone(),
+                args.sample_size,
+                args.refresh_cache,
+                tuning.memory_mb,
+                args.state_flush_every,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    ds.failed = 1;
+                    report.failures.push(FailureEntry {
+                        dataset: dataset.clone(),
+                        phase: "schema_diff_rhs".to_string(),
+                        rel_path: None,
+                        source_path: None,
+                        output_path: None,
+                        error_message: format!("{e:#}"),
+                        suggested_recovery: Some(
+                            "retry without --diff-with or fix right-hand source".to_string(),
+                        ),
+                    });
+                    report.datasets.push(ds);
+                    report_finalize(&mut report);
+                    let _ = write_run_reports(&args.shared.parquet_dir, &report);
+                    continue;
+                }
+            };
+            render_schema_diff(&schema, &right, &args.format)?
+        } else {
+            match args.format {
+                SchemaFormat::Table => render_table(&schema),
+                SchemaFormat::Json => serde_json::to_string_pretty(&schema)?,
+                SchemaFormat::Yaml => serde_yaml::to_string(&schema)?,
+                SchemaFormat::ArrowR => {
+                    let value = serde_json::json!({
+                        "dataset": schema.dataset,
+                        "source": schema.source,
+                        "schema": {
+                            "fields": schema.fields,
+                            "metadata": schema.metadata,
+                        }
+                    });
+                    serde_json::to_string_pretty(&value)?
+                }
+            }
+        };
+
+        if let Some(base) = &args.output {
+            let out = if datasets_len_hint(&args.shared.dataset) > 1 {
+                base.join(format!(
+                    "{}_schema.{}",
+                    dataset,
+                    extension_for_format(&args.format)
+                ))
+            } else {
+                base.clone()
+            };
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Err(e) = fs::write(&out, rendered.as_bytes()) {
+                ds.failed = 1;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "schema_output".to_string(),
+                    rel_path: None,
+                    source_path: None,
+                    output_path: Some(out.to_string_lossy().to_string()),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some("check output path permissions".to_string()),
+                });
+            } else {
+                eprintln!("wrote schema: {}", out.display());
+                ds.succeeded = 1;
+            }
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                &dataset,
+                "schema",
+                &format!("wrote output {}", out.display()),
+            );
+        } else {
+            println!("# dataset={dataset}\n{rendered}");
+            ds.succeeded = 1;
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                &dataset,
+                "schema",
+                "wrote output stdout",
+            );
+        }
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            &dataset,
+            "schema",
+            &format!(
+                "done fields={} elapsed_s={:.2}",
+                schema.fields.len(),
+                dataset_start.elapsed().as_secs_f64()
+            ),
+        );
+        if ds.failed > 0 {
+            ds.succeeded = 0;
+        } else if ds.succeeded == 0 {
+            ds.succeeded = 1;
+        }
+        report.datasets.push(ds);
+        report_finalize(&mut report);
+        let _ = write_run_reports(&args.shared.parquet_dir, &report);
+    }
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    eprintln!(
+        "[schema] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[schema] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
+    let duckdb_bin = duckdb_bin(&args.shared);
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+    if args.explain {
+        println!(
+            "--explain: verify_schema from={:?} diff_with={:?} datasets={} sample_size={} refresh_cache={}",
+            args.from,
+            args.diff_with,
+            datasets.join(","),
+            args.sample_size,
+            args.refresh_cache
+        );
+        return Ok(());
+    }
+    let mut failures = 0usize;
+    for dataset in datasets {
+        let left = load_schema_by_policy(
+            &duckdb_bin,
+            &args.shared.snapshot_dir,
+            &args.shared.parquet_dir,
+            &dataset,
+            args.from.clone(),
+            args.sample_size,
+            args.refresh_cache,
+            tuning.memory_mb,
+            args.state_flush_every,
+        )?;
+        let right = load_schema_by_policy(
+            &duckdb_bin,
+            &args.shared.snapshot_dir,
+            &args.shared.parquet_dir,
+            &dataset,
+            args.diff_with.clone(),
+            args.sample_size,
+            args.refresh_cache,
+            tuning.memory_mb,
+            args.state_flush_every,
+        )?;
+
+        let left_map: BTreeMap<String, String> = left
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.r#type.clone()))
+            .collect();
+        let right_map: BTreeMap<String, String> = right
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.r#type.clone()))
+            .collect();
+        let left_names: BTreeSet<String> = left_map.keys().cloned().collect();
+        let right_names: BTreeSet<String> = right_map.keys().cloned().collect();
+        let added = right_names.difference(&left_names).count();
+        let removed = left_names.difference(&right_names).count();
+        let changed = left_names
+            .intersection(&right_names)
+            .filter(|n| left_map.get(*n) != right_map.get(*n))
+            .count();
+
+        if added + removed + changed == 0 {
+            eprintln!(
+                "[verify_schema] dataset={} status=ok from={:?} diff_with={:?}",
+                dataset, args.from, args.diff_with
+            );
+        } else {
+            failures += 1;
+            eprintln!(
+                "[verify_schema] dataset={} status=failed added={} removed={} changed_types={} from={:?} diff_with={:?}",
+                dataset, added, removed, changed, args.from, args.diff_with
+            );
+        }
+    }
+    if failures > 0 {
+        bail!(
+            "[verify_schema] schema differences detected in {} dataset(s)",
+            failures
+        );
+    }
+    Ok(())
+}
+
+fn explain_repair(
+    args: &RepairArgs,
+    datasets: &[String],
+    duckdb_bin: &Path,
+    tuning: &Tuning,
+) -> Result<()> {
+    let txt = fs::read_to_string(&args.from_verify_report).with_context(|| {
+        format!(
+            "failed to read verify report {}",
+            args.from_verify_report.display()
+        )
+    })?;
+    let verify_report: RunReport = serde_json::from_str(&txt).with_context(|| {
+        format!(
+            "failed to parse verify report {}",
+            args.from_verify_report.display()
+        )
+    })?;
+    let targets = collect_repair_targets(
+        &verify_report,
+        &datasets.iter().cloned().collect::<BTreeSet<_>>(),
+        &args.shared.snapshot_dir,
+        &args.shared.parquet_dir,
+    );
+    println!("--explain: repair_convert");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+    println!("parquet_dir: {}", args.shared.parquet_dir.display());
+    println!("from_verify_report: {}", args.from_verify_report.display());
+    println!("datasets filter: {}", datasets.join(", "));
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+    println!("state_flush_every: {}", args.state_flush_every);
+    println!("selected_files: {}", targets.len());
+    println!("post_verify: targeted file-level verify enabled");
+    Ok(())
+}
+
+fn run_repair(args: RepairArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    let duckdb_bin = duckdb_bin(&args.shared);
+    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
+    let allowed: BTreeSet<String> = datasets.iter().cloned().collect();
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+
+    if args.explain {
+        explain_repair(&args, &datasets, &duckdb_bin, &tuning)?;
+        return Ok(());
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert(
+        "from_verify_report".to_string(),
+        args.from_verify_report.to_string_lossy().to_string(),
+    );
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("repair_convert", report_args);
+    let flush_every = args.state_flush_every.max(1);
+
+    let verify_report: RunReport = match fs::read_to_string(&args.from_verify_report)
+        .with_context(|| {
+            format!(
+                "failed to read verify report {}",
+                args.from_verify_report.display()
+            )
+        })
+        .and_then(|txt| {
+            serde_json::from_str(&txt).with_context(|| {
+                format!(
+                    "failed to parse verify report {}",
+                    args.from_verify_report.display()
+                )
+            })
+        }) {
+        Ok(v) => v,
+        Err(e) => {
+            report.failures.push(FailureEntry {
+                dataset: args.shared.dataset.clone(),
+                phase: "repair_report_parse".to_string(),
+                rel_path: None,
+                source_path: Some(args.from_verify_report.to_string_lossy().to_string()),
+                output_path: None,
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("provide a valid verify report JSON".to_string()),
+            });
+            report_finalize(&mut report);
+            let _ = write_run_reports(&args.shared.parquet_dir, &report);
+            bail!("[repair] failed to parse verify report");
+        }
+    };
+
+    for f in &verify_report.failures {
+        if f.phase != "verify_metrics" || !allowed.contains(&f.dataset) {
+            continue;
+        }
+        let has_source = f
+            .source_path
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_output = f
+            .output_path
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_rel = f.rel_path.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+        if !(has_source && has_output) && !has_rel {
+            report.failures.push(FailureEntry {
+                dataset: f.dataset.clone(),
+                phase: "repair_select".to_string(),
+                rel_path: f.rel_path.clone(),
+                source_path: f.source_path.clone(),
+                output_path: f.output_path.clone(),
+                error_message: "verify failure entry is not actionable (missing paths)".to_string(),
+                suggested_recovery: Some(
+                    "rerun verify to generate complete failure paths".to_string(),
+                ),
+            });
+        }
+    }
+
+    let targets = collect_repair_targets(
+        &verify_report,
+        &allowed,
+        &args.shared.snapshot_dir,
+        &args.shared.parquet_dir,
+    );
+    if targets.is_empty() {
+        eprintln!("[repair] no eligible verify failures found in report");
+        report_finalize(&mut report);
+        let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+        eprintln!(
+            "[repair] summary scanned=0 ok=0 failed=0 reports={}",
+            report_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(());
+    }
+
+    let mut by_dataset: BTreeMap<String, Vec<RepairTarget>> = BTreeMap::new();
+    for t in targets {
+        by_dataset.entry(t.dataset.clone()).or_default().push(t);
+    }
+
+    for (dataset, ds_targets) in by_dataset {
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            &dataset,
+            "repair_convert",
+            &format!(
+                "start files={} workers={} memory_mb={:?}",
+                ds_targets.len(),
+                tuning.workers,
+                tuning.memory_mb
+            ),
+        );
+        let mut ds = DatasetReportSummary {
+            dataset: dataset.clone(),
+            items_scanned: ds_targets.len() as u64,
+            ..Default::default()
+        };
+        let schema = match load_or_infer_source_schema(
+            &duckdb_bin,
+            &args.shared.snapshot_dir,
+            &args.shared.parquet_dir,
+            &dataset,
+            100,
+            false,
+            tuning.memory_mb,
+            args.state_flush_every,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                ds.failed = ds.items_scanned;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "repair_select".to_string(),
+                    rel_path: None,
+                    source_path: None,
+                    output_path: None,
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some("refresh schema cache and retry repair".to_string()),
+                });
+                report.datasets.push(ds);
+                report_finalize(&mut report);
+                let _ = write_run_reports(&args.shared.parquet_dir, &report);
+                continue;
+            }
+        };
+        let columns_clause = Arc::new(to_duckdb_columns_clause(&schema.fields));
+        let pb = make_progress_bar(
+            args.progress,
+            ds_targets.len() as u64,
+            &format!("repair:{dataset}"),
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tuning.workers)
+            .build()
+            .context("failed to build rayon thread pool")?;
+        let duckdb_arc = Arc::new(duckdb_bin.clone());
+        let dataset_arc = Arc::new(dataset.clone());
+        let snapshot_root_arc = Arc::new(args.shared.snapshot_dir.clone());
+        let parquet_root_arc = Arc::new(args.shared.parquet_dir.clone());
+        let extra_json_options = if dataset == "works" {
+            ", maximum_object_size=1000000000".to_string()
+        } else {
+            "".to_string()
+        };
+        let compression = "snappy".to_string();
+        let row_group_rows = 100_000usize;
+
+        let source_metrics_arc = Arc::new(std::sync::Mutex::new(load_source_metrics_cache(
+            &args.shared.parquet_dir,
+            &dataset,
+        )?));
+        let parquet_metrics_arc = Arc::new(std::sync::Mutex::new(load_parquet_metrics_cache(
+            &args.shared.parquet_dir,
+            &dataset,
+        )?));
+
+        for chunk in ds_targets.chunks(flush_every) {
+            let failures: Vec<Option<FailureEntry>> = pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(|t| {
+                        if t.output_path.exists() {
+                            if let Err(e) = fs::remove_file(&t.output_path) {
+                                pb.inc(1);
+                                return Some(FailureEntry {
+                                    dataset: dataset_arc.to_string(),
+                                    phase: "repair_delete".to_string(),
+                                    rel_path: Some(t.rel.to_string_lossy().to_string()),
+                                    source_path: Some(t.source_path.to_string_lossy().to_string()),
+                                    output_path: Some(t.output_path.to_string_lossy().to_string()),
+                                    error_message: format!("{e:#}"),
+                                    suggested_recovery: Some(
+                                        "fix file permissions or remove file manually".to_string(),
+                                    ),
+                                });
+                            }
+                        }
+
+                        let pair = FilePair {
+                            input_gz: t.source_path.clone(),
+                            output_parquet: t.output_path.clone(),
+                            rel: t.rel.clone(),
+                        };
+                        if let Err(e) = convert_one(
+                            &duckdb_arc,
+                            &pair,
+                            &columns_clause,
+                            &compression,
+                            row_group_rows,
+                            tuning.memory_mb,
+                            &extra_json_options,
+                        ) {
+                            pb.inc(1);
+                            return Some(FailureEntry {
+                                dataset: dataset_arc.to_string(),
+                                phase: "repair_convert".to_string(),
+                                rel_path: Some(t.rel.to_string_lossy().to_string()),
+                                source_path: Some(t.source_path.to_string_lossy().to_string()),
+                                output_path: Some(t.output_path.to_string_lossy().to_string()),
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: Some(
+                                    "retry with --profile safe --workers 1 --max-memory-mb 4096"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+
+                        if let Err(e) = verify_file_metrics(
+                            &duckdb_arc,
+                            &pair,
+                            VerifyMetadataLevel::Both,
+                            &source_metrics_arc,
+                            &parquet_metrics_arc,
+                            tuning.memory_mb,
+                        ) {
+                            pb.inc(1);
+                            return Some(FailureEntry {
+                                dataset: dataset_arc.to_string(),
+                                phase: "repair_verify".to_string(),
+                                rel_path: Some(t.rel.to_string_lossy().to_string()),
+                                source_path: Some(t.source_path.to_string_lossy().to_string()),
+                                output_path: Some(t.output_path.to_string_lossy().to_string()),
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: Some(
+                                    "run verify for this file and inspect mismatch".to_string(),
+                                ),
+                            });
+                        }
+                        try_log_dataset(
+                            parquet_root_arc.as_path(),
+                            &dataset_arc,
+                            "repair_convert",
+                            &format!("repaired {}", t.rel.to_string_lossy()),
+                        );
+                        let _ = snapshot_root_arc;
+                        pb.inc(1);
+                        None
+                    })
+                    .collect()
+            });
+            for f in failures.into_iter().flatten() {
+                ds.failed += 1;
+                report.failures.push(f);
+            }
+            let source_metrics = source_metrics_arc
+                .lock()
+                .map_err(|_| anyhow!("repair source metrics cache lock poisoned"))?
+                .clone();
+            let parquet_metrics = parquet_metrics_arc
+                .lock()
+                .map_err(|_| anyhow!("repair parquet metrics cache lock poisoned"))?
+                .clone();
+            save_source_metrics_cache(&args.shared.parquet_dir, &dataset, &source_metrics)?;
+            save_parquet_metrics_cache(&args.shared.parquet_dir, &dataset, &parquet_metrics)?;
+
+            ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+            let mut preview = report.clone();
+            preview.datasets.retain(|d| d.dataset != dataset);
+            preview.datasets.push(ds.clone());
+            report_finalize(&mut preview);
+            let _ = write_run_reports(&args.shared.parquet_dir, &preview);
+        }
+        pb.finish_with_message(format!("repair:{dataset} done"));
+        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+        report.datasets.push(ds.clone());
+        try_log_dataset(
+            &args.shared.parquet_dir,
+            &dataset,
+            "repair_convert",
+            &format!("done files={} failed={}", ds.items_scanned, ds.failed),
+        );
+        report_finalize(&mut report);
+        let _ = write_run_reports(&args.shared.parquet_dir, &report);
+    }
+
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    eprintln!(
+        "[repair] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[repair] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn run_download(args: DownloadArgs) -> Result<()> {
+    ensure_aws_cli(&args.aws_bin)?;
+    fs::create_dir_all(&args.snapshot_dir)?;
+    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
+    if args.explain {
+        explain_download(&args, &tuning)?;
+        return Ok(());
+    }
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "snapshot_dir".to_string(),
+        args.snapshot_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("s3_uri".to_string(), args.s3_uri.clone());
+    report_args.insert("dataset".to_string(), args.dataset.clone());
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    let effective_delete = args.delete_files && !args.no_delete;
+    report_args.insert("no_sign_request".to_string(), effective_no_sign.to_string());
+    report_args.insert("delete_files".to_string(), effective_delete.to_string());
+    report_args.insert("skip_validate".to_string(), args.skip_validate.to_string());
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("download", report_args);
+
+    let preflight_validate_args = ValidateDownloadArgs {
+        root_dir: args.root_dir.clone(),
+        snapshot_dir: args.snapshot_dir.clone(),
+        s3_uri: args.s3_uri.clone(),
+        dataset: args.dataset.clone(),
+        aws_bin: args.aws_bin.clone(),
+        endpoint_url: args.endpoint_url.clone(),
+        region: args.region.clone(),
+        profile_name: args.profile_name.clone(),
+        no_sign_request: effective_no_sign,
+        signed: args.signed,
+        check_extra: effective_delete,
+        profile: args.profile.clone(),
+        workers: args.workers,
+        progress: false,
+        explain: false,
+        state_flush_every: args.state_flush_every,
+    };
+    let remote_manifest = match fetch_remote_manifest(&preflight_validate_args, false) {
+        Ok(v) => v,
+        Err(e) => {
+            report.failures.push(FailureEntry {
+                dataset: args.dataset.clone(),
+                phase: "download_manifest_fetch".to_string(),
+                rel_path: None,
+                source_path: Some(args.s3_uri.clone()),
+                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("check aws CLI/network/endpoint settings".to_string()),
+            });
+            report_finalize(&mut report);
+            let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+            eprintln!(
+                "[download] summary scanned={} ok={} failed={} reports={}",
+                report.totals_items_scanned,
+                report.totals_succeeded,
+                report.totals_failed,
+                report_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            bail!("[download] remote manifest fetch failed");
+        }
+    };
+    if !args.skip_disk_check {
+        let remote_total_bytes: u64 = remote_manifest.iter().map(|o| o.size).sum();
+        let required_bytes = remote_total_bytes.saturating_mul(11).saturating_div(10);
+        let free_bytes = available_disk_bytes(&args.snapshot_dir)?;
+        eprintln!(
+            "[download] disk preflight available={} GiB required={} GiB (remote={} GiB +10%)",
+            bytes_to_gib(free_bytes),
+            bytes_to_gib(required_bytes),
+            bytes_to_gib(remote_total_bytes)
+        );
+        if free_bytes < required_bytes {
+            report.failures.push(FailureEntry {
+                dataset: args.dataset.clone(),
+                phase: "download_disk_space".to_string(),
+                rel_path: None,
+                source_path: Some(args.s3_uri.clone()),
+                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                error_message: format!(
+                    "insufficient free disk space: available={} GiB required={} GiB",
+                    bytes_to_gib(free_bytes),
+                    bytes_to_gib(required_bytes)
+                ),
+                suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+            });
+            report_finalize(&mut report);
+            let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+            eprintln!(
+                "[download] summary scanned={} ok={} failed={} reports={}",
+                report.totals_items_scanned,
+                report.totals_succeeded,
+                report.totals_failed,
+                report_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            bail!(
+                "[download] insufficient disk space at {}: available {} GiB, required {} GiB (or use --skip-disk-check)",
+                args.snapshot_dir.display(),
+                bytes_to_gib(free_bytes),
+                bytes_to_gib(required_bytes)
+            );
+        }
+    }
+
+    let sync = aws_sync_command(&args)?;
+    if let Err(e) = run_aws(&args.aws_bin, &sync) {
+        report.failures.push(FailureEntry {
+            dataset: args.dataset.clone(),
+            phase: "download_sync".to_string(),
+            rel_path: None,
+            source_path: Some(args.s3_uri.clone()),
+            output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+            error_message: format!("{e:#}"),
+            suggested_recovery: Some("check aws CLI/network/endpoint settings".to_string()),
+        });
+        report_finalize(&mut report);
+        let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+        eprintln!(
+            "[download] summary scanned={} ok={} failed={} reports={}",
+            report.totals_items_scanned,
+            report.totals_succeeded,
+            report.totals_failed,
+            report_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        bail!("[download] sync failed");
+    }
+    append_download_log(&args.snapshot_dir, "download", "sync complete")?;
+
+    if args.skip_validate {
+        report.datasets.push(DatasetReportSummary {
+            dataset: args.dataset.clone(),
+            items_scanned: 1,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+        });
+        report_finalize(&mut report);
+        let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+        eprintln!(
+            "[download] summary scanned={} ok={} failed={} reports={}",
+            report.totals_items_scanned,
+            report.totals_succeeded,
+            report.totals_failed,
+            report_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(());
+    }
+
+    let v_args = ValidateDownloadArgs {
+        root_dir: args.root_dir.clone(),
+        snapshot_dir: args.snapshot_dir.clone(),
+        s3_uri: args.s3_uri.clone(),
+        dataset: args.dataset.clone(),
+        aws_bin: args.aws_bin.clone(),
+        endpoint_url: args.endpoint_url.clone(),
+        region: args.region.clone(),
+        profile_name: args.profile_name.clone(),
+        no_sign_request: effective_no_sign,
+        signed: args.signed,
+        check_extra: effective_delete,
+        profile: args.profile.clone(),
+        workers: args.workers,
+        progress: args.progress,
+        explain: false,
+        state_flush_every: args.state_flush_every,
+    };
+    if let Err(e) = run_validate_download(v_args) {
+        report.failures.push(FailureEntry {
+            dataset: args.dataset.clone(),
+            phase: "download_validate".to_string(),
+            rel_path: None,
+            source_path: Some(args.s3_uri.clone()),
+            output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+            error_message: format!("{e:#}"),
+            suggested_recovery: Some("run verify_download for detailed failures".to_string()),
+        });
+    } else {
+        report.datasets.push(DatasetReportSummary {
+            dataset: args.dataset.clone(),
+            items_scanned: 1,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+        });
+    }
+
+    report_finalize(&mut report);
+    let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+    eprintln!(
+        "[download] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[download] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
+    ensure_aws_cli(&args.aws_bin)?;
+    fs::create_dir_all(&args.snapshot_dir)?;
+    let tuning = resolve_tuning(args.profile.clone(), args.workers, None);
+    if args.explain {
+        explain_validate_download(&args, &tuning);
+        return Ok(());
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "snapshot_dir".to_string(),
+        args.snapshot_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("s3_uri".to_string(), args.s3_uri.clone());
+    report_args.insert("dataset".to_string(), args.dataset.clone());
+    report_args.insert("check_extra".to_string(), args.check_extra.to_string());
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("verify_download", report_args);
+
+    let remote = match fetch_remote_manifest(&args, args.progress) {
+        Ok(v) => v,
+        Err(e) => {
+            report.failures.push(FailureEntry {
+                dataset: args.dataset.clone(),
+                phase: "validate_manifest_fetch".to_string(),
+                rel_path: None,
+                source_path: Some(args.s3_uri.clone()),
+                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("check aws CLI credentials/network/endpoint".to_string()),
+            });
+            report_finalize(&mut report);
+            let _ = write_download_reports(&args.snapshot_dir, &report);
+            bail!("[verify_download] remote manifest fetch failed");
+        }
+    };
+    write_manifest_jsonl(
+        &download_manifests_dir(&args.snapshot_dir)
+            .join(format!("remote_manifest-{}.jsonl", report.started_at_unix)),
+        &remote,
+    )?;
+
+    let local = build_local_manifest(&args.snapshot_dir, &args.dataset)?;
+    write_manifest_jsonl(
+        &download_manifests_dir(&args.snapshot_dir)
+            .join(format!("local_manifest-{}.jsonl", report.started_at_unix)),
+        &local,
+    )?;
+
+    let mut ds_map: BTreeMap<String, DatasetReportSummary> = BTreeMap::new();
+    let remote_map: BTreeMap<String, &RemoteObject> =
+        remote.iter().map(|o| (o.key.clone(), o)).collect();
+    let local_map: BTreeMap<String, &RemoteObject> =
+        local.iter().map(|o| (o.key.clone(), o)).collect();
+    let flush_every = args.state_flush_every.max(1);
+
+    let compare_pb = make_progress_bar(args.progress, remote_map.len() as u64, "validate-compare");
+    for (idx, (key, ro)) in remote_map.iter().enumerate() {
+        let ds_name = dataset_from_key(key);
+        let ds = ds_map
+            .entry(ds_name.clone())
+            .or_insert_with(|| DatasetReportSummary {
+                dataset: ds_name.clone(),
+                ..Default::default()
+            });
+        ds.items_scanned += 1;
+        let lp = args.snapshot_dir.join(key);
+        match local_map.get(key) {
+            None => {
+                ds.failed += 1;
+                report.failures.push(FailureEntry {
+                    dataset: ds_name,
+                    phase: "validate_file_presence".to_string(),
+                    rel_path: Some(key.clone()),
+                    source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), key)),
+                    output_path: Some(lp.to_string_lossy().to_string()),
+                    error_message: "missing local file".to_string(),
+                    suggested_recovery: Some("rerun download".to_string()),
+                });
+            }
+            Some(lo) => {
+                if lo.size != ro.size {
+                    ds.failed += 1;
+                    report.failures.push(FailureEntry {
+                        dataset: ds_name,
+                        phase: "validate_file_size".to_string(),
+                        rel_path: Some(key.clone()),
+                        source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), key)),
+                        output_path: Some(lp.to_string_lossy().to_string()),
+                        error_message: format!(
+                            "size mismatch local={} remote={}",
+                            lo.size, ro.size
+                        ),
+                        suggested_recovery: Some("rerun download".to_string()),
+                    });
+                } else {
+                    ds.succeeded += 1;
+                }
+            }
+        }
+        if (idx + 1) % flush_every == 0 {
+            report.datasets = ds_map.values().cloned().collect();
+            report_finalize(&mut report);
+            let _ = write_download_reports(&args.snapshot_dir, &report);
+        }
+        compare_pb.inc(1);
+    }
+    compare_pb.finish_with_message("validate-compare complete");
+
+    if args.check_extra {
+        let extra_pb = make_progress_bar(args.progress, local_map.len() as u64, "validate-extra");
+        for key in local_map.keys() {
+            if !remote_map.contains_key(key) {
+                let ds_name = dataset_from_key(key);
+                let ds = ds_map
+                    .entry(ds_name.clone())
+                    .or_insert_with(|| DatasetReportSummary {
+                        dataset: ds_name.clone(),
+                        ..Default::default()
+                    });
+                ds.failed += 1;
+                report.failures.push(FailureEntry {
+                    dataset: ds_name,
+                    phase: "validate_file_presence".to_string(),
+                    rel_path: Some(key.clone()),
+                    source_path: None,
+                    output_path: Some(args.snapshot_dir.join(key).to_string_lossy().to_string()),
+                    error_message: "unexpected local file".to_string(),
+                    suggested_recovery: Some("rerun download with --delete".to_string()),
+                });
+            }
+            extra_pb.inc(1);
+        }
+        extra_pb.finish_with_message("validate-extra complete");
+    }
+
+    let gz_files = list_scoped_gz_files(&args.snapshot_dir, &args.dataset)?;
+    let pb = make_progress_bar(args.progress, gz_files.len() as u64, "validate-gzip");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(tuning.workers)
+        .build()
+        .context("failed to build rayon thread pool")?;
+    let failures: Vec<Option<FailureEntry>> = pool.install(|| {
+        gz_files
+            .par_iter()
+            .map(|p| {
+                let out = gzip_integrity_ok(p);
+                pb.inc(1);
+                if out.is_ok() {
+                    None
+                } else {
+                    let rel = p
+                        .strip_prefix(&args.snapshot_dir)
+                        .map(|x| x.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| p.to_string_lossy().to_string());
+                    Some(FailureEntry {
+                        dataset: dataset_from_key(&rel),
+                        phase: "validate_gzip_integrity".to_string(),
+                        rel_path: Some(rel.clone()),
+                        source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), rel)),
+                        output_path: Some(p.to_string_lossy().to_string()),
+                        error_message: format!(
+                            "{:#}",
+                            out.err().unwrap_or_else(|| anyhow!("gzip check failed"))
+                        ),
+                        suggested_recovery: Some("rerun download for this file".to_string()),
+                    })
+                }
+            })
+            .collect()
+    });
+    pb.finish_with_message("validate-gzip complete");
+    for f in failures.into_iter().flatten() {
+        let ds = ds_map
+            .entry(f.dataset.clone())
+            .or_insert_with(|| DatasetReportSummary {
+                dataset: f.dataset.clone(),
+                ..Default::default()
+            });
+        ds.failed += 1;
+        report.failures.push(f);
+    }
+
+    report.datasets = ds_map.values().cloned().collect();
+    report_finalize(&mut report);
+    let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
+    append_download_log(
+        &args.snapshot_dir,
+        "verify_download",
+        &format!(
+            "done scanned={} failed={}",
+            report.totals_items_scanned, report.totals_failed
+        ),
+    )?;
+    eprintln!(
+        "[verify_download] summary scanned={} ok={} failed={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!(
+            "[verify_download] failures detected: {}",
+            report.totals_failed
+        );
+    }
+    Ok(())
+}
+
+fn render_schema_diff(
+    left: &SchemaDoc,
+    right: &SchemaDoc,
+    format: &SchemaFormat,
+) -> Result<String> {
+    let lmap: BTreeMap<String, String> = left
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.r#type.clone()))
+        .collect();
+    let rmap: BTreeMap<String, String> = right
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.r#type.clone()))
+        .collect();
+
+    let left_names: BTreeSet<String> = lmap.keys().cloned().collect();
+    let right_names: BTreeSet<String> = rmap.keys().cloned().collect();
+    let removed: Vec<String> = left_names.difference(&right_names).cloned().collect();
+    let added: Vec<String> = right_names.difference(&left_names).cloned().collect();
+
+    let mut changed = Vec::<serde_json::Value>::new();
+    for name in left_names.intersection(&right_names) {
+        let lt = lmap.get(name).unwrap();
+        let rt = rmap.get(name).unwrap();
+        if lt != rt {
+            changed.push(serde_json::json!({
+                "name": name,
+                "left_type": lt,
+                "right_type": rt
+            }));
+        }
+    }
+
+    let diff = serde_json::json!({
+        "dataset": left.dataset,
+        "left_source": left.source,
+        "right_source": right.source,
+        "added": added,
+        "removed": removed,
+        "changed_types": changed
+    });
+
+    let out = match format {
+        SchemaFormat::Table => {
+            let mut s = String::new();
+            s.push_str(&format!(
+                "dataset: {}\nleft: {}\nright: {}\n",
+                left.dataset, left.source, right.source
+            ));
+            s.push_str(&format!(
+                "added: {}\nremoved: {}\nchanged_types: {}\n",
+                diff["added"].as_array().map(|a| a.len()).unwrap_or(0),
+                diff["removed"].as_array().map(|a| a.len()).unwrap_or(0),
+                diff["changed_types"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+            ));
+            s
+        }
+        SchemaFormat::Json | SchemaFormat::ArrowR => serde_json::to_string_pretty(&diff)?,
+        SchemaFormat::Yaml => serde_yaml::to_string(&diff)?,
+    };
+    Ok(out)
+}
+
+fn datasets_len_hint(dataset_arg: &str) -> usize {
+    if dataset_arg == "all" {
+        2
+    } else {
+        1
+    }
+}
+
+fn extension_for_format(fmt: &SchemaFormat) -> &'static str {
+    match fmt {
+        SchemaFormat::Table => "txt",
+        SchemaFormat::Json | SchemaFormat::ArrowR => "json",
+        SchemaFormat::Yaml => "yaml",
+    }
+}
+
+fn explain_convert(args: &ConvertArgs, datasets: &[String], duckdb_bin: &Path, tuning: &Tuning) {
+    println!("--explain: convert");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+    println!("parquet_dir: {}", args.shared.parquet_dir.display());
+    println!("datasets: {}", datasets.join(", "));
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+    println!("compression: {}", args.compression);
+    println!("row_group_rows: {}", args.row_group_rows);
+    println!("sample_size(schema): {}", args.sample_size);
+    println!("refresh_cache: {}", args.refresh_cache);
+    if args.input_files.is_empty() {
+        println!("input_filter: all files");
+    } else {
+        println!("input_filter: {}", args.input_files.len());
+    }
+    println!("post_verify: {}", !args.skip_verify);
+    if !args.skip_verify {
+        println!(
+            "verify_plan: scope={:?}, metadata_level={:?}, file_sample_n={}, seed={}",
+            args.verify_scope, args.verify_metadata_level, args.verify_file_sample_n, args.seed
+        );
+    }
+}
+
+fn explain_verify(args: &VerifyArgs, datasets: &[String], duckdb_bin: &Path, tuning: &Tuning) {
+    println!("--explain: verify");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+    println!("parquet_dir: {}", args.shared.parquet_dir.display());
+    println!("datasets: {}", datasets.join(", "));
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+    println!(
+        "plan: scope={:?}, metadata_level={:?}, file_sample_n={}, seed={}",
+        args.scope, args.metadata_level, args.file_sample_n, args.seed
+    );
+}
+
+fn explain_schema(args: &SchemaArgs, datasets: &[String], duckdb_bin: &Path, tuning: &Tuning) {
+    println!("--explain: schema");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+    println!("parquet_dir: {}", args.shared.parquet_dir.display());
+    println!("datasets: {}", datasets.join(", "));
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+    println!(
+        "plan: from={:?}, format={:?}, diff_with={:?}, sample_size={}, refresh_cache={}, state_flush_every={}",
+        args.from, args.format, args.diff_with, args.sample_size, args.refresh_cache, args.state_flush_every
+    );
+    println!(
+        "output: {}",
+        args.output
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "stdout".to_string())
+    );
+}
+
+fn explain_index(
+    args: &IndexArgs,
+    duckdb_bin: &Path,
+    corpus_dir: &Path,
+    index_file: &Path,
+    tuning: &Tuning,
+) {
+    println!("--explain: index");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("corpus_dir: {}", corpus_dir.display());
+    println!("index_file: {}", index_file.display());
+    println!("overwrite: {}", args.overwrite);
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+}
+
+fn ensure_duckdb(shared: &SharedArgs) -> Result<()> {
+    let bin = duckdb_bin(shared);
+    ensure_duckdb_bin(&bin)
+}
+
+fn ensure_duckdb_bin(bin: &Path) -> Result<()> {
+    let out = Command::new(&bin).arg("--version").output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => bail!(
+            "duckdb check failed for {}: {}",
+            bin.display(),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => bail!("duckdb binary not available at {}: {}", bin.display(), e),
+    }
+}
+
+fn duckdb_bin(shared: &SharedArgs) -> PathBuf {
+    duckdb_bin_from_option(&shared.duckdb_bin)
+}
+
+fn duckdb_bin_from_option(p: &Option<PathBuf>) -> PathBuf {
+    p.clone().unwrap_or_else(|| PathBuf::from("duckdb"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Tuning {
+    workers: usize,
+    memory_mb: Option<usize>,
+}
+
+fn resolve_tuning(profile: Profile, workers: usize, max_memory_mb: Option<usize>) -> Tuning {
+    let total_mb = detect_total_memory_mb();
+    resolve_tuning_with_total(profile, workers, max_memory_mb, total_mb)
+}
+
+fn resolve_tuning_with_total(
+    profile: Profile,
+    workers: usize,
+    max_memory_mb: Option<usize>,
+    total_mb: Option<usize>,
+) -> Tuning {
+    let mut out = Tuning {
+        workers: workers.max(1),
+        memory_mb: max_memory_mb,
+    };
+    match profile {
+        Profile::Safe => {
+            out.workers = out.workers.min(2).max(1);
+            if out.memory_mb.is_none() {
+                let mut mb = auto_profile_memory_mb(Profile::Safe, total_mb);
+                if out.workers == 1 {
+                    mb = mb.max(auto_profile_single_worker_safe_memory_mb(total_mb));
+                }
+                out.memory_mb = Some(mb);
+            }
+        }
+        Profile::Balanced => {
+            if out.memory_mb.is_none() {
+                out.memory_mb = Some(auto_profile_memory_mb(Profile::Balanced, total_mb));
+            }
+        }
+        Profile::Fast => {
+            if out.memory_mb.is_none() {
+                out.memory_mb = Some(auto_profile_memory_mb(Profile::Fast, total_mb));
+            }
+        }
+    }
+    out
+}
+
+fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
+    let t = match total_mb {
+        Some(v) if v > 0 => v,
+        _ => return 8192,
+    };
+    let usable = (t as f64 * 0.80).floor() as usize;
+    // For single-worker safe mode, prefer higher memory to avoid OOM on large nested records.
+    let mb = ((usable as f64) * 0.45).floor() as usize;
+    mb.max(8192).min(24_576)
+}
+
+fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
+    // Conservative defaults when RAM cannot be detected.
+    let fallback = match profile {
+        Profile::Safe => 2048,
+        Profile::Balanced => 6144,
+        Profile::Fast => 12_288,
+    };
+    let t = match total_mb {
+        Some(v) if v > 0 => v,
+        _ => return fallback,
+    };
+
+    // Keep some headroom for OS and other processes.
+    let usable = (t as f64 * 0.80).floor() as usize;
+    let mb = match profile {
+        Profile::Safe => ((usable as f64) * 0.15).floor() as usize,
+        Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
+        Profile::Fast => ((usable as f64) * 0.55).floor() as usize,
+    };
+
+    let (min_mb, max_mb) = match profile {
+        Profile::Safe => (1024, 8192),
+        Profile::Balanced => (4096, 24_576),
+        Profile::Fast => (8192, 32_768),
+    };
+    mb.max(min_mb).min(max_mb)
+}
+
+fn detect_total_memory_mb() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let bytes: u128 = s.parse().ok()?;
+        return Some((bytes / (1024 * 1024) as u128) as usize);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let txt = fs::read_to_string("/proc/meminfo").ok()?;
+        let line = txt.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u128 = line.split_whitespace().nth(1)?.parse().ok()?;
+        return Some((kb / 1024) as usize);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn resolve_datasets(snapshot_dir: &Path, dataset_arg: &str) -> Result<Vec<String>> {
+    if dataset_arg != "all" {
+        return Ok(vec![dataset_arg.to_string()]);
+    }
+
+    let root = snapshot_dir.join("data");
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&root).with_context(|| format!("cannot read {}", root.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name != "merged_ids" {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn enumerate_pairs(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    dataset: &str,
+) -> Result<Vec<FilePair>> {
+    let data_root = snapshot_dir.join("data").join(dataset);
+    let out_root = parquet_dir.join(dataset);
+    let mut pairs = Vec::new();
+
+    if !data_root.exists() {
+        return Ok(pairs);
+    }
+
+    for entry in WalkDir::new(&data_root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("gz") {
+            continue;
+        }
+        let rel = p.strip_prefix(&data_root)?.to_path_buf();
+        let mut out_rel = rel.clone();
+        out_rel.set_extension("parquet");
+        let out_path = out_root.join(&out_rel);
+
+        pairs.push(FilePair {
+            input_gz: p.to_path_buf(),
+            output_parquet: out_path,
+            rel,
+        });
+    }
+
+    pairs.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(pairs)
+}
+
+fn filter_pairs_by_input_files(
+    pairs: &[FilePair],
+    inputs: &[PathBuf],
+    snapshot_dir: &Path,
+    dataset: &str,
+) -> Result<Vec<FilePair>> {
+    let mut wanted_abs = BTreeSet::<String>::new();
+    let mut wanted_rel = BTreeSet::<String>::new();
+    let mut wanted_base = BTreeSet::<String>::new();
+
+    let ds_root = snapshot_dir.join("data").join(dataset);
+    for inp in inputs {
+        if inp.is_absolute() {
+            wanted_abs.insert(inp.to_string_lossy().replace('\\', "/"));
+            if let Ok(rel) = inp.strip_prefix(&ds_root) {
+                wanted_rel.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        } else {
+            wanted_rel.insert(inp.to_string_lossy().replace('\\', "/"));
+            if let Some(b) = inp.file_name().and_then(|s| s.to_str()) {
+                wanted_base.insert(b.to_string());
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for p in pairs {
+        let abs = p.input_gz.to_string_lossy().replace('\\', "/");
+        let rel = p.rel.to_string_lossy().replace('\\', "/");
+        let base = p
+            .input_gz
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if wanted_abs.contains(&abs) || wanted_rel.contains(&rel) || wanted_base.contains(&base) {
+            out.push(p.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn list_parquet_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("parquet")
+        {
+            out.push(entry.path().to_path_buf());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn collect_repair_targets(
+    verify_report: &RunReport,
+    allowed_datasets: &BTreeSet<String>,
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+) -> Vec<RepairTarget> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for f in &verify_report.failures {
+        if f.phase != "verify_metrics" {
+            continue;
+        }
+        if !allowed_datasets.contains(&f.dataset) {
+            continue;
+        }
+        let source_path = f
+            .source_path
+            .as_ref()
+            .map(|p| resolve_report_path_for_root(p, snapshot_dir, parquet_dir));
+        let output_path = f
+            .output_path
+            .as_ref()
+            .map(|p| resolve_report_path_for_root(p, snapshot_dir, parquet_dir));
+        let rel_path = f.rel_path.as_ref().map(PathBuf::from);
+        let dataset = f.dataset.clone();
+
+        let source = source_path.or_else(|| {
+            rel_path
+                .as_ref()
+                .map(|r| snapshot_dir.join("data").join(&dataset).join(r))
+        });
+        let output = output_path.or_else(|| {
+            rel_path
+                .as_ref()
+                .map(|r| parquet_dir.join(&dataset).join(r.with_extension("parquet")))
+        });
+
+        let (source, output) = match (source, output) {
+            (Some(s), Some(o)) => (s, o),
+            _ => continue,
+        };
+        let rel = if let Some(r) = rel_path {
+            r
+        } else if let Ok(r) = source.strip_prefix(snapshot_dir.join("data").join(&dataset)) {
+            r.to_path_buf()
+        } else if let Ok(r) = output.strip_prefix(parquet_dir.join(&dataset)) {
+            r.with_extension("gz")
+        } else {
+            PathBuf::from(
+                source
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("unknown.gz"),
+            )
+        };
+
+        let key = output.to_string_lossy().to_string();
+        if seen.insert(key) {
+            out.push(RepairTarget {
+                dataset,
+                source_path: source,
+                output_path: output,
+                rel,
+            });
+        }
+    }
+    out
+}
+
+fn resolve_report_path_for_root(
+    path_str: &str,
+    snapshot_dir: &Path,
+    _parquet_dir: &Path,
+) -> PathBuf {
+    let p = PathBuf::from(path_str);
+    if p.is_absolute() {
+        return p;
+    }
+    let root = snapshot_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let norm = path_str.trim_start_matches("./");
+    if norm == "openalex-snapshot" || norm.starts_with("openalex-snapshot/") {
+        return root.join(norm);
+    }
+    if norm == "parquet" || norm.starts_with("parquet/") {
+        return root.join(norm);
+    }
+    p
+}
+
+fn ensure_aws_cli(bin: &Path) -> Result<()> {
+    let out = Command::new(bin).arg("--version").output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => bail!(
+            "aws cli check failed for {}: {}",
+            bin.display(),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => bail!("aws binary not available at {}: {}", bin.display(), e),
+    }
+}
+
+fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
+    let u = uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow!("invalid s3 uri: {uri}"))?;
+    let mut parts = u.splitn(2, '/');
+    let bucket = parts
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("invalid s3 uri bucket: {uri}"))?;
+    let prefix = parts.next().unwrap_or("").trim_matches('/').to_string();
+    Ok((bucket, prefix))
+}
+
+fn aws_common_flags_from(
+    endpoint_url: &Option<String>,
+    region: &Option<String>,
+    profile_name: &Option<String>,
+    no_sign_request: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = endpoint_url {
+        out.push("--endpoint-url".to_string());
+        out.push(v.clone());
+    }
+    if let Some(v) = region {
+        out.push("--region".to_string());
+        out.push(v.clone());
+    }
+    if let Some(v) = profile_name {
+        out.push("--profile".to_string());
+        out.push(v.clone());
+    }
+    if no_sign_request {
+        out.push("--no-sign-request".to_string());
+    }
+    out
+}
+
+fn aws_sync_command(args: &DownloadArgs) -> Result<Vec<String>> {
+    let mut cmd = vec!["s3".to_string(), "sync".to_string()];
+    let effective_delete = args.delete_files && !args.no_delete;
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    if effective_delete {
+        cmd.push("--delete".to_string());
+    }
+    let src = if args.dataset == "all" {
+        args.s3_uri.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/data/{}/",
+            args.s3_uri.trim_end_matches('/'),
+            args.dataset
+        )
+    };
+    let dst = if args.dataset == "all" {
+        args.snapshot_dir.to_string_lossy().to_string()
+    } else {
+        args.snapshot_dir
+            .join("data")
+            .join(&args.dataset)
+            .to_string_lossy()
+            .to_string()
+    };
+    cmd.push(src);
+    cmd.push(dst);
+    cmd.extend(aws_common_flags_from(
+        &args.endpoint_url,
+        &args.region,
+        &args.profile_name,
+        effective_no_sign,
+    ));
+    Ok(cmd)
+}
+
+fn run_aws(bin: &Path, args: &[String]) -> Result<String> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run aws {} {}", bin.display(), args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "aws command failed: {}\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn download_metadata_root(snapshot_dir: &Path) -> PathBuf {
+    let root = snapshot_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join(".openalex-snapshot_metadata").join("download")
+}
+
+fn download_manifests_dir(snapshot_dir: &Path) -> PathBuf {
+    download_metadata_root(snapshot_dir).join("manifests")
+}
+
+fn download_reports_dir(snapshot_dir: &Path) -> PathBuf {
+    download_metadata_root(snapshot_dir).join("reports")
+}
+
+fn download_logs_dir(snapshot_dir: &Path) -> PathBuf {
+    download_metadata_root(snapshot_dir).join("logs")
+}
+
+fn append_download_log(snapshot_dir: &Path, command: &str, msg: &str) -> Result<()> {
+    let dir = download_logs_dir(snapshot_dir);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{command}.log"));
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{} [{}] {}", now_unix(), command, msg)?;
+    Ok(())
+}
+
+fn write_download_reports(snapshot_dir: &Path, report: &RunReport) -> Result<Vec<PathBuf>> {
+    let fname = report_file_name(&report.command, report.started_at_unix);
+    let payload = serde_json::to_vec_pretty(report)?;
+    let p = download_reports_dir(snapshot_dir).join(fname);
+    write_json_atomic(&p, &payload)?;
+    Ok(vec![p])
+}
+
+fn write_manifest_jsonl(path: &Path, items: &[RemoteObject]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = String::new();
+    for it in items {
+        out.push_str(&serde_json::to_string(it)?);
+        out.push('\n');
+    }
+    fs::write(path, out.as_bytes())?;
+    Ok(())
+}
+
+fn dataset_prefix(dataset: &str) -> String {
+    if dataset == "all" {
+        "".to_string()
+    } else {
+        format!("data/{}/", dataset)
+    }
+}
+
+fn dataset_from_key(key: &str) -> String {
+    let k = key.trim_start_matches('/');
+    let mut parts = k.split('/');
+    if parts.next() == Some("data") {
+        parts.next().unwrap_or("unknown").to_string()
+    } else {
+        "snapshot".to_string()
+    }
+}
+
+fn fetch_remote_manifest(args: &ValidateDownloadArgs, progress: bool) -> Result<Vec<RemoteObject>> {
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    let (bucket, base_prefix) = parse_s3_uri(&args.s3_uri)?;
+    let ds_prefix = dataset_prefix(&args.dataset);
+    let prefix = if base_prefix.is_empty() {
+        ds_prefix
+    } else if ds_prefix.is_empty() {
+        format!("{}/", base_prefix.trim_end_matches('/'))
+    } else {
+        format!("{}/{ds_prefix}", base_prefix.trim_end_matches('/'))
+    };
+
+    let mut all = Vec::new();
+    let manifest_pb = if progress {
+        let pb = ProgressBar::new_spinner();
+        pb.set_prefix("validate-manifest");
+        pb.set_message("fetching remote manifest pages");
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        Some(pb)
+    } else {
+        None
+    };
+    let mut token: Option<String> = None;
+    let mut pages: u64 = 0;
+    loop {
+        let mut cmd = vec![
+            "s3api".to_string(),
+            "list-objects-v2".to_string(),
+            "--bucket".to_string(),
+            bucket.clone(),
+            "--prefix".to_string(),
+            prefix.clone(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(t) = &token {
+            cmd.push("--continuation-token".to_string());
+            cmd.push(t.clone());
+        }
+        cmd.extend(aws_common_flags_from(
+            &args.endpoint_url,
+            &args.region,
+            &args.profile_name,
+            effective_no_sign,
+        ));
+        let out = run_aws(&args.aws_bin, &cmd)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&out).context("invalid aws list-objects-v2 JSON")?;
+        pages += 1;
+        if let Some(pb) = &manifest_pb {
+            pb.set_message(format!("pages={} objects={}", pages, all.len()));
+        }
+        if let Some(arr) = v.get("Contents").and_then(|x| x.as_array()) {
+            for item in arr {
+                let key = item
+                    .get("Key")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if key.is_empty() {
+                    continue;
+                }
+                let size = item.get("Size").and_then(|x| x.as_u64()).unwrap_or(0);
+                let etag = item
+                    .get("ETag")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let last_modified = item
+                    .get("LastModified")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                all.push(RemoteObject {
+                    key,
+                    size,
+                    etag,
+                    last_modified,
+                });
+            }
+            if let Some(pb) = &manifest_pb {
+                pb.set_message(format!("pages={} objects={}", pages, all.len()));
+            }
+        }
+        let truncated = v
+            .get("IsTruncated")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if truncated {
+            token = v
+                .get("NextContinuationToken")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if let Some(pb) = manifest_pb {
+        pb.finish_with_message(format!(
+            "validate-manifest pages={} objects={}",
+            pages,
+            all.len()
+        ));
+    }
+    all.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(all)
+}
+
+fn build_local_manifest(snapshot_dir: &Path, dataset: &str) -> Result<Vec<RemoteObject>> {
+    let mut out = Vec::new();
+    let root = if dataset == "all" {
+        snapshot_dir.to_path_buf()
+    } else {
+        snapshot_dir.join("data").join(dataset)
+    };
+    if !root.exists() {
+        return Ok(out);
+    }
+    for e in WalkDir::new(&root).into_iter().filter_map(|x| x.ok()) {
+        if !e.file_type().is_file() {
+            continue;
+        }
+        let p = e.path();
+        if p.components()
+            .any(|c| c.as_os_str() == ".openalex_download_metadata")
+        {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(snapshot_dir)
+            .map(|x| x.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
+        let m = fs::metadata(p)?;
+        let last_modified = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        out.push(RemoteObject {
+            key: rel,
+            size: m.len(),
+            etag: "".to_string(),
+            last_modified,
+        });
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(out)
+}
+
+fn list_scoped_gz_files(snapshot_dir: &Path, dataset: &str) -> Result<Vec<PathBuf>> {
+    let root = if dataset == "all" {
+        snapshot_dir.join("data")
+    } else {
+        snapshot_dir.join("data").join(dataset)
+    };
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    for e in WalkDir::new(&root).into_iter().filter_map(|x| x.ok()) {
+        if e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("gz") {
+            out.push(e.path().to_path_buf());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn gzip_integrity_ok(path: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let f = fs::File::open(path)?;
+    let mut d = GzDecoder::new(f);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = d.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn explain_download(args: &DownloadArgs, tuning: &Tuning) -> Result<()> {
+    let cmd = aws_sync_command(args)?;
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    let effective_delete = args.delete_files && !args.no_delete;
+    println!("--explain: download");
+    println!("aws_bin: {}", args.aws_bin.display());
+    println!("snapshot_dir: {}", args.snapshot_dir.display());
+    println!("dataset: {}", args.dataset);
+    println!("no_sign_request: {}", effective_no_sign);
+    println!("delete_files: {}", effective_delete);
+    println!("sync_command: {} {}", args.aws_bin.display(), cmd.join(" "));
+    println!("auto_validate: {}", !args.skip_validate);
+    println!("workers(validate): {}", tuning.workers);
+    println!("memory_mb(validate): {:?}", tuning.memory_mb);
+    Ok(())
+}
+
+fn explain_validate_download(args: &ValidateDownloadArgs, tuning: &Tuning) {
+    println!("--explain: validate-download");
+    println!("aws_bin: {}", args.aws_bin.display());
+    println!("snapshot_dir: {}", args.snapshot_dir.display());
+    println!("s3_uri: {}", args.s3_uri);
+    println!("dataset: {}", args.dataset);
+    println!("check_extra: {}", args.check_extra);
+    println!("workers: {}", tuning.workers);
+}
+
+#[derive(Debug, Clone)]
+struct ReportRecord {
+    source_kind: String,
+    path: PathBuf,
+    timestamp: i64,
+    report: RunReport,
+}
+
+fn parse_report_filename(name: &str) -> Option<(String, i64)> {
+    let stem = name.strip_suffix(".json")?;
+    let mut parts = stem.rsplitn(2, '-');
+    let ts = parts.next()?.parse::<i64>().ok()?;
+    let cmd = parts.next()?.to_string();
+    if cmd.is_empty() {
+        return None;
+    }
+    Some((cmd, ts))
+}
+
+fn parquet_report_roots(parquet_dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![global_reports_dir(parquet_dir)];
+    if let Ok(entries) = fs::read_dir(parquet_dir) {
+        let mut extra = Vec::new();
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with('.')
+                    && name.ends_with("_metadata")
+                    && name != ".openalex_metadata"
+                {
+                    extra.push(p.join("reports"));
+                }
+            }
+        }
+        extra.sort();
+        out.extend(extra);
+    }
+    out
+}
+
+fn download_report_roots(snapshot_dir: &Path) -> Vec<PathBuf> {
+    vec![download_reports_dir(snapshot_dir)]
+}
+
+fn report_roots(snapshot_dir: &Path, parquet_dir: &Path, source: &ReportSource) -> Vec<PathBuf> {
+    match source {
+        ReportSource::Parquet => parquet_report_roots(parquet_dir),
+        ReportSource::Download => download_report_roots(snapshot_dir),
+        ReportSource::All => {
+            let mut v = parquet_report_roots(parquet_dir);
+            v.extend(download_report_roots(snapshot_dir));
+            v
+        }
+    }
+}
+
+fn load_report_records(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    source: &ReportSource,
+) -> Result<Vec<ReportRecord>> {
+    let roots = report_roots(snapshot_dir, parquet_dir, source);
+    let mut out = Vec::new();
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for entry in
+            fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))?
+        {
+            let entry = entry?;
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = match p.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let (_cmd, ts) = match parse_report_filename(name) {
+                Some(v) => v,
+                None => continue,
+            };
+            let txt = fs::read_to_string(&p)
+                .with_context(|| format!("failed to read report {}", p.display()))?;
+            let report: RunReport = serde_json::from_str(&txt)
+                .with_context(|| format!("invalid report JSON {}", p.display()))?;
+            let source_kind = if p.starts_with(download_metadata_root(snapshot_dir)) {
+                "download".to_string()
+            } else if p.starts_with(global_reports_dir(parquet_dir)) {
+                "parquet-global".to_string()
+            } else {
+                "parquet-dataset".to_string()
+            };
+            out.push(ReportRecord {
+                source_kind,
+                path: p,
+                timestamp: ts,
+                report,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn dataset_metadata_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    let root = parquet_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join(".openalex-snapshot_metadata")
+        .join("datasets")
+        .join(dataset)
+}
+
+fn prev_dataset_metadata_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    parquet_dir.join(format!(".{dataset}_conversion_metadata"))
+}
+
+fn legacy_dataset_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    parquet_dir.join(dataset).join(".schema_cache")
+}
+
+fn dataset_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("schemata")
+}
+
+fn dataset_logs_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("logs")
+}
+
+fn dataset_reports_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("reports")
+}
+
+fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
+    let root = parquet_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join(".openalex-snapshot_metadata").join("reports")
+}
+
+fn schema_csv_candidates(parquet_dir: &Path, dataset: &str) -> Vec<PathBuf> {
+    vec![
+        dataset_cache_dir(parquet_dir, dataset).join("unified_schema.csv"),
+        legacy_dataset_cache_dir(parquet_dir, dataset).join("unified_schema.csv"),
+    ]
+}
+
+fn schema_json_candidates(parquet_dir: &Path, dataset: &str, file_name: &str) -> Vec<PathBuf> {
+    vec![
+        dataset_cache_dir(parquet_dir, dataset).join(file_name),
+        legacy_dataset_cache_dir(parquet_dir, dataset).join(file_name),
+    ]
+}
+
+fn move_dir_with_fallback(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::create_dir_all(dst)?;
+            for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+                let rel = entry.path().strip_prefix(src)?;
+                let target = dst.join(rel);
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(&target)?;
+                } else if entry.file_type().is_file() {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(entry.path(), &target)?;
+                }
+            }
+            fs::remove_dir_all(src)?;
+            Ok(())
+        }
+    }
+}
+
+fn merge_dir_with_fallback(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        let rel = entry.path().strip_prefix(src)?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !target.exists() {
+                fs::copy(entry.path(), &target)?;
+            }
+        }
+    }
+    fs::remove_dir_all(src)?;
+    Ok(())
+}
+
+fn migrate_previous_metadata_root_if_needed(parquet_dir: &Path, dataset: &str) -> Result<()> {
+    let new_root = dataset_metadata_dir(parquet_dir, dataset);
+    let old_root = prev_dataset_metadata_dir(parquet_dir, dataset);
+    if !old_root.exists() {
+        return Ok(());
+    }
+    if !new_root.exists() {
+        eprintln!(
+            "[meta] dataset={dataset} migrating prior metadata root {} -> {}",
+            old_root.display(),
+            new_root.display()
+        );
+        move_dir_with_fallback(&old_root, &new_root)?;
+    } else {
+        eprintln!(
+            "[meta] dataset={dataset} merging prior metadata root {} -> {}",
+            old_root.display(),
+            new_root.display()
+        );
+        merge_dir_with_fallback(&old_root, &new_root)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_schema_cache_if_needed(parquet_dir: &Path, dataset: &str) -> Result<()> {
+    migrate_previous_metadata_root_if_needed(parquet_dir, dataset)?;
+    let new_dir = dataset_cache_dir(parquet_dir, dataset);
+    let old_conversion = prev_dataset_metadata_dir(parquet_dir, dataset).join("schema_cache");
+    let old_in_dataset = legacy_dataset_cache_dir(parquet_dir, dataset);
+    if !new_dir.exists() && old_conversion.exists() {
+        eprintln!(
+            "[schema] dataset={dataset} migrating prior cache {} -> {}",
+            old_conversion.display(),
+            new_dir.display()
+        );
+        move_dir_with_fallback(&old_conversion, &new_dir)?;
+    }
+    if !new_dir.exists() && old_in_dataset.exists() {
+        eprintln!(
+            "[schema] dataset={dataset} migrating legacy cache {} -> {}",
+            old_in_dataset.display(),
+            new_dir.display()
+        );
+        move_dir_with_fallback(&old_in_dataset, &new_dir)?;
+    }
+    Ok(())
+}
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn bytes_to_gib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024 * 1024)
+}
+
+fn check_path_writable(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let probe = path.join(".openalex-check-write-probe.tmp");
+    fs::write(&probe, b"ok")?;
+    fs::remove_file(&probe)?;
+    Ok(())
+}
+
+fn estimate_convert_input_bytes_precise(snapshot_dir: &Path, dataset: &str) -> Result<u64> {
+    let mut total = 0u64;
+    let data_root = snapshot_dir.join("data");
+    if dataset == "all" {
+        if !data_root.exists() {
+            return Ok(0);
+        }
+        for e in WalkDir::new(&data_root).into_iter().filter_map(|e| e.ok()) {
+            if e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("gz")
+            {
+                total = total.saturating_add(e.metadata()?.len());
+            }
+        }
+        return Ok(total);
+    }
+    let ds_root = data_root.join(dataset);
+    if !ds_root.exists() {
+        return Ok(0);
+    }
+    for e in WalkDir::new(&ds_root).into_iter().filter_map(|e| e.ok()) {
+        if e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("gz") {
+            total = total.saturating_add(e.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+fn skills_templates(root_dir: &Path) -> Vec<(PathBuf, String)> {
+    let base = root_dir.join("skills");
+    vec![
+        (
+            base.join("README.md"),
+            r#"# Project Skills
+
+These skills help AI coding agents operate `openalex-snapshot` safely and consistently.
+
+## Program Summary
+
+`openalex-snapshot` is a root-dir-first CLI for OpenAlex snapshot workflows:
+
+1. `download` / `verify_download`
+2. `convert` / `verify_convert` / `repair_convert`
+3. `index` / `verify_index`
+4. `schema` / `verify_schema`
+5. reporting and progress (`report`, `prune-reports`, `progress`)
+
+Core requirements:
+- `duckdb` for conversion/verify/schema/index paths
+- `aws` for download/verify_download paths
+
+## How to use these skills
+
+- Start with `cli-operations/SKILL.md`.
+- Use `pipeline-runbook/SKILL.md` for end-to-end execution.
+- Use `debug-and-recovery/SKILL.md` when any command fails.
+- Use `release-and-docs/SKILL.md` when changing behavior.
+
+Canonical references:
+- `ARCHITECTURE_AND_DECISIONS.md`
+- `NEWS.md`
+- CLI help and man pages
+"#
+            .to_string(),
+        ),
+        (
+            base.join("cli-operations").join("SKILL.md"),
+            r#"# CLI Operations Skill
+
+## Purpose
+Run subcommands with correct root-dir model and predictable outputs.
+
+## Required Inputs
+- `root_dir`
+- target `dataset` or `all`
+- resource settings (`profile`, `workers`, `max-memory-mb`) when needed
+
+## Command Pattern
+- Always prefer `--root-dir`.
+- Use `--explain` before long runs.
+- Use `report` and `progress` for run-state visibility.
+
+## Common command snippets
+- Preflight: `openalex-snapshot check --root-dir <root> --dataset all`
+- Convert one dataset: `openalex-snapshot convert --root-dir <root> --dataset works --profile safe --workers 1`
+- Verify one dataset: `openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both`
+- Repair from report: `openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>`
+
+## Failure Handling
+- On non-zero exit, inspect latest report (`report --latest --full`).
+- Use `repair_convert` for verify-driven reconversion.
+
+## Decision rules
+- If memory is constrained, use `--profile safe --workers 1`.
+- If debugging a single problematic file, use repeated `--input-file` on `convert`.
+- Prefer `verify_convert --scope file` for quick checks, `--scope dataset|snapshot` for full checks.
+
+## Done Criteria
+- command exits successfully,
+- expected report written to `.openalex-snapshot_metadata/reports/`.
+"#
+            .to_string(),
+        ),
+        (
+            base.join("pipeline-runbook").join("SKILL.md"),
+            r#"# Pipeline Runbook Skill
+
+## Purpose
+Execute the recommended end-to-end flow safely.
+
+## Flow
+1. `check`
+2. `download`
+3. `verify_download`
+4. `convert`
+5. `verify_convert`
+6. `repair_convert` (only when verify reports failures)
+7. `index`
+8. `verify_index`
+
+## Decision Rules
+- Keep `profile=safe` for constrained memory hosts.
+- Use `--dataset` scope for focused reruns.
+- Keep reports for traceability.
+
+## Fast operational variants
+- Local snapshot already present:
+  1. `check`
+  2. `convert`
+  3. `verify_convert`
+  4. `index`
+  5. `verify_index`
+
+- Auto orchestration:
+  - `openalex-snapshot all --config <path> --retry <N>`
+"#
+            .to_string(),
+        ),
+        (
+            base.join("debug-and-recovery").join("SKILL.md"),
+            r#"# Debug and Recovery Skill
+
+## Purpose
+Triage failures using metadata and reports.
+
+## Steps
+1. `report --latest --full`
+2. `progress --once`
+3. verify failure phase and paths
+4. run targeted command with `--explain`
+5. rerun or `repair_convert` as indicated
+
+## Common Traps
+- wrong root-dir
+- missing duckdb/aws binaries
+- low disk space
+- stale assumptions from old command names
+
+## Failure phase hints
+- `check_dependency`: missing tool binary (`duckdb`/`aws`)
+- `check_download_disk` / `check_convert_disk`: insufficient free space
+- `verify_metrics`: file-level parity mismatch; candidate for `repair_convert`
+- `download_sync`: S3 sync/auth/endpoint failure
+- `validate_gzip_integrity`: corrupted `.json.gz` file
+"#
+            .to_string(),
+        ),
+        (
+            base.join("release-and-docs").join("SKILL.md"),
+            r#"# Release and Docs Hygiene Skill
+
+## Purpose
+Keep docs and release notes in sync with behavior changes.
+
+## Required Updates on Feature Change
+- `NEWS.md`
+- command docs/man pages
+- config template examples
+- architecture/decisions doc for changed invariants
+
+## Acceptance
+- new command/options appear in help, README, docs, and man pages
+- tests cover parsing + behavior + edge cases
+
+## Minimum release checks
+- `cargo test -q`
+- `cargo build --release`
+- `openalex-snapshot --help`
+- `openalex-snapshot --version`
+"#
+            .to_string(),
+        ),
+        (
+            base.join("_templates").join("skill-template.md"),
+            r#"# Skill Name
+
+## Purpose
+One-sentence objective.
+
+## Required Inputs
+- required context/flags
+
+## Commands
+Concrete command patterns.
+
+## Decision Rules
+When to choose one path vs another.
+
+## Failure Handling
+How to diagnose and recover.
+
+## Done Criteria
+What must be true to mark complete.
+"#
+            .to_string(),
+        ),
+    ]
+}
+
+fn convert_min_free_bytes(path: &Path) -> u64 {
+    if let Ok(v) = std::env::var("OPENALEX_CONVERT_MIN_FREE_GB") {
+        if let Ok(gb) = v.parse::<u64>() {
+            return gb.saturating_mul(1024 * 1024 * 1024);
+        }
+    }
+    let tmp = std::env::temp_dir();
+    if path.starts_with(&tmp) {
+        return 1u64 * 1024u64 * 1024u64 * 1024u64;
+    }
+    CONVERT_MIN_FREE_BYTES
+}
+
+fn available_disk_bytes(path: &Path) -> Result<u64> {
+    let out = Command::new("df")
+        .arg("-k")
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to run df for {}", path.display()))?;
+    if !out.status.success() {
+        bail!(
+            "df failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let line = txt
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| anyhow!("unexpected df output"))?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() < 4 {
+        bail!("unexpected df output row: {line}");
+    }
+    let avail_kb: u64 = cols[3]
+        .parse()
+        .with_context(|| format!("cannot parse df available kb from row: {line}"))?;
+    Ok(avail_kb.saturating_mul(1024))
+}
+
+fn append_dataset_log(parquet_dir: &Path, dataset: &str, command: &str, msg: &str) -> Result<()> {
+    let dir = dataset_logs_dir(parquet_dir, dataset);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{command}.log"));
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{} [{}] {}", now_unix(), command, msg)?;
+    Ok(())
+}
+
+fn try_log_dataset(parquet_dir: &Path, dataset: &str, command: &str, msg: &str) {
+    if let Err(e) = append_dataset_log(parquet_dir, dataset, command, msg) {
+        eprintln!("[log] dataset={dataset} command={command} write failed: {e}");
+    }
+}
+
+fn sanitize_command_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn command_flow_rank(cmd: &str) -> usize {
+    match cmd {
+        "all" => 0,
+        "download" => 1,
+        "verify_download" | "validate-download" | "verify-download" => 2,
+        "check" => 3,
+        "convert" => 4,
+        "verify" | "verify_convert" | "verify-convert" => 5,
+        "verify_schema" | "verify-schema" => 6,
+        "index" => 7,
+        "verify-index" | "verify_index" => 8,
+        "repair_convert" | "repair-convert" | "repair" => 9,
+        _ => 100,
+    }
+}
+
+fn report_file_name(command: &str, started_at_unix: i64) -> String {
+    format!(
+        "{}-{}.json",
+        sanitize_command_name(command),
+        started_at_unix
+    )
+}
+
+fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn write_run_reports(parquet_dir: &Path, report: &RunReport) -> Result<Vec<PathBuf>> {
+    let mut out_paths = Vec::new();
+    let fname = report_file_name(&report.command, report.started_at_unix);
+    let payload = serde_json::to_vec_pretty(report)?;
+
+    let global = global_reports_dir(parquet_dir).join(&fname);
+    write_json_atomic(&global, &payload)?;
+    out_paths.push(global);
+
+    for ds in &report.datasets {
+        let p = dataset_reports_dir(parquet_dir, &ds.dataset).join(&fname);
+        write_json_atomic(&p, &payload)?;
+        out_paths.push(p);
+    }
+    Ok(out_paths)
+}
+
+fn report_new(command: &str, args: BTreeMap<String, String>) -> RunReport {
+    RunReport {
+        command: command.to_string(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at_unix: now_unix(),
+        finished_at_unix: None,
+        duration_seconds: None,
+        args,
+        totals_items_scanned: 0,
+        totals_succeeded: 0,
+        totals_failed: 0,
+        totals_skipped: 0,
+        datasets: Vec::new(),
+        failures: Vec::new(),
+        step_runs: Vec::new(),
+    }
+}
+
+fn report_finalize(report: &mut RunReport) {
+    let finished = now_unix();
+    report.finished_at_unix = Some(finished);
+    report.duration_seconds = Some((finished - report.started_at_unix) as f64);
+    report.totals_items_scanned = report.datasets.iter().map(|d| d.items_scanned).sum();
+    report.totals_succeeded = report.datasets.iter().map(|d| d.succeeded).sum();
+    report.totals_failed = report.datasets.iter().map(|d| d.failed).sum();
+    report.totals_skipped = report.datasets.iter().map(|d| d.skipped).sum();
+}
+
+fn load_or_infer_source_schema(
+    duckdb_bin: &Path,
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    dataset: &str,
+    sample_size: usize,
+    refresh: bool,
+    memory_mb: Option<usize>,
+    state_flush_every: usize,
+) -> Result<SchemaDoc> {
+    migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
+    let cache_file = dataset_cache_dir(parquet_dir, dataset).join("source_schema.json");
+    let unified_csv = dataset_cache_dir(parquet_dir, dataset).join("unified_schema.csv");
+
+    // Canonical cache precedence: unified_schema.csv first.
+    if !refresh {
+        for csv in schema_csv_candidates(parquet_dir, dataset) {
+            if csv.exists() {
+                eprintln!(
+                    "[schema] dataset={dataset} using canonical cache: {}",
+                    csv.display()
+                );
+                let doc = read_unified_schema_csv(dataset, &csv)?;
+                // Optional mirror cache for inspection/debugging only.
+                fs::create_dir_all(dataset_cache_dir(parquet_dir, dataset))?;
+                fs::write(&cache_file, serde_json::to_vec_pretty(&doc)?)?;
+                return Ok(doc);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    let root = snapshot_dir.join("data").join(dataset);
+    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("gz")
+        {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+
+    if files.is_empty() {
+        bail!("no source .gz files found for dataset {dataset}");
+    }
+
+    let sample: Vec<PathBuf> = if sample_size == 0 || files.len() <= sample_size {
+        files
+    } else {
+        let step = (files.len() / sample_size).max(1);
+        files.into_iter().step_by(step).take(sample_size).collect()
+    };
+
+    eprintln!(
+        "[schema] dataset={dataset} inferring schema from {} sampled source files",
+        sample.len()
+    );
+    let mut merged: HashMap<String, String> = HashMap::new();
+    let flush_every = state_flush_every.max(1);
+    let in_progress_csv =
+        dataset_cache_dir(parquet_dir, dataset).join("unified_schema.in_progress.csv");
+    let in_progress_json =
+        dataset_cache_dir(parquet_dir, dataset).join("source_schema.in_progress.json");
+    for (i, f) in sample.iter().enumerate() {
+        let extra = if dataset == "works" {
+            ", maximum_object_size=1000000000"
+        } else {
+            ""
+        };
+        let cols = describe_json_file(duckdb_bin, f, extra, memory_mb)?;
+        for (k, t) in cols {
+            merged
+                .entry(k)
+                .and_modify(|existing| {
+                    if existing != &t {
+                        *existing = widen_type(existing, &t);
+                    }
+                })
+                .or_insert(t);
+        }
+        if (i + 1) % flush_every == 0 || i + 1 == sample.len() {
+            let checkpoint_doc = schema_doc_from_merged(dataset, &merged);
+            write_unified_schema_csv(&in_progress_csv, &checkpoint_doc)?;
+            write_json_atomic(
+                &in_progress_json,
+                &serde_json::to_vec_pretty(&checkpoint_doc)?,
+            )?;
+            eprintln!(
+                "[schema] dataset={dataset} processed {}/{} schema sample files",
+                i + 1,
+                sample.len()
+            );
+        }
+    }
+    let doc = schema_doc_from_merged(dataset, &merged);
+
+    fs::create_dir_all(dataset_cache_dir(parquet_dir, dataset))?;
+    write_unified_schema_csv(&unified_csv, &doc)?;
+    fs::write(&cache_file, serde_json::to_vec_pretty(&doc)?)?;
+    let _ = fs::remove_file(&in_progress_csv);
+    let _ = fs::remove_file(&in_progress_json);
+    eprintln!(
+        "[schema] dataset={dataset} wrote canonical schema cache: {}",
+        unified_csv.display()
+    );
+    Ok(doc)
+}
+
+fn load_parquet_schema(
+    duckdb_bin: &Path,
+    parquet_dir: &Path,
+    dataset: &str,
+    refresh: bool,
+    memory_mb: Option<usize>,
+) -> Result<SchemaDoc> {
+    migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
+    let cache_file = dataset_cache_dir(parquet_dir, dataset).join("parquet_schema.json");
+    if !refresh {
+        for p in schema_json_candidates(parquet_dir, dataset, "parquet_schema.json") {
+            if p.exists() {
+                let txt = fs::read_to_string(&p)?;
+                return serde_json::from_str(&txt).context("invalid parquet schema cache");
+            }
+        }
+    }
+
+    let glob = parquet_dir
+        .join(dataset)
+        .join("**")
+        .join("*.parquet")
+        .to_string_lossy()
+        .to_string();
+
+    let cols = describe_parquet_glob(duckdb_bin, &glob, memory_mb)?;
+    let mut fields: Vec<FieldDef> = cols
+        .into_iter()
+        .map(|(name, t)| FieldDef {
+            name,
+            r#type: duckdb_to_arrow_type(&t),
+            nullable: true,
+            children: Vec::new(),
+            metadata: {
+                let mut md = BTreeMap::new();
+                md.insert("duckdb_type".to_string(), t);
+                md
+            },
+        })
+        .collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let doc = SchemaDoc {
+        dataset: dataset.to_string(),
+        source: "parquet".to_string(),
+        generated_at_unix: now_unix(),
+        fields,
+        metadata: BTreeMap::new(),
+    };
+
+    fs::create_dir_all(dataset_cache_dir(parquet_dir, dataset))?;
+    fs::write(&cache_file, serde_json::to_vec_pretty(&doc)?)?;
+    Ok(doc)
+}
+
+fn schema_doc_from_merged(dataset: &str, merged: &HashMap<String, String>) -> SchemaDoc {
+    let mut fields: Vec<FieldDef> = merged
+        .iter()
+        .map(|(name, t)| FieldDef {
+            name: name.clone(),
+            r#type: duckdb_to_arrow_type(t),
+            nullable: true,
+            children: Vec::new(),
+            metadata: {
+                let mut md = BTreeMap::new();
+                md.insert("duckdb_type".to_string(), t.clone());
+                md
+            },
+        })
+        .collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if dataset == "works" {
+        if let Some(f) = fields
+            .iter_mut()
+            .find(|x| x.name == "abstract_inverted_index")
+        {
+            f.r#type = "utf8".to_string();
+        }
+    }
+
+    SchemaDoc {
+        dataset: dataset.to_string(),
+        source: "source".to_string(),
+        generated_at_unix: now_unix(),
+        fields,
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn load_schema_by_policy(
+    duckdb_bin: &Path,
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    dataset: &str,
+    from: SchemaFrom,
+    sample_size: usize,
+    refresh: bool,
+    memory_mb: Option<usize>,
+    state_flush_every: usize,
+) -> Result<SchemaDoc> {
+    migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
+    let cache_file = dataset_cache_dir(parquet_dir, dataset).join("source_schema.json");
+    let unified_csv = dataset_cache_dir(parquet_dir, dataset).join("unified_schema.csv");
+
+    match from {
+        SchemaFrom::Source => load_or_infer_source_schema(
+            duckdb_bin,
+            snapshot_dir,
+            parquet_dir,
+            dataset,
+            sample_size,
+            refresh,
+            memory_mb,
+            state_flush_every,
+        ),
+        SchemaFrom::Cache => {
+            for p in schema_csv_candidates(parquet_dir, dataset) {
+                if p.exists() {
+                    return read_unified_schema_csv(dataset, &p);
+                }
+            }
+            for p in schema_json_candidates(parquet_dir, dataset, "source_schema.json") {
+                if p.exists() {
+                    let txt = fs::read_to_string(&p)?;
+                    return serde_json::from_str(&txt).context("invalid legacy cache schema");
+                }
+            }
+            let first = schema_csv_candidates(parquet_dir, dataset)
+                .into_iter()
+                .next()
+                .unwrap_or(unified_csv);
+            let _ = cache_file;
+            bail!("cache not found: {}", first.display())
+        }
+        SchemaFrom::Parquet => {
+            load_parquet_schema(duckdb_bin, parquet_dir, dataset, refresh, memory_mb)
+        }
+        SchemaFrom::Auto => {
+            let src_root = snapshot_dir.join("data").join(dataset);
+            if src_root.exists() {
+                return load_or_infer_source_schema(
+                    duckdb_bin,
+                    snapshot_dir,
+                    parquet_dir,
+                    dataset,
+                    sample_size,
+                    refresh,
+                    memory_mb,
+                    state_flush_every,
+                );
+            }
+            for p in schema_csv_candidates(parquet_dir, dataset) {
+                if p.exists() {
+                    return read_unified_schema_csv(dataset, &p);
+                }
+            }
+            for p in schema_json_candidates(parquet_dir, dataset, "source_schema.json") {
+                if p.exists() {
+                    let txt = fs::read_to_string(&p)?;
+                    return serde_json::from_str(&txt).context("invalid legacy cache schema");
+                }
+            }
+            load_parquet_schema(duckdb_bin, parquet_dir, dataset, refresh, memory_mb)
+        }
+    }
+}
+
+fn convert_one(
+    duckdb_bin: &Path,
+    pair: &FilePair,
+    columns_clause: &str,
+    compression: &str,
+    row_group_rows: usize,
+    memory_mb: Option<usize>,
+    extra_json_options: &str,
+) -> Result<()> {
+    if let Some(parent) = pair.output_parquet.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp = pair.output_parquet.with_extension("parquet.tmp");
+    let in_q = sql_quote(&pair.input_gz.to_string_lossy());
+    let out_q = sql_quote(&tmp.to_string_lossy());
+
+    let mut sql = String::new();
+    if let Some(mb) = memory_mb {
+        sql.push_str(&format!("SET memory_limit='{}MB';", mb));
+    }
+    sql.push_str("SET preserve_insertion_order = false;");
+    sql.push_str("LOAD json;");
+    sql.push_str(&format!(
+        "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true)) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
+        in_q,
+        columns_clause,
+        out_q,
+        compression.to_uppercase(),
+        row_group_rows
+    ));
+    if !extra_json_options.is_empty() {
+        sql.clear();
+        if let Some(mb) = memory_mb {
+            sql.push_str(&format!("SET memory_limit='{}MB';", mb));
+        }
+        sql.push_str("SET preserve_insertion_order = false;");
+        sql.push_str("LOAD json;");
+        sql.push_str(&format!(
+            "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true{}) ) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
+            in_q,
+            columns_clause,
+            extra_json_options,
+            out_q,
+            compression.to_uppercase(),
+            row_group_rows
+        ));
+    }
+
+    run_duckdb_sql(duckdb_bin, &sql)?;
+    fs::rename(&tmp, &pair.output_parquet)?;
+    Ok(())
+}
+
+fn list_parquet_rel(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut out = BTreeSet::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("parquet") {
+            continue;
+        }
+        out.insert(entry.path().strip_prefix(root)?.to_path_buf());
+    }
+    Ok(out)
+}
+
+fn legacy_verify_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    parquet_dir.join(dataset).join(".verify_cache")
+}
+
+fn prev_verify_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    prev_dataset_metadata_dir(parquet_dir, dataset).join("verify_cache")
+}
+
+fn verify_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("verify")
+}
+
+fn migrate_legacy_verify_cache_if_needed(parquet_dir: &Path, dataset: &str) -> Result<()> {
+    migrate_previous_metadata_root_if_needed(parquet_dir, dataset)?;
+    let new_dir = verify_cache_dir(parquet_dir, dataset);
+    let old_conversion = prev_verify_cache_dir(parquet_dir, dataset);
+    let old_in_dataset = legacy_verify_cache_dir(parquet_dir, dataset);
+    if !new_dir.exists() && old_conversion.exists() {
+        eprintln!(
+            "[verify] dataset={dataset} migrating prior cache {} -> {}",
+            old_conversion.display(),
+            new_dir.display()
+        );
+        move_dir_with_fallback(&old_conversion, &new_dir)?;
+    }
+    if !new_dir.exists() && old_in_dataset.exists() {
+        eprintln!(
+            "[verify] dataset={dataset} migrating legacy cache {} -> {}",
+            old_in_dataset.display(),
+            new_dir.display()
+        );
+        move_dir_with_fallback(&old_in_dataset, &new_dir)?;
+    }
+    Ok(())
+}
+
+fn source_metrics_cache_file(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    verify_cache_dir(parquet_dir, dataset).join("source_file_metrics.csv")
+}
+
+fn parquet_metrics_cache_file(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    verify_cache_dir(parquet_dir, dataset).join("parquet_file_metrics.csv")
+}
+
+fn load_source_metrics_cache(
+    parquet_dir: &Path,
+    dataset: &str,
+) -> Result<HashMap<String, SourceMetricRow>> {
+    migrate_legacy_verify_cache_if_needed(parquet_dir, dataset)?;
+    let canonical = source_metrics_cache_file(parquet_dir, dataset);
+    let legacy = legacy_verify_cache_dir(parquet_dir, dataset).join("source_file_metrics.csv");
+    let f = if canonical.exists() {
+        canonical
+    } else {
+        legacy
+    };
+    if !f.exists() {
+        return Ok(HashMap::new());
+    }
+    let mut rdr = csv::Reader::from_path(&f)?;
+    let mut out = HashMap::new();
+    for rec in rdr.deserialize::<SourceMetricRow>() {
+        let r = rec?;
+        out.insert(r.rel_path.clone(), r);
+    }
+    Ok(out)
+}
+
+fn load_parquet_metrics_cache(
+    parquet_dir: &Path,
+    dataset: &str,
+) -> Result<HashMap<String, ParquetMetricRow>> {
+    migrate_legacy_verify_cache_if_needed(parquet_dir, dataset)?;
+    let f = parquet_metrics_cache_file(parquet_dir, dataset);
+    if !f.exists() {
+        return Ok(HashMap::new());
+    }
+    let mut rdr = csv::Reader::from_path(&f)?;
+    let mut out = HashMap::new();
+    for rec in rdr.deserialize::<ParquetMetricRow>() {
+        let r = rec?;
+        out.insert(r.rel_path.clone(), r);
+    }
+    Ok(out)
+}
+
+fn save_source_metrics_cache(
+    parquet_dir: &Path,
+    dataset: &str,
+    map: &HashMap<String, SourceMetricRow>,
+) -> Result<()> {
+    let dir = verify_cache_dir(parquet_dir, dataset);
+    fs::create_dir_all(&dir)?;
+    let f = source_metrics_cache_file(parquet_dir, dataset);
+    let mut rows: Vec<SourceMetricRow> = map.values().cloned().collect();
+    rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let tmp = f.with_extension("csv.tmp");
+    let mut wtr = csv::Writer::from_path(&tmp)?;
+    for r in rows {
+        wtr.serialize(r)?;
+    }
+    wtr.flush()?;
+    fs::rename(&tmp, &f)?;
+    Ok(())
+}
+
+fn save_parquet_metrics_cache(
+    parquet_dir: &Path,
+    dataset: &str,
+    map: &HashMap<String, ParquetMetricRow>,
+) -> Result<()> {
+    let dir = verify_cache_dir(parquet_dir, dataset);
+    fs::create_dir_all(&dir)?;
+    let f = parquet_metrics_cache_file(parquet_dir, dataset);
+    let mut rows: Vec<ParquetMetricRow> = map.values().cloned().collect();
+    rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let tmp = f.with_extension("csv.tmp");
+    let mut wtr = csv::Writer::from_path(&tmp)?;
+    for r in rows {
+        wtr.serialize(r)?;
+    }
+    wtr.flush()?;
+    fs::rename(&tmp, &f)?;
+    Ok(())
+}
+
+fn file_meta_signature(path: &Path) -> Result<(u64, i64)> {
+    let m = fs::metadata(path)?;
+    let sz = m.len();
+    let mt = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok((sz, mt))
+}
+
+fn verify_file_metrics(
+    duckdb_bin: &Path,
+    p: &FilePair,
+    level: VerifyMetadataLevel,
+    source_metrics: &Arc<std::sync::Mutex<HashMap<String, SourceMetricRow>>>,
+    parquet_metrics: &Arc<std::sync::Mutex<HashMap<String, ParquetMetricRow>>>,
+    memory_mb: Option<usize>,
+) -> Result<()> {
+    let rel = p.rel.to_string_lossy().replace('\\', "/");
+    let (src_sz, src_mt) = file_meta_signature(&p.input_gz)?;
+    let (pq_sz, pq_mt) = file_meta_signature(&p.output_parquet)?;
+    let need_hash = matches!(
+        level,
+        VerifyMetadataLevel::IdHash | VerifyMetadataLevel::Both
+    );
+    let cached = {
+        let guard = source_metrics
+            .lock()
+            .map_err(|_| anyhow!("verify metrics cache lock poisoned"))?;
+        guard.get(&rel).cloned()
+    };
+    let src_row = match cached {
+        Some(cached)
+            if cached.source_size == src_sz
+                && cached.source_mtime_unix == src_mt
+                && (!need_hash || !cached.id_hash.is_empty()) =>
+        {
+            cached
+        }
+        _ => {
+            let (n, h) = if need_hash {
+                duckdb_metrics_json(duckdb_bin, &p.input_gz, memory_mb)?
+            } else {
+                (
+                    duckdb_count_json(duckdb_bin, &p.input_gz, memory_mb)?,
+                    String::new(),
+                )
+            };
+            let row = SourceMetricRow {
+                rel_path: rel.clone(),
+                source_size: src_sz,
+                source_mtime_unix: src_mt,
+                row_count: n,
+                id_hash: h,
+            };
+            let mut guard = source_metrics
+                .lock()
+                .map_err(|_| anyhow!("verify metrics cache lock poisoned"))?;
+            guard.insert(rel.clone(), row.clone());
+            row
+        }
+    };
+    let pq_cached = {
+        let guard = parquet_metrics
+            .lock()
+            .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?;
+        guard.get(&rel).cloned()
+    };
+    let (pq_n, pq_h) = if let Some(c) = pq_cached {
+        if c.parquet_size == pq_sz
+            && c.parquet_mtime_unix == pq_mt
+            && (!need_hash || !c.id_hash.is_empty())
+        {
+            (c.row_count, c.id_hash)
+        } else {
+            let (n, h) = if need_hash {
+                duckdb_metrics_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+            } else {
+                duckdb_count_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+                    .map(|n| (n, String::new()))
+            }
+            .with_context(|| {
+                format!(
+                    "parquet metrics failed for {}. \
+If this parquet is corrupt/truncated, delete it and reconvert matching source file: {}",
+                    p.output_parquet.display(),
+                    p.rel.display()
+                )
+            })?;
+            let row = ParquetMetricRow {
+                rel_path: rel.clone(),
+                parquet_size: pq_sz,
+                parquet_mtime_unix: pq_mt,
+                row_count: n,
+                id_hash: h.clone(),
+            };
+            let mut guard = parquet_metrics
+                .lock()
+                .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?;
+            guard.insert(rel.clone(), row);
+            (n, h)
+        }
+    } else {
+        let (n, h) = if need_hash {
+            duckdb_metrics_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+        } else {
+            duckdb_count_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+                .map(|n| (n, String::new()))
+        }
+        .with_context(|| {
+            format!(
+                "parquet metrics failed for {}. \
+If this parquet is corrupt/truncated, delete it and reconvert matching source file: {}",
+                p.output_parquet.display(),
+                p.rel.display()
+            )
+        })?;
+        let row = ParquetMetricRow {
+            rel_path: rel.clone(),
+            parquet_size: pq_sz,
+            parquet_mtime_unix: pq_mt,
+            row_count: n,
+            id_hash: h.clone(),
+        };
+        let mut guard = parquet_metrics
+            .lock()
+            .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?;
+        guard.insert(rel.clone(), row);
+        (n, h)
+    };
+
+    if matches!(
+        level,
+        VerifyMetadataLevel::RowCount | VerifyMetadataLevel::Both
+    ) && src_row.row_count != pq_n
+    {
+        bail!(
+            "[verify] row count mismatch for {} (json={}, parquet={})",
+            p.rel.display(),
+            src_row.row_count,
+            pq_n
+        );
+    }
+    if matches!(
+        level,
+        VerifyMetadataLevel::IdHash | VerifyMetadataLevel::Both
+    ) && src_row.id_hash != pq_h
+    {
+        bail!(
+            "[verify] id hash mismatch for {} (json_hash={}, parquet_hash={})",
+            p.rel.display(),
+            src_row.id_hash,
+            pq_h
+        );
+    }
+    Ok(())
+}
+
+fn duckdb_metrics_json(
+    duckdb_bin: &Path,
+    path: &Path,
+    memory_mb: Option<usize>,
+) -> Result<(u64, String)> {
+    let sql = with_session_settings(&format!(
+        "LOAD json; SELECT COUNT(*) AS n, COALESCE(CAST(bit_xor(hash(CAST(id AS VARCHAR))) AS VARCHAR), '0') AS h FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
+        sql_quote(&path.to_string_lossy())
+    ), memory_mb, Some(1));
+    let row = query_one_row(duckdb_bin, &sql)?;
+    Ok((
+        parse_u64(row.get("n"))?,
+        row.get("h").cloned().unwrap_or_else(|| "0".to_string()),
+    ))
+}
+
+fn duckdb_count_json(duckdb_bin: &Path, path: &Path, memory_mb: Option<usize>) -> Result<u64> {
+    let sql = with_session_settings(
+        &format!(
+            "LOAD json; SELECT COUNT(*) AS n FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
+            sql_quote(&path.to_string_lossy())
+        ),
+        memory_mb,
+        Some(1),
+    );
+    let row = query_one_row(duckdb_bin, &sql)?;
+    parse_u64(row.get("n"))
+}
+
+fn duckdb_metrics_parquet(
+    duckdb_bin: &Path,
+    path: &Path,
+    memory_mb: Option<usize>,
+) -> Result<(u64, String)> {
+    let sql = with_session_settings(&format!(
+        "SELECT COUNT(*) AS n, COALESCE(CAST(bit_xor(hash(CAST(id AS VARCHAR))) AS VARCHAR), '0') AS h FROM read_parquet({})",
+        sql_quote(&path.to_string_lossy())
+    ), memory_mb, Some(1));
+    let row = query_one_row(duckdb_bin, &sql)?;
+    Ok((
+        parse_u64(row.get("n"))?,
+        row.get("h").cloned().unwrap_or_else(|| "0".to_string()),
+    ))
+}
+
+fn duckdb_count_parquet(duckdb_bin: &Path, path: &Path, memory_mb: Option<usize>) -> Result<u64> {
+    let sql = with_session_settings(
+        &format!(
+            "SELECT COUNT(*) AS n FROM read_parquet({})",
+            sql_quote(&path.to_string_lossy())
+        ),
+        memory_mb,
+        Some(1),
+    );
+    let row = query_one_row(duckdb_bin, &sql)?;
+    parse_u64(row.get("n"))
+}
+
+fn parse_u64(v: Option<&String>) -> Result<u64> {
+    v.ok_or_else(|| anyhow!("missing numeric value"))?
+        .parse::<u64>()
+        .context("invalid integer in duckdb output")
+}
+
+fn describe_json_file(
+    duckdb_bin: &Path,
+    file: &Path,
+    extra_options: &str,
+    memory_mb: Option<usize>,
+) -> Result<BTreeMap<String, String>> {
+    let sql = with_session_settings(&format!(
+        "LOAD json; SELECT * FROM (DESCRIBE SELECT * FROM read_json_auto({}, union_by_name=true, ignore_errors=true{}))",
+        sql_quote(&file.to_string_lossy()),
+        extra_options
+    ), memory_mb, Some(1));
+    describe_query(duckdb_bin, &sql)
+}
+
+fn describe_parquet_glob(
+    duckdb_bin: &Path,
+    glob: &str,
+    memory_mb: Option<usize>,
+) -> Result<BTreeMap<String, String>> {
+    let sql = with_session_settings(
+        &format!(
+            "SELECT * FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+            sql_quote(glob)
+        ),
+        memory_mb,
+        Some(1),
+    );
+    describe_query(duckdb_bin, &sql)
+}
+
+fn describe_query(duckdb_bin: &Path, sql: &str) -> Result<BTreeMap<String, String>> {
+    let rows = run_duckdb_csv(duckdb_bin, sql)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let name = row
+            .get("column_name")
+            .or_else(|| row.get("name"))
+            .cloned()
+            .ok_or_else(|| anyhow!("DESCRIBE row missing column name"))?;
+        let ty = row
+            .get("column_type")
+            .or_else(|| row.get("type"))
+            .cloned()
+            .ok_or_else(|| anyhow!("DESCRIBE row missing column type"))?;
+        out.insert(name, ty);
+    }
+    Ok(out)
+}
+
+fn to_duckdb_columns_clause(fields: &[FieldDef]) -> String {
+    let defs = fields
+        .iter()
+        .map(|f| {
+            let dt = f
+                .metadata
+                .get("duckdb_type")
+                .cloned()
+                .unwrap_or_else(|| arrow_to_duckdb_type(&f.r#type));
+            format!("'{}': '{}'", f.name, dt.replace('\'', "''"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{}}}", defs)
+}
+
+fn read_unified_schema_csv(dataset: &str, path: &Path) -> Result<SchemaDoc> {
+    let mut rdr =
+        csv::Reader::from_path(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut fields = Vec::<FieldDef>::new();
+    for rec in rdr.deserialize::<HashMap<String, String>>() {
+        let row = rec.context("invalid row in unified_schema.csv")?;
+        let name = row
+            .get("col_name")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing col_name in unified_schema.csv"))?;
+        let typ = row
+            .get("col_type")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing col_type in unified_schema.csv"))?;
+        let mut md = BTreeMap::new();
+        md.insert("duckdb_type".to_string(), typ.clone());
+        fields.push(FieldDef {
+            name,
+            r#type: duckdb_to_arrow_type(&typ),
+            nullable: true,
+            children: Vec::new(),
+            metadata: md,
+        });
+    }
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(SchemaDoc {
+        dataset: dataset.to_string(),
+        source: "source".to_string(),
+        generated_at_unix: now_unix(),
+        fields,
+        metadata: BTreeMap::new(),
+    })
+}
+
+fn write_unified_schema_csv(path: &Path, doc: &SchemaDoc) -> Result<()> {
+    let mut wtr =
+        csv::Writer::from_path(path).with_context(|| format!("cannot write {}", path.display()))?;
+    wtr.write_record(["col_name", "col_type"])?;
+    for f in &doc.fields {
+        let dt = f
+            .metadata
+            .get("duckdb_type")
+            .cloned()
+            .unwrap_or_else(|| arrow_to_duckdb_type(&f.r#type));
+        wtr.write_record([f.name.as_str(), dt.as_str()])?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+fn arrow_to_duckdb_type(t: &str) -> String {
+    match t {
+        "bool" => "BOOLEAN".to_string(),
+        "int8" => "TINYINT".to_string(),
+        "int16" => "SMALLINT".to_string(),
+        "int32" => "INTEGER".to_string(),
+        "int64" => "BIGINT".to_string(),
+        "float32" => "FLOAT".to_string(),
+        "float64" => "DOUBLE".to_string(),
+        "utf8" => "VARCHAR".to_string(),
+        "date32" => "DATE".to_string(),
+        "timestamp[us]" => "TIMESTAMP".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+fn duckdb_to_arrow_type(t: &str) -> String {
+    let tt = t.trim().to_uppercase();
+    if tt.starts_with("STRUCT") {
+        return "struct".to_string();
+    }
+    if tt.starts_with("LIST") {
+        return "list".to_string();
+    }
+    match tt.as_str() {
+        "BOOLEAN" => "bool".to_string(),
+        "TINYINT" => "int8".to_string(),
+        "SMALLINT" => "int16".to_string(),
+        "INTEGER" | "INT" => "int32".to_string(),
+        "BIGINT" | "HUGEINT" => "int64".to_string(),
+        "FLOAT" => "float32".to_string(),
+        "DOUBLE" | "DECIMAL" => "float64".to_string(),
+        "DATE" => "date32".to_string(),
+        "TIMESTAMP" => "timestamp[us]".to_string(),
+        _ => "utf8".to_string(),
+    }
+}
+
+fn widen_type(a: &str, b: &str) -> String {
+    let na = normalize_duckdb_type(a);
+    let nb = normalize_duckdb_type(b);
+    if na == nb {
+        return na;
+    }
+
+    let numeric = [
+        "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "FLOAT", "DOUBLE",
+    ];
+    let pa = numeric.iter().position(|x| *x == na);
+    let pb = numeric.iter().position(|x| *x == nb);
+
+    match (pa, pb) {
+        (Some(i), Some(j)) => numeric[i.max(j)].to_string(),
+        _ => {
+            if na.starts_with("STRUCT") || na.starts_with("LIST") || na.starts_with("MAP") {
+                na
+            } else if nb.starts_with("STRUCT") || nb.starts_with("LIST") || nb.starts_with("MAP") {
+                nb
+            } else {
+                "VARCHAR".to_string()
+            }
+        }
+    }
+}
+
+fn normalize_duckdb_type(t: &str) -> String {
+    t.trim().to_uppercase()
+}
+
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn run_duckdb_sql(duckdb_bin: &Path, sql: &str) -> Result<()> {
+    let out = Command::new(duckdb_bin)
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
+
+    if !out.status.success() {
+        bail!(
+            "duckdb sql failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn with_session_settings(sql: &str, memory_mb: Option<usize>, threads: Option<usize>) -> String {
+    let mut out = String::new();
+    if let Some(t) = threads {
+        out.push_str(&format!("SET threads = {}; ", t.max(1)));
+    }
+    if let Some(mb) = memory_mb {
+        out.push_str(&format!("SET memory_limit='{}MB'; ", mb));
+    }
+    out.push_str(sql);
+    out
+}
+
+fn run_duckdb_csv(duckdb_bin: &Path, sql: &str) -> Result<Vec<HashMap<String, String>>> {
+    let out = Command::new(duckdb_bin)
+        .arg("-csv")
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
+
+    if !out.status.success() {
+        bail!(
+            "duckdb csv query failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let mut rdr = csv::Reader::from_reader(out.stdout.as_slice());
+    let headers = rdr
+        .headers()
+        .context("cannot read csv header")?
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    let mut rows = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        let mut row = HashMap::new();
+        for (i, h) in headers.iter().enumerate() {
+            let v = rec.get(i).unwrap_or_default().to_string();
+            row.insert(h.clone(), v);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn query_one_row(duckdb_bin: &Path, sql: &str) -> Result<HashMap<String, String>> {
+    let rows = run_duckdb_csv(duckdb_bin, sql)?;
+    rows.into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("query returned no rows"))
+}
+
+fn make_progress_bar(enabled: bool, len: u64, prefix: &str) -> ProgressBar {
+    if !enabled {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{prefix} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} eta {eta}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+    pb.set_prefix(prefix.to_string());
+    pb
+}
+
+fn render_table(schema: &SchemaDoc) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("dataset: {}\n", schema.dataset));
+    out.push_str(&format!("source: {}\n", schema.source));
+    out.push_str("\nname\ttype\tnullable\n");
+    for f in &schema.fields {
+        out.push_str(&format!("{}\t{}\t{}\n", f.name, f.r#type, f.nullable));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_widen_numeric() {
+        assert_eq!(widen_type("INTEGER", "DOUBLE"), "DOUBLE");
+        assert_eq!(widen_type("SMALLINT", "BIGINT"), "BIGINT");
+    }
+
+    #[test]
+    fn test_sql_quote() {
+        assert_eq!(sql_quote("abc"), "'abc'");
+        assert_eq!(sql_quote("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn test_arrow_mapping() {
+        assert_eq!(duckdb_to_arrow_type("BIGINT"), "int64");
+        assert_eq!(duckdb_to_arrow_type("VARCHAR"), "utf8");
+        assert_eq!(arrow_to_duckdb_type("utf8"), "VARCHAR");
+    }
+
+    #[test]
+    fn test_resolve_tuning_profiles() {
+        let s = resolve_tuning_with_total(Profile::Safe, 8, None, Some(32_768));
+        assert_eq!(s.workers, 2);
+        assert_eq!(s.memory_mb, Some(3932));
+
+        let s1 = resolve_tuning_with_total(Profile::Safe, 1, None, Some(32_768));
+        assert_eq!(s1.workers, 1);
+        assert_eq!(s1.memory_mb, Some(11_796));
+
+        let b = resolve_tuning_with_total(Profile::Balanced, 8, None, Some(32_768));
+        assert_eq!(b.workers, 8);
+        assert_eq!(b.memory_mb, Some(9174));
+
+        let f = resolve_tuning_with_total(Profile::Fast, 8, None, Some(32_768));
+        assert_eq!(f.workers, 8);
+        assert_eq!(f.memory_mb, Some(14_417));
+
+        let ov = resolve_tuning_with_total(Profile::Safe, 3, Some(999), Some(32_768));
+        assert_eq!(ov.memory_mb, Some(999));
+    }
+
+    #[test]
+    fn test_auto_profile_memory_fallback() {
+        assert_eq!(auto_profile_memory_mb(Profile::Safe, None), 2048);
+        assert_eq!(auto_profile_memory_mb(Profile::Balanced, None), 6144);
+        assert_eq!(auto_profile_memory_mb(Profile::Fast, None), 12_288);
+        assert_eq!(auto_profile_single_worker_safe_memory_mb(None), 8192);
+    }
+
+    #[test]
+    fn test_collect_repair_targets_filters_and_dedups() {
+        let report = RunReport {
+            command: "verify".to_string(),
+            cli_version: "0.1.0".to_string(),
+            started_at_unix: 1,
+            finished_at_unix: Some(2),
+            duration_seconds: Some(1.0),
+            args: BTreeMap::new(),
+            totals_items_scanned: 2,
+            totals_succeeded: 0,
+            totals_failed: 2,
+            totals_skipped: 0,
+            datasets: vec![],
+            failures: vec![
+                FailureEntry {
+                    dataset: "authors".to_string(),
+                    phase: "verify_metrics".to_string(),
+                    rel_path: Some("part_000/part1.gz".to_string()),
+                    source_path: Some("/tmp/snapshot/data/authors/part_000/part1.gz".to_string()),
+                    output_path: Some("/tmp/parquet/authors/part_000/part1.parquet".to_string()),
+                    error_message: "x".to_string(),
+                    suggested_recovery: None,
+                },
+                FailureEntry {
+                    dataset: "authors".to_string(),
+                    phase: "verify_metrics".to_string(),
+                    rel_path: Some("part_000/part1.gz".to_string()),
+                    source_path: Some("/tmp/snapshot/data/authors/part_000/part1.gz".to_string()),
+                    output_path: Some("/tmp/parquet/authors/part_000/part1.parquet".to_string()),
+                    error_message: "x".to_string(),
+                    suggested_recovery: None,
+                },
+                FailureEntry {
+                    dataset: "works".to_string(),
+                    phase: "structure".to_string(),
+                    rel_path: Some("part_000/part1.gz".to_string()),
+                    source_path: None,
+                    output_path: None,
+                    error_message: "x".to_string(),
+                    suggested_recovery: None,
+                },
+            ],
+            step_runs: vec![],
+        };
+        let mut allowed = BTreeSet::new();
+        allowed.insert("authors".to_string());
+        let out = collect_repair_targets(
+            &report,
+            &allowed,
+            Path::new("/tmp/snapshot"),
+            Path::new("/tmp/parquet"),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dataset, "authors");
+    }
+}
