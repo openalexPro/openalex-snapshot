@@ -13,6 +13,7 @@ use std::io::stdout;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -190,6 +191,8 @@ Argument precedence (highest wins):
 ";
 
 const CONVERT_MIN_FREE_BYTES: u64 = 900u64 * 1024u64 * 1024u64 * 1024u64;
+static INDEX_ALL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static VERIFY_INDEX_ALL_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 const REPORT_LONG_ABOUT: &str = "\
 View stored report files from parquet and/or download metadata roots.
@@ -1584,6 +1587,21 @@ struct RunReport {
     failures: Vec<FailureEntry>,
     #[serde(default)]
     step_runs: Vec<StepRunSummary>,
+}
+
+struct RecursionDepthGuard(&'static AtomicUsize);
+
+impl RecursionDepthGuard {
+    fn enter(counter: &'static AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for RecursionDepthGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn main() -> Result<()> {
@@ -3477,6 +3495,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
         println!("precise: {}", args.precise);
         return Ok(());
     }
+    let _ = cleanup_command_reports(&args.shared.parquet_dir, "check");
 
     let mut report_args = BTreeMap::new();
     report_args.insert(
@@ -3825,8 +3844,8 @@ fn run_check(args: CheckArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
-            "{:<20} {:<8} {:<70} {}",
-            "check", "status", "details", "recommendation"
+            "{:<20} {:<8} {:<70} recommendation",
+            "check", "status", "details"
         );
         println!("{}", "-".repeat(140));
         for f in &findings {
@@ -3895,16 +3914,8 @@ fn run_report(args: ReportArgs) -> Result<()> {
     }
 
     println!(
-        "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
-        "source",
-        "command",
-        "status",
-        "failed",
-        "succeeded",
-        "skipped",
-        "started_local",
-        "runtime",
-        "path"
+        "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  path",
+        "source", "command", "status", "failed", "succeeded", "skipped", "started_local", "runtime"
     );
     println!("{}", "-".repeat(140));
     for rec in &records {
@@ -4225,6 +4236,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
         );
         return Ok(());
     }
+    let _ = cleanup_command_reports(&parquet_dir, "all");
 
     let mut report_args = BTreeMap::new();
     report_args.insert(
@@ -4575,10 +4587,13 @@ fn run_progress(mut args: ProgressArgs) -> Result<()> {
 
 fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
     if args.dataset == "all" {
+        let _guard = RecursionDepthGuard::enter(&VERIFY_INDEX_ALL_DEPTH);
         if args.index_file.is_some() {
             bail!("--index-file cannot be used with --dataset all");
         }
         let parquet_dir = args.root_dir.join("parquet");
+        let _ = cleanup_command_reports(&parquet_dir, "verify-index");
+        let _ = cleanup_command_dataset_logs(&parquet_dir, "verify-index");
         let mut datasets: Vec<String> = fs::read_dir(&parquet_dir)
             .with_context(|| format!("failed to read {}", parquet_dir.display()))?
             .filter_map(|e| e.ok())
@@ -4638,7 +4653,10 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
         println!("memory_mb: {:?}", tuning.memory_mb);
         return Ok(());
     }
-
+    if VERIFY_INDEX_ALL_DEPTH.load(Ordering::SeqCst) == 0 {
+        let _ = cleanup_command_reports(&parquet_dir, "verify-index");
+        let _ = cleanup_command_dataset_logs(&parquet_dir, "verify-index");
+    }
     let mut report_args = BTreeMap::new();
     report_args.insert(
         "root_dir".to_string(),
@@ -4895,6 +4913,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         explain_convert(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
+    let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
+    let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
     let mut report_args = BTreeMap::new();
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
     report_args.insert("workers".to_string(), tuning.workers.to_string());
@@ -5247,12 +5267,15 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
 fn run_index(args: IndexArgs) -> Result<()> {
     if args.dataset == "all" {
+        let _guard = RecursionDepthGuard::enter(&INDEX_ALL_DEPTH);
         if args.index_file.is_some() {
             eprintln!(
                 "[index] --index-file is ignored when --dataset all; using per-dataset default paths"
             );
         }
         let parquet_dir = args.root_dir.join("parquet");
+        let _ = cleanup_command_reports(&parquet_dir, "index");
+        let _ = cleanup_command_dataset_logs(&parquet_dir, "index");
         let mut datasets: Vec<String> = fs::read_dir(&parquet_dir)
             .with_context(|| format!("failed to read {}", parquet_dir.display()))?
             .filter_map(|e| e.ok())
@@ -5320,6 +5343,10 @@ fn run_index(args: IndexArgs) -> Result<()> {
     if args.explain {
         explain_index(&args, &bin, &corpus_dir, &index_file, &tuning);
         return Ok(());
+    }
+    if INDEX_ALL_DEPTH.load(Ordering::SeqCst) == 0 {
+        let _ = cleanup_command_reports(&parquet_dir, "index");
+        let _ = cleanup_command_dataset_logs(&parquet_dir, "index");
     }
     let mut report_args = BTreeMap::new();
     report_args.insert(
@@ -5565,6 +5592,8 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
         explain_verify(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
+    let _ = cleanup_command_reports(&args.shared.parquet_dir, "verify_convert");
+    let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "verify");
     let mut report_args = BTreeMap::new();
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
     report_args.insert("scope".to_string(), format!("{:?}", args.scope));
@@ -5894,6 +5923,8 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
         explain_schema(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
+    let _ = cleanup_command_reports(&args.shared.parquet_dir, "schema");
+    let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "schema");
     let mut report_args = BTreeMap::new();
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
     report_args.insert("from".to_string(), format!("{:?}", args.from));
@@ -6237,6 +6268,8 @@ fn run_repair(args: RepairArgs) -> Result<()> {
         explain_repair(&args, &datasets, &duckdb_bin, &tuning)?;
         return Ok(());
     }
+    let _ = cleanup_command_reports(&args.shared.parquet_dir, "repair_convert");
+    let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "repair_convert");
 
     let mut report_args = BTreeMap::new();
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
@@ -6300,7 +6333,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
             .map(|s| !s.is_empty())
             .unwrap_or(false);
         let has_rel = f.rel_path.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-        if !(has_source && has_output) && !has_rel {
+        if !(has_rel || has_source && has_output) {
             report.failures.push(FailureEntry {
                 dataset: f.dataset.clone(),
                 phase: "repair_select".to_string(),
@@ -6562,6 +6595,8 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         explain_download(&args)?;
         return Ok(());
     }
+    let _ = cleanup_download_reports(&args.snapshot_dir, "download");
+    let _ = cleanup_download_log(&args.snapshot_dir, "download");
     let mut report_args = BTreeMap::new();
     report_args.insert(
         "snapshot_dir".to_string(),
@@ -6734,6 +6769,9 @@ fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
         explain_validate_download(&args, &tuning);
         return Ok(());
     }
+    let _ = cleanup_download_reports(&args.snapshot_dir, "verify_download");
+    let _ = cleanup_download_log(&args.snapshot_dir, "verify_download");
+    let _ = cleanup_download_manifests(&args.snapshot_dir);
 
     let mut report_args = BTreeMap::new();
     report_args.insert(
@@ -7105,7 +7143,7 @@ fn ensure_duckdb(shared: &SharedArgs) -> Result<()> {
 }
 
 fn ensure_duckdb_bin(bin: &Path) -> Result<()> {
-    let out = Command::new(&bin).arg("--version").output();
+    let out = Command::new(bin).arg("--version").output();
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => bail!(
@@ -7148,7 +7186,7 @@ fn resolve_tuning_with_total(
     };
     match profile {
         Profile::Safe => {
-            out.workers = out.workers.min(2).max(1);
+            out.workers = out.workers.clamp(1, 2);
             if out.memory_mb.is_none() {
                 let mut mb = auto_profile_memory_mb(Profile::Safe, total_mb);
                 if out.workers == 1 {
@@ -7179,7 +7217,7 @@ fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
     let usable = (t as f64 * 0.80).floor() as usize;
     // For single-worker safe mode, prefer higher memory to avoid OOM on large nested records.
     let mb = ((usable as f64) * 0.45).floor() as usize;
-    mb.max(8192).min(24_576)
+    mb.clamp(8192, 24_576)
 }
 
 fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
@@ -7582,6 +7620,55 @@ fn write_download_reports(snapshot_dir: &Path, report: &RunReport) -> Result<Vec
     Ok(vec![p])
 }
 
+fn cleanup_download_reports(snapshot_dir: &Path, command: &str) -> Result<()> {
+    let dir = download_reports_dir(snapshot_dir);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let prefix = format!("{}-", sanitize_command_name(command));
+    for ent in fs::read_dir(&dir)? {
+        let ent = ent?;
+        if !ent.path().is_file() {
+            continue;
+        }
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".json") {
+            let _ = fs::remove_file(ent.path());
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_download_log(snapshot_dir: &Path, command: &str) -> Result<()> {
+    let p = download_logs_dir(snapshot_dir).join(format!("{command}.log"));
+    if p.exists() {
+        let _ = fs::remove_file(p);
+    }
+    Ok(())
+}
+
+fn cleanup_download_manifests(snapshot_dir: &Path) -> Result<()> {
+    let dir = download_manifests_dir(snapshot_dir);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for ent in fs::read_dir(&dir)? {
+        let ent = ent?;
+        if !ent.path().is_file() {
+            continue;
+        }
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("remote_manifest-") || name.starts_with("local_manifest-"))
+            && name.ends_with(".jsonl")
+        {
+            let _ = fs::remove_file(ent.path());
+        }
+    }
+    Ok(())
+}
+
 fn write_manifest_jsonl(path: &Path, items: &[RemoteObject]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -7963,12 +8050,69 @@ fn dataset_reports_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
     dataset_metadata_dir(parquet_dir, dataset).join("reports")
 }
 
+fn datasets_metadata_root(parquet_dir: &Path) -> PathBuf {
+    let root = parquet_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join(".openalex-snapshot_metadata").join("datasets")
+}
+
 fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
     let root = parquet_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     root.join(".openalex-snapshot_metadata").join("reports")
+}
+
+fn cleanup_command_reports(parquet_dir: &Path, command: &str) -> Result<()> {
+    let prefix = format!("{}-", sanitize_command_name(command));
+    let mut dirs = vec![global_reports_dir(parquet_dir)];
+    let datasets_root = datasets_metadata_root(parquet_dir);
+    if datasets_root.exists() {
+        for ent in fs::read_dir(&datasets_root)? {
+            let ent = ent?;
+            if ent.path().is_dir() {
+                dirs.push(ent.path().join("reports"));
+            }
+        }
+    }
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for ent in fs::read_dir(&dir)? {
+            let ent = ent?;
+            if !ent.path().is_file() {
+                continue;
+            }
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".json") {
+                let _ = fs::remove_file(ent.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_command_dataset_logs(parquet_dir: &Path, log_command: &str) -> Result<()> {
+    let datasets_root = datasets_metadata_root(parquet_dir);
+    if !datasets_root.exists() {
+        return Ok(());
+    }
+    for ent in fs::read_dir(&datasets_root)? {
+        let ent = ent?;
+        if !ent.path().is_dir() {
+            continue;
+        }
+        let p = ent.path().join("logs").join(format!("{log_command}.log"));
+        if p.exists() {
+            let _ = fs::remove_file(p);
+        }
+    }
+    Ok(())
 }
 
 fn schema_csv_candidates(parquet_dir: &Path, dataset: &str) -> Vec<PathBuf> {
@@ -8340,7 +8484,7 @@ fn convert_min_free_bytes(path: &Path) -> u64 {
     }
     let tmp = std::env::temp_dir();
     if path.starts_with(&tmp) {
-        return 1u64 * 1024u64 * 1024u64 * 1024u64;
+        return 1024u64 * 1024u64 * 1024u64;
     }
     CONVERT_MIN_FREE_BYTES
 }
@@ -8493,6 +8637,7 @@ fn report_finalize(report: &mut RunReport) {
     report.totals_skipped = report.datasets.iter().map(|d| d.skipped).sum();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_or_infer_source_schema(
     duckdb_bin: &Path,
     snapshot_dir: &Path,
@@ -8691,6 +8836,7 @@ fn schema_doc_from_merged(dataset: &str, merged: &HashMap<String, String>) -> Sc
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_schema_by_policy(
     duckdb_bin: &Path,
     snapshot_dir: &Path,
