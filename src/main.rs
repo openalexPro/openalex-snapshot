@@ -469,7 +469,9 @@ struct AllArgs {
 #[command(long_about = CONFIG_LONG_ABOUT)]
 struct ConfigArgs {
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "complete")]
-    #[arg(help = "Create config template: complete, safe, or fast (default when omitted: complete)")]
+    #[arg(
+        help = "Create config template: complete, safe, or fast (default when omitted: complete)"
+    )]
     create: Option<ConfigTemplateMode>,
 
     #[arg(long, default_value_t = false)]
@@ -1837,7 +1839,11 @@ fn cli_explicit(matches: Option<&ArgMatches>, id: &str) -> bool {
     matches.and_then(|m| m.value_source(id)) == Some(ValueSource::CommandLine)
 }
 
-fn apply_shared_defaults(shared: &mut SharedArgs, d: &ConfigDefaults, matches: Option<&ArgMatches>) {
+fn apply_shared_defaults(
+    shared: &mut SharedArgs,
+    d: &ConfigDefaults,
+    matches: Option<&ArgMatches>,
+) {
     if !cli_explicit(matches, "root_dir") {
         if let Some(v) = &d.root_dir {
             shared.root_dir = v.clone();
@@ -1860,7 +1866,11 @@ fn apply_shared_defaults(shared: &mut SharedArgs, d: &ConfigDefaults, matches: O
     }
 }
 
-fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_convert_config(
+    args: &mut ConvertArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -1959,7 +1969,11 @@ fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>, matches
     }
 }
 
-fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_verify_config(
+    args: &mut VerifyArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -2048,7 +2062,11 @@ fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>, matches: 
     }
 }
 
-fn apply_schema_config(args: &mut SchemaArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_schema_config(
+    args: &mut SchemaArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -2229,7 +2247,11 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
     }
 }
 
-fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_repair_config(
+    args: &mut RepairArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -2303,7 +2325,11 @@ fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>, matches: 
     }
 }
 
-fn apply_download_config(args: &mut DownloadArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_download_config(
+    args: &mut DownloadArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -2585,7 +2611,11 @@ fn apply_verify_index_config(
     }
 }
 
-fn apply_report_config(args: &mut ReportArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_report_config(
+    args: &mut ReportArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -2651,7 +2681,11 @@ fn apply_prune_reports_config(
     }
 }
 
-fn apply_progress_config(args: &mut ProgressArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
+fn apply_progress_config(
+    args: &mut ProgressArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
@@ -3284,9 +3318,7 @@ check:
 fn run_config(args: ConfigArgs) -> Result<()> {
     let modes = (args.create.is_some() as u8) + (args.verify as u8);
     if modes != 1 {
-        bail!(
-            "config requires exactly one mode: use --create <complete|safe|fast> or --verify"
-        );
+        bail!("config requires exactly one mode: use --create <complete|safe|fast> or --verify");
     }
     if args.explain {
         let create_mode = args
@@ -3540,7 +3572,9 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     name: name.to_string(),
                     status: "fail".to_string(),
                     details: format!("{e:#}"),
-                    recommendation: Some("fix path permissions or choose another --root-dir".to_string()),
+                    recommendation: Some(
+                        "fix path permissions or choose another --root-dir".to_string(),
+                    ),
                 });
                 report.failures.push(FailureEntry {
                     dataset: args.shared.dataset.clone(),
@@ -3604,7 +3638,9 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     name: "download_disk".to_string(),
                     status: "fail".to_string(),
                     details: msg.clone(),
-                    recommendation: Some("free disk space or use download --skip-disk-check".to_string()),
+                    recommendation: Some(
+                        "free disk space or use download --skip-disk-check".to_string(),
+                    ),
                 });
                 report.failures.push(FailureEntry {
                     dataset: args.shared.dataset.clone(),
@@ -3680,7 +3716,9 @@ fn run_check(args: CheckArgs) -> Result<()> {
                 name: "convert_disk".to_string(),
                 status: "fail".to_string(),
                 details: msg.clone(),
-                recommendation: Some("free disk space or use convert --skip-disk-check".to_string()),
+                recommendation: Some(
+                    "free disk space or use convert --skip-disk-check".to_string(),
+                ),
             });
             report.failures.push(FailureEntry {
                 dataset: args.shared.dataset.clone(),
@@ -3705,7 +3743,11 @@ fn run_check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    let tuning = resolve_tuning(args.profile.clone(), args.shared.workers, args.max_memory_mb);
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
     let total = detect_total_memory_mb();
     if let Some(total_mb) = total {
         let mem = tuning.memory_mb.unwrap_or(0);
@@ -3748,10 +3790,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
     report.datasets.push(DatasetReportSummary {
         dataset: args.shared.dataset.clone(),
         items_scanned: findings.len() as u64,
-        succeeded: findings
-            .iter()
-            .filter(|f| f.status == "ok")
-            .count() as u64,
+        succeeded: findings.iter().filter(|f| f.status == "ok").count() as u64,
         failed: fails as u64,
         skipped: 0,
     });
@@ -3759,7 +3798,9 @@ fn run_check(args: CheckArgs) -> Result<()> {
     report.totals_succeeded = findings.iter().filter(|f| f.status == "ok").count() as u64;
     report.totals_failed = fails as u64;
     report.totals_skipped = 0;
-    report.args.insert("warnings".to_string(), warns.to_string());
+    report
+        .args
+        .insert("warnings".to_string(), warns.to_string());
     report_finalize(&mut report);
     let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
 
@@ -4186,7 +4227,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
     }
 
     let mut report_args = BTreeMap::new();
-    report_args.insert("root_dir".to_string(), resolved.root_dir.to_string_lossy().to_string());
+    report_args.insert(
+        "root_dir".to_string(),
+        resolved.root_dir.to_string_lossy().to_string(),
+    );
     report_args.insert("retry".to_string(), resolved.retry.to_string());
     let mut report = report_new("all", report_args);
     report.datasets.push(DatasetReportSummary {
@@ -4364,8 +4408,11 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                 break;
             }
             attempts += 1;
-            let report_path = latest_report_path_for_command(&snapshot_dir, &parquet_dir, "verify_convert")
-                .ok_or_else(|| anyhow!("[all] cannot locate latest verify_convert report for repair loop"))?;
+            let report_path =
+                latest_report_path_for_command(&snapshot_dir, &parquet_dir, "verify_convert")
+                    .ok_or_else(|| {
+                        anyhow!("[all] cannot locate latest verify_convert report for repair loop")
+                    })?;
             let mut ra = RepairArgs {
                 shared: SharedArgs {
                     root_dir: resolved.root_dir.clone(),
@@ -4408,7 +4455,9 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                     "verify_convert did not pass after {} repair attempt(s)",
                     resolved.retry
                 ),
-                suggested_recovery: Some("rerun repair_convert manually with higher memory profile".to_string()),
+                suggested_recovery: Some(
+                    "rerun repair_convert manually with higher memory profile".to_string(),
+                ),
             });
             report_finalize(&mut report);
             let _ = write_run_reports(&parquet_dir, &report);
@@ -4557,7 +4606,10 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
             }
         }
         if failures > 0 {
-            bail!("[verify-index] failures detected across datasets: {}", failures);
+            bail!(
+                "[verify-index] failures detected across datasets: {}",
+                failures
+            );
         }
         return Ok(());
     }
@@ -8063,7 +8115,8 @@ fn estimate_convert_input_bytes_precise(snapshot_dir: &Path, dataset: &str) -> R
             return Ok(0);
         }
         for e in WalkDir::new(&data_root).into_iter().filter_map(|e| e.ok()) {
-            if e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("gz")
+            if e.file_type().is_file()
+                && e.path().extension().and_then(|x| x.to_str()) == Some("gz")
             {
                 total = total.saturating_add(e.metadata()?.len());
             }

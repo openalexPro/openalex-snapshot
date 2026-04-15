@@ -401,7 +401,13 @@ fn index_all_builds_multiple_datasets() {
         .success());
 
     assert!(Command::new(&exe)
-        .args(["index", "--root-dir", root.to_str().unwrap(), "--dataset", "all"])
+        .args([
+            "index",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "all"
+        ])
         .status()
         .unwrap()
         .success());
