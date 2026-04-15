@@ -338,6 +338,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#extract-by-ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extract by IDs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#download-and-verify-snapshot" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -597,6 +608,34 @@
     
   
     index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../commands/extract/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    extract
   
 
     
@@ -920,6 +959,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#extract-by-ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extract by IDs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#download-and-verify-snapshot" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -990,6 +1040,12 @@ cargo build --release
 ./target/release/openalex-snapshot verify_index \
   --root-dir /Volumes/openalex \
   --dataset works
+</code></pre>
+<h2 id="extract-by-ids">Extract by IDs</h2>
+<pre><code class="language-bash">./target/release/openalex-snapshot extract \
+  --root-dir /Volumes/openalex \
+  --ids /Volumes/openalex/ids.csv \
+  --output /Volumes/openalex/extract.parquet
 </code></pre>
 <h2 id="download-and-verify-snapshot">Download and verify snapshot</h2>
 <pre><code class="language-bash">./target/release/openalex-snapshot download --root-dir /Volumes/openalex
