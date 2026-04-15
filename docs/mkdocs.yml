@@ -1,4 +1,5 @@
 site_name: openalex-convert
+docs_dir: .
 theme:
   name: material
 nav:
