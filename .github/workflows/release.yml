@@ -57,8 +57,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BIN="openalex-convert${{ matrix.bin_ext }}"
-          PKG="openalex-convert-${{ github.ref_name }}-${{ matrix.target }}"
+          BIN="openalex-snapshot${{ matrix.bin_ext }}"
+          PKG="openalex-snapshot-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$PKG"
           cp "target/${{ matrix.target }}/release/$BIN" "$PKG/"
           cp README.md "$PKG/"
@@ -69,8 +69,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = "openalex-convert${{ matrix.bin_ext }}"
-          $pkg = "openalex-convert-${{ github.ref_name }}-${{ matrix.target }}"
+          $bin = "openalex-snapshot${{ matrix.bin_ext }}"
+          $pkg = "openalex-snapshot-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$bin" "$pkg/"
           Copy-Item "README.md" "$pkg/"
