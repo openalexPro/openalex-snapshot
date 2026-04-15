@@ -47,6 +47,15 @@ cargo build --release
   --dataset works
 ```
 
+## Extract by IDs
+
+```bash
+./target/release/openalex-snapshot extract \
+  --root-dir /Volumes/openalex \
+  --ids /Volumes/openalex/ids.csv \
+  --output /Volumes/openalex/extract.parquet
+```
+
 ## Download and verify snapshot
 
 ```bash

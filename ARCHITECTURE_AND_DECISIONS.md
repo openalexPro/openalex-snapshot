@@ -36,6 +36,7 @@ This document captures project invariants and decision records so human and AI c
 - `verify_convert` validates structure and per-file metrics parity.
 - `repair_convert` is verify-report-driven and only targets actionable file-level failures.
 - `verify_schema` is separate from `schema` inspection for consistent command semantics.
+- `extract` uses `<dataset>_id_idx.parquet` indexes and supports entity-prefix plus taxonomy-namespace ID routing.
 
 ## Download Decisions
 

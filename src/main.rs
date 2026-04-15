@@ -39,6 +39,7 @@ This binary provides:
 - schema: inspect schema from source/cache/parquet, including arrow-r JSON
 - verify_schema: assert schema parity across schema sources
 - index: build *_id_idx.parquet lookup index (R build_corpus_index equivalent)
+- extract: extract rows by OpenAlex IDs using per-dataset indexes
 - verify_index: validate index integrity and coverage
 - repair_convert: re-convert files that failed prior verify runs
 - report: view stored reports
@@ -71,6 +72,12 @@ index (detailed):
   - stage 2: shard combine into *_id_idx.parquet
   - outputs columns: id, id_block, parquet_file, file_row_number
 
+extract (detailed):
+  - reads IDs from CSV
+  - routes IDs by entity prefix / taxonomy namespace
+  - resolves files via *_id_idx.parquet
+  - writes one parquet output per dataset
+
 repair_convert (detailed):
   - reads a verify report JSON
   - selects file-level verify failures (phase=verify_metrics)
@@ -91,6 +98,7 @@ Examples:
   openalex-snapshot schema --root-dir /data --dataset works --format arrow-r
   openalex-snapshot verify_schema --root-dir /data --dataset works
   openalex-snapshot index --root-dir /data --dataset works --profile balanced
+  openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
   openalex-snapshot verify_index --root-dir /data --dataset works
   openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
   openalex-snapshot report --root-dir /data --latest
@@ -171,6 +179,24 @@ Checks:
   - required columns exist: id, id_block, parquet_file, file_row_number
   - index row count matches total rows across corpus parquet files
   - parquet_file references in index resolve to existing files
+";
+
+const EXTRACT_LONG_ABOUT: &str = "\
+Extract records by OpenAlex IDs using parquet indexes.
+
+Behavior:
+  - reads IDs from CSV
+  - routes IDs by entity prefix or taxonomy namespace
+  - uses <root>/parquet/<dataset>_id_idx.parquet
+  - writes <output_base>_<dataset>.parquet
+
+Entity prefixes:
+  W works, A authors, S sources, I institutions, T topics,
+  K keywords, P publishers, F funders, G awards, C concepts (deprecated)
+
+Taxonomy namespaces:
+  institution-types, work-types, source-types, licenses,
+  countries, continents, languages, domains, fields, subfields, sdgs
 ";
 
 const CONFIG_LONG_ABOUT: &str = "\
@@ -418,6 +444,8 @@ enum Commands {
     VerifySchema(VerifySchemaArgs),
     #[command(about = "Build a parquet lookup index for a parquet corpus.", long_about = INDEX_LONG_ABOUT)]
     Index(IndexArgs),
+    #[command(about = "Extract rows by OpenAlex IDs using indexes.", long_about = EXTRACT_LONG_ABOUT)]
+    Extract(ExtractArgs),
     #[command(
         about = "Verify index integrity for a parquet corpus.",
         long_about = VERIFY_INDEX_LONG_ABOUT,
@@ -845,6 +873,44 @@ struct IndexArgs {
 }
 
 #[derive(clap::Args, Debug, Clone)]
+#[command(about = "Extract rows by OpenAlex IDs using indexes")]
+#[command(long_about = EXTRACT_LONG_ABOUT)]
+struct ExtractArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+
+    #[arg(long)]
+    #[arg(help = "Input CSV containing OpenAlex IDs")]
+    ids: PathBuf,
+
+    #[arg(long)]
+    #[arg(help = "Output parquet base path (writes <base>_<dataset>.parquet)")]
+    output: PathBuf,
+
+    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    profile: Profile,
+
+    #[arg(long)]
+    #[arg(
+        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
+    )]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+
+    #[arg(long, default_value_t = 25)]
+    #[arg(help = "Flush state/report every N items (for crash resilience)")]
+    state_flush_every: usize,
+}
+
+#[derive(clap::Args, Debug, Clone)]
 #[command(about = "Repair failed files from a verify report")]
 #[command(long_about = REPAIR_LONG_ABOUT)]
 struct RepairArgs {
@@ -1260,6 +1326,7 @@ struct AppConfig {
     verify_convert: Option<VerifyConfig>,
     schema: Option<SchemaConfig>,
     index: Option<IndexConfig>,
+    extract: Option<ExtractConfig>,
     repair_convert: Option<RepairConfig>,
     download: Option<DownloadConfig>,
     verify_download: Option<ValidateDownloadConfig>,
@@ -1363,6 +1430,21 @@ struct IndexConfig {
     state_flush_every: Option<usize>,
     index_file: Option<PathBuf>,
     overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
+    ids: Option<PathBuf>,
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1512,6 +1594,13 @@ struct RepairTarget {
     source_path: PathBuf,
     output_path: PathBuf,
     rel: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractInput {
+    raw: String,
+    normalized: String,
+    dataset: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1710,6 +1799,25 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             run_index(args)
+        }
+        Commands::Extract(mut args) => {
+            fill_shared_dirs(&mut args.shared);
+            apply_extract_config(&mut args, cfg.as_ref(), sub_matches);
+            fill_shared_dirs(&mut args.shared);
+            try_migrate_metadata_root(&args.shared.root_dir);
+            if cli.print_effective_config {
+                explain_extract(
+                    &args,
+                    &duckdb_bin(&args.shared),
+                    &resolve_tuning(
+                        args.profile.clone(),
+                        args.shared.workers,
+                        args.max_memory_mb,
+                    ),
+                );
+                return Ok(());
+            }
+            run_extract(args)
         }
         Commands::Repair(mut args) => {
             fill_shared_dirs(&mut args.shared);
@@ -2260,6 +2368,89 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "overwrite") {
             if let Some(v) = c.overwrite {
                 args.overwrite = v;
+            }
+        }
+    }
+}
+
+fn apply_extract_config(
+    args: &mut ExtractArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        apply_shared_defaults(&mut args.shared, d, matches);
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &d.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = d.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.extract {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "ids") {
+            if let Some(v) = &c.ids {
+                args.ids = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "output") {
+            if let Some(v) = &c.output {
+                args.output = v.clone();
             }
         }
     }
@@ -3141,6 +3332,29 @@ index:
 
   # allowed values: true | false
   overwrite: false
+
+extract:
+  # ---------------------------------------------------------------------------
+  # Extract rows by OpenAlex IDs from CSV using per-dataset indexes
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # Input CSV with IDs (column auto-detected: id/openalex_id/work_id/first column).
+  # allowed values: any valid path
+  # ids: ./ids.csv
+
+  # Output base path. Command writes one file per dataset:
+  # <base>_<dataset>.parquet
+  # allowed values: any valid path
+  # output: ./extract.parquet
 
 verify_index:
   # ---------------------------------------------------------------------------
@@ -5579,6 +5793,411 @@ fn run_index(args: IndexArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_extract(args: ExtractArgs) -> Result<()> {
+    ensure_duckdb(&args.shared)?;
+    let bin = duckdb_bin(&args.shared);
+    let parquet_dir = args.shared.parquet_dir.clone();
+    let tuning = resolve_tuning(
+        args.profile.clone(),
+        args.shared.workers,
+        args.max_memory_mb,
+    );
+    if args.explain {
+        explain_extract(&args, &bin, &tuning);
+        return Ok(());
+    }
+
+    let _ = cleanup_command_reports(&parquet_dir, "extract");
+    let _ = cleanup_command_dataset_logs(&parquet_dir, "extract");
+
+    let inputs = read_extract_ids(&args.ids)?;
+    let allowed_dataset = if args.shared.dataset == "all" {
+        None
+    } else {
+        Some(args.shared.dataset.clone())
+    };
+
+    let mut unknown_rows: Vec<(String, String, String)> = Vec::new();
+    let mut dataset_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for inp in inputs {
+        let Some(ds) = inp.dataset.clone() else {
+            unknown_rows.push((
+                inp.raw,
+                inp.normalized,
+                "unmapped id format/prefix".to_string(),
+            ));
+            continue;
+        };
+        if let Some(only) = &allowed_dataset {
+            if &ds != only {
+                unknown_rows.push((
+                    inp.raw,
+                    inp.normalized,
+                    format!("filtered by --dataset={only}"),
+                ));
+                continue;
+            }
+        }
+        dataset_ids.entry(ds).or_default().insert(inp.normalized);
+    }
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "root_dir".to_string(),
+        args.shared.root_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("ids".to_string(), args.ids.to_string_lossy().to_string());
+    report_args.insert(
+        "output".to_string(),
+        args.output.to_string_lossy().to_string(),
+    );
+    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
+    report_args.insert(
+        "state_flush_every".to_string(),
+        args.state_flush_every.to_string(),
+    );
+    let mut report = report_new("extract", report_args);
+    let flush_every = args.state_flush_every.max(1);
+    let ds_names: Vec<String> = dataset_ids.keys().cloned().collect();
+    let pb = make_progress_bar(args.progress, ds_names.len() as u64, "extract");
+
+    let output_base = args.output.clone();
+    let output_parent = output_base
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&output_parent)
+        .with_context(|| format!("failed to create output dir {}", output_parent.display()))?;
+
+    let reports_dir = global_reports_dir(&parquet_dir);
+    fs::create_dir_all(&reports_dir)?;
+    let ts = now_unix();
+    let unknown_report_path = reports_dir.join(format!("extract-unknown-ids-{}.csv", ts));
+    let missing_report_path = reports_dir.join(format!("extract-missing-ids-{}.csv", ts));
+    let mut missing_rows: Vec<(String, String)> = Vec::new();
+
+    for (i, (dataset, ids)) in dataset_ids.iter().enumerate() {
+        if i > 0 && i % flush_every == 0 {
+            report_finalize(&mut report);
+            let _ = write_run_reports(&parquet_dir, &report);
+            // Continue updating report in-memory after checkpoint write.
+            report.finished_at_unix = None;
+            report.duration_seconds = None;
+        }
+        let mut ds = DatasetReportSummary {
+            dataset: dataset.clone(),
+            items_scanned: ids.len() as u64,
+            ..Default::default()
+        };
+        try_log_dataset(
+            &parquet_dir,
+            dataset,
+            "extract",
+            &format!(
+                "start ids={} workers={} memory_mb={:?}",
+                ids.len(),
+                tuning.workers,
+                tuning.memory_mb
+            ),
+        );
+
+        let index_file = parquet_dir.join(format!("{dataset}_id_idx.parquet"));
+        if !index_file.exists() {
+            ds.failed += ds.items_scanned.max(1);
+            report.datasets.push(ds);
+            report.failures.push(FailureEntry {
+                dataset: dataset.clone(),
+                phase: "extract_index_read".to_string(),
+                rel_path: None,
+                source_path: Some(index_file.to_string_lossy().to_string()),
+                output_path: None,
+                error_message: "index file missing".to_string(),
+                suggested_recovery: Some(format!(
+                    "run openalex-snapshot index --root-dir {} --dataset {}",
+                    args.shared.root_dir.display(),
+                    dataset
+                )),
+            });
+            pb.inc(1);
+            continue;
+        }
+
+        let req_ids_tmp = reports_dir.join(format!("extract-req-{}-{}.csv", dataset, ts));
+        {
+            let mut wtr = csv::Writer::from_path(&req_ids_tmp)?;
+            wtr.write_record(["id"])?;
+            for id in ids {
+                wtr.write_record([id])?;
+            }
+            wtr.flush()?;
+        }
+
+        let idx_sql = with_session_settings(
+            &format!(
+                "SELECT DISTINCT CAST(i.id AS VARCHAR) AS id, i.parquet_file AS parquet_file \
+                 FROM read_parquet({}) i \
+                 INNER JOIN read_csv_auto({}, HEADER=true, ALL_VARCHAR=true) r \
+                 ON CAST(i.id AS VARCHAR)=CAST(r.id AS VARCHAR);",
+                sql_quote(&index_file.to_string_lossy()),
+                sql_quote(&req_ids_tmp.to_string_lossy())
+            ),
+            tuning.memory_mb,
+            Some(1),
+        );
+        let idx_rows = match run_duckdb_csv(&bin, &idx_sql) {
+            Ok(v) => v,
+            Err(e) => {
+                ds.failed += ds.items_scanned.max(1);
+                report.datasets.push(ds);
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "extract_index_read".to_string(),
+                    rel_path: None,
+                    source_path: Some(index_file.to_string_lossy().to_string()),
+                    output_path: None,
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some("rebuild index and retry extract".to_string()),
+                });
+                let _ = fs::remove_file(&req_ids_tmp);
+                pb.inc(1);
+                continue;
+            }
+        };
+        let mut matched_ids = BTreeSet::<String>::new();
+        let mut dataset_files = BTreeSet::<PathBuf>::new();
+        for row in idx_rows {
+            if let Some(id) = row.get("id") {
+                matched_ids.insert(id.clone());
+            }
+            if let Some(rel_file) = row.get("parquet_file") {
+                dataset_files.insert(parquet_dir.join(rel_file));
+            }
+        }
+        let missing: Vec<String> = ids
+            .iter()
+            .filter(|id| !matched_ids.contains(*id))
+            .cloned()
+            .collect();
+        for id in &missing {
+            missing_rows.push((dataset.clone(), id.clone()));
+        }
+        ds.skipped = missing.len() as u64;
+
+        let out_path = extract_output_path(&output_base, dataset);
+        if matched_ids.is_empty() {
+            ds.succeeded = 0;
+            report.datasets.push(ds);
+            let _ = fs::remove_file(&req_ids_tmp);
+            pb.inc(1);
+            continue;
+        }
+
+        let matched_tmp = reports_dir.join(format!("extract-match-{}-{}.csv", dataset, ts));
+        {
+            let mut wtr = csv::Writer::from_path(&matched_tmp)?;
+            wtr.write_record(["id"])?;
+            for id in &matched_ids {
+                wtr.write_record([id])?;
+            }
+            wtr.flush()?;
+        }
+        let file_list_sql = format!(
+            "[{}]",
+            dataset_files
+                .iter()
+                .map(|p| sql_quote(&p.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let copy_sql = with_session_settings(
+            &format!(
+                "COPY (SELECT s.* \
+                 FROM read_parquet({}) s \
+                 INNER JOIN read_csv_auto({}, HEADER=true, ALL_VARCHAR=true) m \
+                 ON CAST(s.id AS VARCHAR)=CAST(m.id AS VARCHAR)) \
+                 TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
+                file_list_sql,
+                sql_quote(&matched_tmp.to_string_lossy()),
+                sql_quote(&out_path.to_string_lossy())
+            ),
+            tuning.memory_mb,
+            Some(1),
+        );
+        if let Err(e) = run_duckdb_sql(&bin, &copy_sql) {
+            ds.failed += matched_ids.len() as u64;
+            report.failures.push(FailureEntry {
+                dataset: dataset.clone(),
+                phase: "extract_write_output".to_string(),
+                rel_path: None,
+                source_path: Some(index_file.to_string_lossy().to_string()),
+                output_path: Some(out_path.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("verify parquet/index and retry extract".to_string()),
+            });
+        } else {
+            ds.succeeded = matched_ids.len() as u64;
+            try_log_dataset(
+                &parquet_dir,
+                dataset,
+                "extract",
+                &format!(
+                    "done output={} matched={} missing={}",
+                    out_path.display(),
+                    ds.succeeded,
+                    ds.skipped
+                ),
+            );
+        }
+        report.datasets.push(ds);
+        let _ = fs::remove_file(&req_ids_tmp);
+        let _ = fs::remove_file(&matched_tmp);
+        pb.inc(1);
+    }
+    pb.finish_with_message("extract complete");
+
+    if !unknown_rows.is_empty() {
+        let mut wtr = csv::Writer::from_path(&unknown_report_path)?;
+        wtr.write_record(["raw_id", "normalized_id", "reason"])?;
+        for (raw, norm, reason) in &unknown_rows {
+            wtr.write_record([raw, norm, reason])?;
+        }
+        wtr.flush()?;
+    }
+    if !missing_rows.is_empty() {
+        let mut wtr = csv::Writer::from_path(&missing_report_path)?;
+        wtr.write_record(["dataset", "id"])?;
+        for (dataset, id) in &missing_rows {
+            wtr.write_record([dataset, id])?;
+        }
+        wtr.flush()?;
+    }
+    if !unknown_rows.is_empty() {
+        report.args.insert(
+            "unknown_report".to_string(),
+            unknown_report_path.to_string_lossy().to_string(),
+        );
+    }
+    if !missing_rows.is_empty() {
+        report.args.insert(
+            "missing_report".to_string(),
+            missing_report_path.to_string_lossy().to_string(),
+        );
+    }
+    report
+        .args
+        .insert("unknown_ids".to_string(), unknown_rows.len().to_string());
+    report
+        .args
+        .insert("missing_ids".to_string(), missing_rows.len().to_string());
+    report_finalize(&mut report);
+    let report_paths = write_run_reports(&parquet_dir, &report)?;
+    eprintln!(
+        "[extract] summary scanned={} ok={} failed={} skipped={} reports={}",
+        report.totals_items_scanned,
+        report.totals_succeeded,
+        report.totals_failed,
+        report.totals_skipped,
+        report_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if report.totals_failed > 0 {
+        bail!("[extract] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn read_extract_ids(path: &Path) -> Result<Vec<ExtractInput>> {
+    let mut rdr = csv::Reader::from_path(path)
+        .with_context(|| format!("cannot read ids CSV {}", path.display()))?;
+    let headers = rdr.headers()?.clone();
+    let id_idx = headers
+        .iter()
+        .position(|h| matches!(h, "id" | "openalex_id" | "work_id"))
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        let raw = rec.get(id_idx).unwrap_or_default().trim().to_string();
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = normalize_openalex_id(&raw);
+        let dataset = extract_dataset_from_id(&normalized);
+        out.push(ExtractInput {
+            raw,
+            normalized,
+            dataset,
+        });
+    }
+    Ok(out)
+}
+
+fn normalize_openalex_id(id: &str) -> String {
+    let t = id.trim().trim_matches('"').trim_matches('\'').to_string();
+    if let Some(rest) = t.strip_prefix("https://openalex.org/") {
+        return rest.trim_matches('/').to_string();
+    }
+    if let Some(rest) = t.strip_prefix("http://openalex.org/") {
+        return rest.trim_matches('/').to_string();
+    }
+    t.trim_matches('/').to_string()
+}
+
+fn extract_dataset_from_id(id: &str) -> Option<String> {
+    let t = id.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.contains('/') {
+        let ns = t.split('/').next()?.to_ascii_lowercase();
+        let ds = match ns.as_str() {
+            "institution-types" => "institution-types",
+            "work-types" => "work-types",
+            "source-types" => "source-types",
+            "licenses" => "licenses",
+            "countries" => "countries",
+            "continents" => "continents",
+            "languages" => "languages",
+            "domains" => "domains",
+            "fields" => "fields",
+            "subfields" => "subfields",
+            "sdgs" => "sdgs",
+            _ => return None,
+        };
+        return Some(ds.to_string());
+    }
+    let first = t.chars().next()?.to_ascii_uppercase();
+    let ds = match first {
+        'W' => "works",
+        'A' => "authors",
+        'S' => "sources",
+        'I' => "institutions",
+        'T' => "topics",
+        'K' => "keywords",
+        'P' => "publishers",
+        'F' => "funders",
+        'G' => "awards",
+        'C' => "concepts",
+        _ => return None,
+    };
+    Some(ds.to_string())
+}
+
+fn extract_output_path(base: &Path, dataset: &str) -> PathBuf {
+    let parent = base.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("extract");
+    parent.join(format!("{stem}_{dataset}.parquet"))
+}
+
 fn run_verify(args: VerifyArgs) -> Result<()> {
     ensure_duckdb(&args.shared)?;
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
@@ -7137,6 +7756,18 @@ fn explain_index(
     println!("memory_mb: {:?}", tuning.memory_mb);
 }
 
+fn explain_extract(args: &ExtractArgs, duckdb_bin: &Path, tuning: &Tuning) {
+    println!("--explain: extract");
+    println!("duckdb_bin: {}", duckdb_bin.display());
+    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
+    println!("parquet_dir: {}", args.shared.parquet_dir.display());
+    println!("dataset filter: {}", args.shared.dataset);
+    println!("ids csv: {}", args.ids.display());
+    println!("output base: {}", args.output.display());
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+}
+
 fn ensure_duckdb(shared: &SharedArgs) -> Result<()> {
     let bin = duckdb_bin(shared);
     ensure_duckdb_bin(&bin)
@@ -8558,8 +9189,9 @@ fn command_flow_rank(cmd: &str) -> usize {
         "verify" | "verify_convert" | "verify-convert" => 5,
         "verify_schema" | "verify-schema" => 6,
         "index" => 7,
-        "verify-index" | "verify_index" => 8,
-        "repair_convert" | "repair-convert" | "repair" => 9,
+        "extract" => 8,
+        "verify-index" | "verify_index" => 9,
+        "repair_convert" | "repair-convert" | "repair" => 10,
         _ => 100,
     }
 }
@@ -9732,5 +10364,35 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].dataset, "authors");
+    }
+
+    #[test]
+    fn test_extract_dataset_routing() {
+        assert_eq!(
+            extract_dataset_from_id("A5073096074").as_deref(),
+            Some("authors")
+        );
+        assert_eq!(extract_dataset_from_id("W123").as_deref(), Some("works"));
+        assert_eq!(
+            extract_dataset_from_id("institution-types/other").as_deref(),
+            Some("institution-types")
+        );
+        assert_eq!(
+            extract_dataset_from_id("continents/europe").as_deref(),
+            Some("continents")
+        );
+        assert_eq!(extract_dataset_from_id("X999"), None);
+    }
+
+    #[test]
+    fn test_normalize_openalex_id() {
+        assert_eq!(
+            normalize_openalex_id("https://openalex.org/A5073096074"),
+            "A5073096074"
+        );
+        assert_eq!(
+            normalize_openalex_id("http://openalex.org/countries/us"),
+            "countries/us"
+        );
     }
 }

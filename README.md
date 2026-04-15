@@ -30,6 +30,7 @@ Argument precedence (highest wins):
 - `schema`
 - `verify_schema`
 - `index`
+- `extract`
 - `verify_index`
 - `repair_convert`
 - `report`
@@ -56,6 +57,12 @@ openalex-snapshot verify_convert \
   --dataset works \
   --scope dataset \
   --metadata-level both
+
+# extract by OpenAlex IDs (writes one parquet per resolved dataset)
+openalex-snapshot extract \
+  --root-dir /Volumes/openalex \
+  --ids /Volumes/openalex/ids.csv \
+  --output /Volumes/openalex/extract.parquet
 
 # repair from verify report
 openalex-snapshot repair_convert \

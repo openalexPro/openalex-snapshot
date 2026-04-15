@@ -1,0 +1,24 @@
+.TH openalex-snapshot-extract 1
+.SH NAME
+openalex-snapshot-extract \- extract records by OpenAlex IDs using parquet indexes
+.SH SYNOPSIS
+.B openalex-snapshot extract
+\-\-ids IDS.csv \-\-output OUT.parquet
+[\-\-root-dir PATH] [\-\-dataset NAME|all] [\-\-profile safe|balanced|fast]
+.SH DESCRIPTION
+Reads IDs from CSV, routes each ID to a dataset, resolves matching rows via
+`<dataset>_id_idx.parquet`, and writes output parquet files.
+
+Output naming:
+`<output_base>_<dataset>.parquet`
+
+Routing:
+- Entity prefixes: W, A, S, I, T, K, P, F, G, C
+- Taxonomy namespaces: institution-types, work-types, source-types, licenses,
+  countries, continents, languages, domains, fields, subfields, sdgs
+
+Unknown IDs are skipped and reported.
+.SH EXAMPLES
+openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
+
+openalex-snapshot extract --root-dir /data --dataset works --ids /data/work_ids.csv --output /data/work_extract.parquet

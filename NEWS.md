@@ -7,6 +7,7 @@ All notable changes to `openalex-snapshot` are documented in this file.
 ### Added
 - `skills` subcommand to bootstrap a project-local `skills/` folder for AI agents.
 - `check` subcommand for dependency/path/disk/memory preflight checks.
+- `extract` subcommand to extract records by OpenAlex IDs using per-dataset parquet indexes.
 - Top-level CLI version output via `openalex-snapshot --version`.
 - CLI version embedded in run report payloads for traceability.
 

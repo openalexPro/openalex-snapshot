@@ -33,6 +33,9 @@ Assert schema parity across sources.
 .B index
 Build lookup index parquet.
 .TP
+.B extract
+Extract records by IDs using indexes.
+.TP
 .B verify_index
 Verify index integrity.
 .TP
@@ -60,6 +63,8 @@ openalex-snapshot convert --root-dir /data --dataset works
 
 openalex-snapshot verify_convert --root-dir /data --dataset works --scope dataset --metadata-level both
 
+openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
+
 openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
 .SH SEE ALSO
-openalex-snapshot-convert(1), openalex-snapshot-verify(1), openalex-snapshot-schema(1), openalex-snapshot-index(1), openalex-snapshot-repair(1), openalex-snapshot-download(1), openalex-snapshot-verify_download(1), openalex-snapshot-skills(1), openalex-snapshot-check(1)
+openalex-snapshot-convert(1), openalex-snapshot-verify(1), openalex-snapshot-schema(1), openalex-snapshot-index(1), openalex-snapshot-extract(1), openalex-snapshot-repair(1), openalex-snapshot-download(1), openalex-snapshot-verify_download(1), openalex-snapshot-skills(1), openalex-snapshot-check(1)

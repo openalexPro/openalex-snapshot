@@ -12,6 +12,7 @@ nav:
       - verify_convert: commands/verify.md
       - repair_convert: commands/repair.md
       - index: commands/index.md
+      - extract: commands/extract.md
       - schema: commands/schema.md
       - skills: commands/skills.md
   - Operations:
