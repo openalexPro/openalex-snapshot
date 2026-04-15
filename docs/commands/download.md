@@ -1,6 +1,8 @@
 # Command: download
 
-Sync OpenAlex snapshot from S3 via AWS CLI and run strict validation by default.
+Sync OpenAlex snapshot from S3 via AWS CLI.
+
+Validation is a separate step via `verify_download`.
 
 ## Usage
 

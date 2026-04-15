@@ -11,6 +11,13 @@ Version:
 
 - `openalex-snapshot --version`
 
+Argument precedence (highest wins):
+
+1. CLI arguments
+2. Config subcommand section values
+3. Config `defaults` section values
+4. Built-in defaults
+
 ## Command Set
 
 - `config`

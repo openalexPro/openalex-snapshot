@@ -2,6 +2,8 @@
 
 This folder contains internet-facing documentation for `openalex-snapshot`.
 
+Argument precedence (highest wins): CLI arguments > config subcommand section > config `defaults` section > built-in defaults.
+
 Recommended page order:
 
 1. `quickstart.md`

@@ -6,3 +6,6 @@ openalex-snapshot-index \- build lookup index parquet
 [OPTIONS]
 .SH EXAMPLE
 openalex-snapshot index --root-dir /data --dataset works --profile balanced
+.SH DEFAULTS
+dataset defaults to `all`.
+With `--dataset all`, existing per-dataset index files are skipped and `--index-file` is ignored.

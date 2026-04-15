@@ -12,7 +12,7 @@ This project is a strong candidate for a dedicated repository.
 ## Recommended target layout
 
 ```text
-openalex-convert/
+openalex-snapshot/
   Cargo.toml
   src/
   tests/
@@ -42,7 +42,7 @@ Document explicit contracts:
 
 ## Transition checklist
 
-1. Copy `openalex-convert/` into new repo.
+1. Copy `openalex-snapshot/` into new repo.
 2. Preserve git history if desired (`git subtree split` or `filter-repo`).
 3. Add CI for `cargo test`, integration smoke tests, and docs checks.
 4. Update R package docs to point to external CLI repo/releases.

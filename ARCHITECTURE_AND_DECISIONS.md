@@ -48,12 +48,12 @@ This document captures project invariants and decision records so human and AI c
 ## Config Decisions
 
 - Config precedence:
-  1. built-in defaults
-  2. `defaults` section
-  3. command-specific section
-  4. explicit CLI flags
+  1. explicit CLI flags
+  2. command-specific section
+  3. `defaults` section
+  4. built-in defaults
 - `all` requires explicit `--config`.
-- Config templates support `simple`, `complete`, `expert` generation modes.
+- Config templates support `complete` (default), `safe`, and `fast` generation modes.
 
 ## Agent Contribution Rules
 

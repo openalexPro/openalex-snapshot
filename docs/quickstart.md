@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-cd openalex-convert
+cd openalex-snapshot
 cargo build --release
 ./target/release/openalex-snapshot --help
 ```

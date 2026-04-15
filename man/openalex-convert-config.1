@@ -3,4 +3,6 @@
 openalex-snapshot-config \- create or verify YAML configuration
 .SH SYNOPSIS
 .B openalex-snapshot config
-[\-\-create simple|complete|expert|\-\-verify] [\-\-config PATH]
+[\-\-create complete|safe|fast|\-\-verify] [\-\-config PATH]
+.SH PRECEDENCE
+CLI arguments > config subcommand section > config defaults section > built-in defaults.

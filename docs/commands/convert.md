@@ -16,5 +16,5 @@ openalex-snapshot convert \
 
 - 1 input `.gz` maps to 1 output `.parquet`
 - resume-safe output skipping
-- optional post-conversion verification (enabled by default)
+- verification is separate via `verify_convert`
 - supports selected-file conversion via repeated `--input-file`

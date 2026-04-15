@@ -142,7 +142,6 @@ fn convert_and_verify_structure() {
             root.to_str().unwrap(),
             "--dataset",
             "authors",
-            "--skip-verify",
         ])
         .status()
         .unwrap();
@@ -175,7 +174,7 @@ fn schema_arrow_r_output() {
     let root = td.path();
 
     let snapshot = root.join("openalex-snapshot");
-    let parquet = root.join("parquet");
+    let _parquet = root.join("parquet");
 
     let ds = snapshot.join("data/works/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -196,7 +195,6 @@ fn schema_arrow_r_output() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
-            "--skip-verify",
         ])
         .status()
         .unwrap();
@@ -252,7 +250,6 @@ fn index_builds_expected_columns() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
-            "--skip-verify",
         ])
         .status()
         .unwrap();
@@ -317,7 +314,6 @@ fn index_skip_and_overwrite() {
             root.to_str().unwrap(),
             "--dataset",
             "authors",
-            "--skip-verify",
         ])
         .status()
         .unwrap()
@@ -368,6 +364,156 @@ fn index_skip_and_overwrite() {
 }
 
 #[test]
+fn index_all_builds_multiple_datasets() {
+    if !has_duckdb() {
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let snapshot = root.join("openalex-snapshot");
+    let parquet = root.join("parquet");
+
+    let works = snapshot.join("data/works/part_000");
+    let authors = snapshot.join("data/authors/part_000");
+    fs::create_dir_all(&works).unwrap();
+    fs::create_dir_all(&authors).unwrap();
+    write_gz_ndjson(
+        &works.join("part1.gz"),
+        &[r#"{"id":"https://openalex.org/W1000000001","title":"T1"}"#],
+    );
+    write_gz_ndjson(
+        &authors.join("part1.gz"),
+        &[r#"{"id":"https://openalex.org/A1000000001","display_name":"A"}"#],
+    );
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    assert!(Command::new(&exe)
+        .args([
+            "convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "all",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    assert!(Command::new(&exe)
+        .args(["index", "--root-dir", root.to_str().unwrap(), "--dataset", "all"])
+        .status()
+        .unwrap()
+        .success());
+
+    assert!(parquet.join("works_id_idx.parquet").exists());
+    assert!(parquet.join("authors_id_idx.parquet").exists());
+}
+
+#[test]
+fn index_cli_dataset_not_overridden_by_config() {
+    if !has_duckdb() {
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let snapshot = root.join("openalex-snapshot");
+    let parquet = root.join("parquet");
+
+    let works = snapshot.join("data/works/part_000");
+    let authors = snapshot.join("data/authors/part_000");
+    fs::create_dir_all(&works).unwrap();
+    fs::create_dir_all(&authors).unwrap();
+    write_gz_ndjson(
+        &works.join("part1.gz"),
+        &[r#"{"id":"https://openalex.org/W1000000001","title":"T1"}"#],
+    );
+    write_gz_ndjson(
+        &authors.join("part1.gz"),
+        &[r#"{"id":"https://openalex.org/A1000000001","display_name":"A"}"#],
+    );
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    assert!(Command::new(&exe)
+        .args([
+            "convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "all",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let cfg = root.join("openalex-snapshot.yaml");
+    fs::write(
+        &cfg,
+        format!(
+            "defaults:\n  root_dir: {}\n  dataset: all\nindex:\n  dataset: all\n",
+            root.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    assert!(Command::new(&exe)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "index",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "works",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    assert!(parquet.join("works_id_idx.parquet").exists());
+    assert!(!parquet.join("authors_id_idx.parquet").exists());
+}
+
+#[test]
+fn precedence_config_over_default_when_cli_unset() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    let cfg = root.join("openalex-snapshot.yaml");
+    fs::write(&cfg, "index:\n  dataset: authors\n").unwrap();
+
+    let out = Command::new(&exe)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--print-effective-config",
+            "index",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("corpus_dir: ./parquet/authors"), "{}", s);
+}
+
+#[test]
+fn precedence_default_when_cli_and_config_unset() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+
+    let out = Command::new(&exe)
+        .current_dir(root)
+        .args(["--print-effective-config", "index"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("corpus_dir: ./parquet/all"), "{}", s);
+}
+
+#[test]
 fn canonical_unified_schema_csv_written() {
     if !has_duckdb() {
         return;
@@ -375,7 +521,7 @@ fn canonical_unified_schema_csv_written() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let snapshot = root.join("openalex-snapshot");
-    let parquet = root.join("parquet");
+    let _parquet = root.join("parquet");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
     write_gz_ndjson(
@@ -391,7 +537,6 @@ fn canonical_unified_schema_csv_written() {
             root.to_str().unwrap(),
             "--dataset",
             "authors",
-            "--skip-verify",
         ])
         .status()
         .unwrap()
@@ -412,7 +557,7 @@ fn csv_cache_precedence_over_json_cache() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let snapshot = root.join("openalex-snapshot");
-    let parquet = root.join("parquet");
+    let _parquet = root.join("parquet");
     let ds = snapshot.join("data/works/part_000");
     fs::create_dir_all(&ds).unwrap();
     write_gz_ndjson(
@@ -428,7 +573,6 @@ fn csv_cache_precedence_over_json_cache() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
-            "--skip-verify",
         ])
         .status()
         .unwrap()
@@ -488,7 +632,6 @@ fn convert_only_selected_input_file() {
             "authors",
             "--input-file",
             "part_000/part2.gz",
-            "--skip-verify",
         ])
         .status()
         .unwrap();
@@ -567,7 +710,6 @@ fn repair_reconverts_failed_verify_files() {
             root.to_str().unwrap(),
             "--dataset",
             "authors",
-            "--skip-verify",
         ])
         .status()
         .unwrap()
@@ -774,33 +916,22 @@ fn config_create_and_verify_roundtrip() {
 }
 
 #[test]
-fn config_create_requires_template_mode() {
+fn config_create_without_template_mode_defaults_to_complete() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    let td = tempfile::tempdir().unwrap();
+    let cfg = td.path().join("openalex-snapshot.yaml");
     let out = Command::new(&exe)
-        .args(["config", "--create"])
+        .args(["config", "--create", "--config", cfg.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("a value is required for '--create"));
+    assert!(out.status.success());
+    let txt = fs::read_to_string(cfg).unwrap();
+    assert!(txt.contains("# openalex-snapshot.yaml"));
 }
 
 #[test]
 fn config_create_mode_contracts() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
-
-    let simple = Command::new(&exe)
-        .args(["config", "--create", "simple", "--stdout"])
-        .output()
-        .unwrap();
-    assert!(simple.status.success());
-    let s = String::from_utf8_lossy(&simple.stdout);
-    assert!(s.contains("defaults:"));
-    assert!(s.contains("verify_convert:"));
-    assert!(s.contains("verify_index:"));
-    assert!(!s.contains("\nschema:\n"));
-    assert!(!s.contains("\nrepair_convert:\n"));
-    assert!(!s.contains("\ncorpus_dir:"));
 
     let complete = Command::new(&exe)
         .args(["config", "--create", "complete", "--stdout"])
@@ -813,17 +944,25 @@ fn config_create_mode_contracts() {
     assert!(c.contains("progress:"));
     assert!(!c.contains("\ncorpus_dir:"));
 
-    let expert = Command::new(&exe)
-        .args(["config", "--create", "expert", "--stdout"])
+    let safe = Command::new(&exe)
+        .args(["config", "--create", "safe", "--stdout"])
         .output()
         .unwrap();
-    assert!(expert.status.success());
-    let e = String::from_utf8_lossy(&expert.stdout);
-    assert!(e.contains("# Every known configuration key is listed explicitly."));
-    assert!(e.contains("max_memory_mb:"));
-    assert!(e.contains("sample_size:"));
-    assert!(e.contains("endpoint_url:"));
-    assert!(!e.contains("\ncorpus_dir:"));
+    assert!(safe.status.success());
+    let sf = String::from_utf8_lossy(&safe.stdout);
+    assert!(sf.contains("# openalex-snapshot.yaml (safe)"));
+    assert!(sf.contains("profile: safe"));
+    assert!(sf.contains("workers: 1"));
+
+    let fast = Command::new(&exe)
+        .args(["config", "--create", "fast", "--stdout"])
+        .output()
+        .unwrap();
+    assert!(fast.status.success());
+    let f = String::from_utf8_lossy(&fast.stdout);
+    assert!(f.contains("# openalex-snapshot.yaml (fast)"));
+    assert!(f.contains("profile: fast"));
+    assert!(f.contains("workers: 8"));
 }
 
 #[test]

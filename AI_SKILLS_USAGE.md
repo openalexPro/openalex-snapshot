@@ -6,6 +6,12 @@ This project supports a repo-local `skills/` folder to help AI coding agents exe
 
 Provide operational skills that are specific to `openalex-snapshot` behavior, not generic AI prompting advice.
 
+Configuration precedence to follow in all skills:
+1. explicit CLI flags
+2. config subcommand section values
+3. config `defaults` section values
+4. built-in defaults
+
 ## Bootstrapping
 
 Create starter skills:

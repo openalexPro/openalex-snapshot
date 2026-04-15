@@ -12,7 +12,12 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ### Changed
 - Config templates now include a `check:` section.
-- README and command docs updated for `skills` and `check` usage.
+- `index`/`verify_index` default dataset changed from `works` to `all`.
+- `index --dataset all` now skips existing per-dataset index files and continues building missing ones (and ignores `--index-file` in `all` mode).
+- Documentation consistency sweep across README/docs/man/skills references:
+  - precedence clarified as `CLI > command section > defaults section > built-in defaults`
+  - naming aligned to `openalex-snapshot` repo/binary usage
+  - config template mode docs aligned to `complete|safe|fast`
 
 ## [0.1.0] - 2026-04-14
 

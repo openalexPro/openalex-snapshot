@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -20,6 +21,12 @@ use walkdir::WalkDir;
 
 const CLI_LONG_ABOUT: &str = "\
 Standalone OpenAlex snapshot tooling.
+
+Argument precedence (highest wins):
+  1) explicit CLI arguments
+  2) config subcommand section values
+  3) config defaults section values
+  4) built-in defaults
 
 This binary provides:
 - config: create or verify YAML configuration
@@ -43,7 +50,7 @@ convert (detailed):
   - reads <snapshot_dir>/data/<dataset>/**/*.gz
   - writes <parquet_dir>/<dataset>/... with preserved relative structure
   - infers unified dataset schema and uses cache
-  - optional post-conversion verify
+  - verification is handled separately by verify_convert
 
 verify_convert (detailed):
   - checks .gz -> .parquet mapping and folder structure parity
@@ -95,6 +102,8 @@ Examples:
   openalex-snapshot verify_convert --root-dir /data --dataset all --scope snapshot
   openalex-snapshot progress --root-dir /data
   openalex-snapshot config --create complete
+  openalex-snapshot config --create safe
+  openalex-snapshot config --create fast
   openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
 ";
 
@@ -122,20 +131,18 @@ Output:
 ";
 
 const DOWNLOAD_LONG_ABOUT: &str = "\
-Download OpenAlex snapshot via AWS CLI sync and run strict validation.
+Download OpenAlex snapshot via AWS CLI sync.
 
 Defaults (zero-config):
   aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
   dataset scope: all
-  auto-validate: enabled
   disk preflight: remote manifest size + 10% free space required
 
 Optional overrides:
-  --root-dir, --s3-uri, --endpoint-url, --region, --profile, --aws-bin
+  --root-dir, --s3-uri, --endpoint-url, --region, --aws-bin
   --signed/--no-sign-request
   --delete/--no-delete
   --dataset <name|all>
-  --skip-validate
 ";
 
 const VALIDATE_DOWNLOAD_LONG_ABOUT: &str = "\
@@ -169,11 +176,17 @@ const CONFIG_LONG_ABOUT: &str = "\
 Manage openalex-snapshot YAML configuration.
 
 Modes:
-  --create <simple|complete|expert>  Generate annotated config template
+  --create <complete|safe|fast>  Generate annotated config template
   --verify  Validate an existing config file strictly
 
 Defaults:
   config path: ./openalex-snapshot.yaml
+
+Argument precedence (highest wins):
+  1) explicit CLI arguments
+  2) config subcommand section values
+  3) config defaults section values
+  4) built-in defaults
 ";
 
 const CONVERT_MIN_FREE_BYTES: u64 = 900u64 * 1024u64 * 1024u64 * 1024u64;
@@ -260,9 +273,11 @@ Index columns:
   id, id_block, parquet_file, file_row_number
 
 Defaults:
+  dataset: all
   corpus path: <root_dir>/parquet/<dataset>
   index path: <root_dir>/parquet/<dataset>_id_idx.parquet
   existing index: skip (use --overwrite to rebuild)
+  --index-file is ignored with --dataset all
 ";
 
 const CONVERT_LONG_ABOUT: &str = "\
@@ -273,7 +288,6 @@ Behavior:
 2) Infers a unified schema per dataset (with cache + optional refresh)
 3) Converts each source file to one parquet file
 4) Preserves dataset-relative folder/file structure in output
-5) Optionally runs verify step unless --skip-verify is set
 
 Output:
   parquet root: <root_dir>/parquet
@@ -283,8 +297,6 @@ Output:
 
 Defaults:
   profile: balanced
-  verify scope: dataset
-  verification enabled unless --skip-verify is set
   memory: auto-detected from system RAM unless --max-memory-mb is provided
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
@@ -456,8 +468,8 @@ struct AllArgs {
 #[command(about = "Create or verify config YAML")]
 #[command(long_about = CONFIG_LONG_ABOUT)]
 struct ConfigArgs {
-    #[arg(long, value_enum)]
-    #[arg(help = "Create config template: simple, complete, or expert")]
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "complete")]
+    #[arg(help = "Create config template: complete, safe, or fast (default when omitted: complete)")]
     create: Option<ConfigTemplateMode>,
 
     #[arg(long, default_value_t = false)]
@@ -483,9 +495,9 @@ struct ConfigArgs {
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum ConfigTemplateMode {
-    Simple,
     Complete,
-    Expert,
+    Safe,
+    Fast,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -614,25 +626,9 @@ struct ConvertArgs {
     #[arg(help = "Show progress bars with rough ETA")]
     progress: bool,
 
-    #[arg(long, value_enum, default_value = "dataset")]
-    #[arg(help = "Post-conversion verification scope: file|dataset|snapshot")]
-    verify_scope: VerifyScope,
-
-    #[arg(long, value_enum, default_value = "both")]
-    #[arg(help = "Post-conversion metadata level: row_count|id_hash|both")]
-    verify_metadata_level: VerifyMetadataLevel,
-
-    #[arg(long, default_value_t = 50)]
-    #[arg(help = "Sample size for file verify scope")]
-    verify_file_sample_n: usize,
-
     #[arg(long, default_value_t = 42)]
-    #[arg(help = "Random seed for random verify mode")]
+    #[arg(help = "Random seed for schema sampling")]
     seed: u64,
-
-    #[arg(long, default_value_t = false)]
-    #[arg(help = "Skip post-conversion verification")]
-    skip_verify: bool,
 
     #[arg(long, default_value_t = false)]
     #[arg(help = "Skip free disk space preflight checks")]
@@ -802,8 +798,8 @@ struct IndexArgs {
     )]
     root_dir: PathBuf,
 
-    #[arg(long, default_value = "works")]
-    #[arg(help = "Dataset name to index (e.g. works, authors, sources)")]
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Dataset name to index (e.g. works, authors, sources, or all)")]
     dataset: String,
 
     #[arg(long)]
@@ -931,24 +927,8 @@ struct DownloadArgs {
     no_delete: bool,
 
     #[arg(long, default_value_t = false)]
-    #[arg(help = "Skip validation after sync")]
-    skip_validate: bool,
-
-    #[arg(long, default_value_t = false)]
     #[arg(help = "Skip free disk space preflight checks")]
     skip_disk_check: bool,
-
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile for validation phase")]
-    profile: Profile,
-
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of worker threads for validation phase")]
-    workers: usize,
-
-    #[arg(long)]
-    #[arg(help = "Per-worker memory cap override in MB (validation phase)")]
-    max_memory_mb: Option<usize>,
 
     #[arg(long, default_value_t = true)]
     #[arg(help = "Show progress bars with rough ETA")]
@@ -1043,8 +1023,8 @@ struct VerifyIndexArgs {
     )]
     root_dir: PathBuf,
 
-    #[arg(long, default_value = "works")]
-    #[arg(help = "Dataset name to verify index for (e.g. works, authors, sources)")]
+    #[arg(long, default_value = "all")]
+    #[arg(help = "Dataset name to verify index for (e.g. works, authors, sources, or all)")]
     dataset: String,
 
     #[arg(long)]
@@ -1314,21 +1294,33 @@ struct ConfigDefaults {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConvertConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     row_group_rows: Option<usize>,
     batch_rows: Option<usize>,
     compression: Option<String>,
     sample_size: Option<usize>,
-    verify_scope: Option<VerifyScope>,
-    verify_metadata_level: Option<VerifyMetadataLevel>,
-    verify_file_sample_n: Option<usize>,
     seed: Option<u64>,
-    skip_verify: Option<bool>,
     refresh_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerifyConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     scope: Option<VerifyScope>,
     metadata_level: Option<VerifyMetadataLevel>,
     file_sample_n: Option<usize>,
@@ -1338,6 +1330,13 @@ struct VerifyConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    state_flush_every: Option<usize>,
     from: Option<SchemaFrom>,
     format: Option<SchemaFormat>,
     diff_with: Option<SchemaFrom>,
@@ -1351,6 +1350,12 @@ struct SchemaConfig {
 struct IndexConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     index_file: Option<PathBuf>,
     overwrite: Option<bool>,
 }
@@ -1358,6 +1363,14 @@ struct IndexConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepairConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     from_verify_report: Option<PathBuf>,
 }
 
@@ -1367,6 +1380,8 @@ struct DownloadConfig {
     root_dir: Option<PathBuf>,
     s3_uri: Option<String>,
     dataset: Option<String>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     aws_bin: Option<PathBuf>,
     endpoint_url: Option<String>,
     region: Option<String>,
@@ -1375,7 +1390,6 @@ struct DownloadConfig {
     signed: Option<bool>,
     delete_files: Option<bool>,
     no_delete: Option<bool>,
-    skip_validate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1384,6 +1398,10 @@ struct ValidateDownloadConfig {
     root_dir: Option<PathBuf>,
     s3_uri: Option<String>,
     dataset: Option<String>,
+    workers: Option<usize>,
+    profile: Option<Profile>,
+    progress: Option<bool>,
+    state_flush_every: Option<usize>,
     aws_bin: Option<PathBuf>,
     endpoint_url: Option<String>,
     region: Option<String>,
@@ -1398,6 +1416,11 @@ struct ValidateDownloadConfig {
 struct VerifyIndexConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
+    workers: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    profile: Option<Profile>,
+    max_memory_mb: Option<usize>,
+    progress: Option<bool>,
     index_file: Option<PathBuf>,
 }
 
@@ -1545,6 +1568,8 @@ struct RunReport {
     command: String,
     #[serde(default)]
     cli_version: String,
+    #[serde(default)]
+    report_nonce: u128,
     started_at_unix: i64,
     finished_at_unix: Option<i64>,
     duration_seconds: Option<f64>,
@@ -1560,7 +1585,10 @@ struct RunReport {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli =
+        Cli::from_arg_matches(&matches).map_err(|e| anyhow!("failed to parse CLI args: {e}"))?;
+    let sub_matches = matches.subcommand().map(|(_, m)| m);
     if let Commands::Config(args) = cli.command.clone() {
         return run_config(args);
     }
@@ -1570,7 +1598,7 @@ fn main() -> Result<()> {
             let all_cfg = load_optional_config(Some(&args.config))?
                 .ok_or_else(|| anyhow!("all requires --config <path>"))?;
             if let Some(c) = all_cfg.defaults.as_ref() {
-                if args.root_dir == PathBuf::from(".") {
+                if !cli_explicit(sub_matches, "root_dir") {
                     if let Some(v) = &c.root_dir {
                         args.root_dir = v.clone();
                     }
@@ -1581,7 +1609,7 @@ fn main() -> Result<()> {
         }
         Commands::Convert(mut args) => {
             fill_shared_dirs(&mut args.shared);
-            apply_convert_config(&mut args, cfg.as_ref());
+            apply_convert_config(&mut args, cfg.as_ref(), sub_matches);
             fill_shared_dirs(&mut args.shared);
             try_migrate_metadata_root(&args.shared.root_dir);
             if cli.print_effective_config {
@@ -1601,7 +1629,7 @@ fn main() -> Result<()> {
         }
         Commands::Verify(mut args) => {
             fill_shared_dirs(&mut args.shared);
-            apply_verify_config(&mut args, cfg.as_ref());
+            apply_verify_config(&mut args, cfg.as_ref(), sub_matches);
             fill_shared_dirs(&mut args.shared);
             try_migrate_metadata_root(&args.shared.root_dir);
             if cli.print_effective_config {
@@ -1621,7 +1649,7 @@ fn main() -> Result<()> {
         }
         Commands::Schema(mut args) => {
             fill_shared_dirs(&mut args.shared);
-            apply_schema_config(&mut args, cfg.as_ref());
+            apply_schema_config(&mut args, cfg.as_ref(), sub_matches);
             fill_shared_dirs(&mut args.shared);
             try_migrate_metadata_root(&args.shared.root_dir);
             if cli.print_effective_config {
@@ -1645,7 +1673,7 @@ fn main() -> Result<()> {
             run_verify_schema(args)
         }
         Commands::Index(mut args) => {
-            apply_index_config(&mut args, cfg.as_ref());
+            apply_index_config(&mut args, cfg.as_ref(), sub_matches);
             try_migrate_metadata_root(&args.root_dir);
             if cli.print_effective_config {
                 let corpus_dir = args.root_dir.join("parquet").join(&args.dataset);
@@ -1665,47 +1693,47 @@ fn main() -> Result<()> {
         }
         Commands::Repair(mut args) => {
             fill_shared_dirs(&mut args.shared);
-            apply_repair_config(&mut args, cfg.as_ref());
+            apply_repair_config(&mut args, cfg.as_ref(), sub_matches);
             fill_shared_dirs(&mut args.shared);
             try_migrate_metadata_root(&args.shared.root_dir);
             run_repair(args)
         }
         Commands::Download(mut args) => {
             fill_download_dirs(&mut args);
-            apply_download_config(&mut args, cfg.as_ref());
+            apply_download_config(&mut args, cfg.as_ref(), sub_matches);
             fill_download_dirs(&mut args);
             try_migrate_metadata_root(&args.root_dir);
             run_download(args)
         }
         Commands::ValidateDownload(mut args) => {
             fill_validate_download_dirs(&mut args);
-            apply_validate_download_config(&mut args, cfg.as_ref());
+            apply_validate_download_config(&mut args, cfg.as_ref(), sub_matches);
             fill_validate_download_dirs(&mut args);
             try_migrate_metadata_root(&args.root_dir);
             run_validate_download(args)
         }
         Commands::VerifyIndex(mut args) => {
-            apply_verify_index_config(&mut args, cfg.as_ref());
+            apply_verify_index_config(&mut args, cfg.as_ref(), sub_matches);
             try_migrate_metadata_root(&args.root_dir);
             run_verify_index(args)
         }
         Commands::Report(mut args) => {
             fill_report_dirs(&mut args);
-            apply_report_config(&mut args, cfg.as_ref());
+            apply_report_config(&mut args, cfg.as_ref(), sub_matches);
             fill_report_dirs(&mut args);
             try_migrate_metadata_root(&args.root_dir);
             run_report(args)
         }
         Commands::PruneReports(mut args) => {
             fill_prune_report_dirs(&mut args);
-            apply_prune_reports_config(&mut args, cfg.as_ref());
+            apply_prune_reports_config(&mut args, cfg.as_ref(), sub_matches);
             fill_prune_report_dirs(&mut args);
             try_migrate_metadata_root(&args.root_dir);
             run_prune_reports(args)
         }
         Commands::Progress(mut args) => {
             fill_progress_dirs(&mut args);
-            apply_progress_config(&mut args, cfg.as_ref());
+            apply_progress_config(&mut args, cfg.as_ref(), sub_matches);
             fill_progress_dirs(&mut args);
             try_migrate_metadata_root(&args.root_dir);
             run_progress(args)
@@ -1713,7 +1741,7 @@ fn main() -> Result<()> {
         Commands::Skills(args) => run_skills(args),
         Commands::Check(mut args) => {
             fill_shared_dirs(&mut args.shared);
-            apply_check_config(&mut args, cfg.as_ref());
+            apply_check_config(&mut args, cfg.as_ref(), sub_matches);
             fill_shared_dirs(&mut args.shared);
             try_migrate_metadata_root(&args.shared.root_dir);
             run_check(args)
@@ -1805,99 +1833,125 @@ fn try_migrate_metadata_root(root_dir: &Path) {
     }
 }
 
-fn apply_shared_defaults(shared: &mut SharedArgs, d: &ConfigDefaults) {
-    if shared.root_dir == PathBuf::from(".") {
+fn cli_explicit(matches: Option<&ArgMatches>, id: &str) -> bool {
+    matches.and_then(|m| m.value_source(id)) == Some(ValueSource::CommandLine)
+}
+
+fn apply_shared_defaults(shared: &mut SharedArgs, d: &ConfigDefaults, matches: Option<&ArgMatches>) {
+    if !cli_explicit(matches, "root_dir") {
         if let Some(v) = &d.root_dir {
             shared.root_dir = v.clone();
         }
     }
-    if shared.dataset == "all" {
+    if !cli_explicit(matches, "dataset") {
         if let Some(v) = &d.dataset {
             shared.dataset = v.clone();
         }
     }
-    if shared.workers == 4 {
+    if !cli_explicit(matches, "workers") {
         if let Some(v) = d.workers {
             shared.workers = v;
         }
     }
-    if shared.duckdb_bin.is_none() {
+    if !cli_explicit(matches, "duckdb_bin") {
         if let Some(v) = &d.duckdb_bin {
             shared.duckdb_bin = Some(v.clone());
         }
     }
 }
 
-fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>) {
+fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        apply_shared_defaults(&mut args.shared, d);
-        if args.profile == Profile::Balanced {
+        apply_shared_defaults(&mut args.shared, d, matches);
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.convert {
-        if args.row_group_rows == 100_000 {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "row_group_rows") {
             if let Some(v) = c.row_group_rows {
                 args.row_group_rows = v;
             }
         }
-        if args.batch_rows == 5_000 {
+        if !cli_explicit(matches, "batch_rows") {
             if let Some(v) = c.batch_rows {
                 args.batch_rows = v;
             }
         }
-        if args.compression == "snappy" {
+        if !cli_explicit(matches, "compression") {
             if let Some(v) = &c.compression {
                 args.compression = v.clone();
             }
         }
-        if args.sample_size == 100 {
+        if !cli_explicit(matches, "sample_size") {
             if let Some(v) = c.sample_size {
                 args.sample_size = v;
             }
         }
-        if args.verify_scope == VerifyScope::Dataset {
-            if let Some(v) = &c.verify_scope {
-                args.verify_scope = v.clone();
-            }
-        }
-        if args.verify_metadata_level == VerifyMetadataLevel::Both {
-            if let Some(v) = &c.verify_metadata_level {
-                args.verify_metadata_level = v.clone();
-            }
-        }
-        if args.verify_file_sample_n == 50 {
-            if let Some(v) = c.verify_file_sample_n {
-                args.verify_file_sample_n = v;
-            }
-        }
-        if args.seed == 42 {
+        if !cli_explicit(matches, "seed") {
             if let Some(v) = c.seed {
                 args.seed = v;
             }
         }
-        if !args.skip_verify {
-            if let Some(v) = c.skip_verify {
-                args.skip_verify = v;
-            }
-        }
-        if !args.refresh_cache {
+        if !cli_explicit(matches, "refresh_cache") {
             if let Some(v) = c.refresh_cache {
                 args.refresh_cache = v;
             }
@@ -1905,46 +1959,88 @@ fn apply_convert_config(args: &mut ConvertArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>) {
+fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        apply_shared_defaults(&mut args.shared, d);
-        if args.profile == Profile::Balanced {
+        apply_shared_defaults(&mut args.shared, d, matches);
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.verify_convert {
-        if args.scope == VerifyScope::Dataset {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "scope") {
             if let Some(v) = &c.scope {
                 args.scope = v.clone();
             }
         }
-        if args.metadata_level == VerifyMetadataLevel::Both {
+        if !cli_explicit(matches, "metadata_level") {
             if let Some(v) = &c.metadata_level {
                 args.metadata_level = v.clone();
             }
         }
-        if args.file_sample_n == 50 {
+        if !cli_explicit(matches, "file_sample_n") {
             if let Some(v) = c.file_sample_n {
                 args.file_sample_n = v;
             }
         }
-        if args.seed == 42 {
+        if !cli_explicit(matches, "seed") {
             if let Some(v) = c.seed {
                 args.seed = v;
             }
@@ -1952,49 +2048,84 @@ fn apply_verify_config(args: &mut VerifyArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_schema_config(args: &mut SchemaArgs, cfg: Option<&AppConfig>) {
+fn apply_schema_config(args: &mut SchemaArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        apply_shared_defaults(&mut args.shared, d);
-        if args.profile == Profile::Balanced {
+        apply_shared_defaults(&mut args.shared, d, matches);
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.schema {
-        if args.from == SchemaFrom::Auto {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "from") {
             if let Some(v) = &c.from {
                 args.from = v.clone();
             }
         }
-        if args.format == SchemaFormat::Table {
+        if !cli_explicit(matches, "format") {
             if let Some(v) = &c.format {
                 args.format = v.clone();
             }
         }
-        if args.diff_with.is_none() {
+        if !cli_explicit(matches, "diff_with") {
             args.diff_with = c.diff_with.clone();
         }
-        if args.output.is_none() {
+        if !cli_explicit(matches, "output") {
             args.output = c.output.clone();
         }
-        if args.sample_size == 100 {
+        if !cli_explicit(matches, "sample_size") {
             if let Some(v) = c.sample_size {
                 args.sample_size = v;
             }
         }
-        if !args.refresh_cache {
+        if !cli_explicit(matches, "refresh_cache") {
             if let Some(v) = c.refresh_cache {
                 args.refresh_cache = v;
             }
@@ -2002,63 +2133,95 @@ fn apply_schema_config(args: &mut SchemaArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>) {
+fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &d.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "works" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &d.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.workers == 4 {
+        if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.workers = v;
             }
         }
-        if args.duckdb_bin.is_none() {
+        if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &d.duckdb_bin {
                 args.duckdb_bin = Some(v.clone());
             }
         }
-        if args.profile == Profile::Balanced {
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.index {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "works" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.index_file.is_none() {
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "index_file") {
             args.index_file = c.index_file.clone();
         }
-        if !args.overwrite {
+        if !cli_explicit(matches, "overwrite") {
             if let Some(v) = c.overwrite {
                 args.overwrite = v;
             }
@@ -2066,31 +2229,73 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>) {
+fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        apply_shared_defaults(&mut args.shared, d);
-        if args.profile == Profile::Balanced {
+        apply_shared_defaults(&mut args.shared, d, matches);
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.repair_convert {
-        if args.from_verify_report == PathBuf::new() {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.shared.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.shared.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.shared.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.shared.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "from_verify_report") {
             if let Some(v) = &c.from_verify_report {
                 args.from_verify_report = v.clone();
             }
@@ -2098,176 +2303,196 @@ fn apply_repair_config(args: &mut RepairArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_download_config(args: &mut DownloadArgs, cfg: Option<&AppConfig>) {
+fn apply_download_config(args: &mut DownloadArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &d.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &d.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.profile == Profile::Balanced {
-            if let Some(v) = &d.profile {
-                args.profile = v.clone();
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
             }
         }
-        if args.workers == 4 {
-            if let Some(v) = d.workers {
-                args.workers = v;
-            }
-        }
-        if args.max_memory_mb.is_none() {
-            args.max_memory_mb = d.max_memory_mb;
-        }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
-        }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.download {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.s3_uri == "s3://openalex" {
+        if !cli_explicit(matches, "s3_uri") {
             if let Some(v) = &c.s3_uri {
                 args.s3_uri = v.clone();
             }
         }
-        if args.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.aws_bin == PathBuf::from("aws") {
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "aws_bin") {
             if let Some(v) = &c.aws_bin {
                 args.aws_bin = v.clone();
             }
         }
-        if args.endpoint_url.is_none() {
+        if !cli_explicit(matches, "endpoint_url") {
             args.endpoint_url = c.endpoint_url.clone();
         }
-        if args.region.is_none() {
+        if !cli_explicit(matches, "region") {
             args.region = c.region.clone();
         }
-        if args.profile_name.is_none() {
+        if !cli_explicit(matches, "profile_name") {
             args.profile_name = c.profile_name.clone();
         }
-        if args.no_sign_request {
+        if !cli_explicit(matches, "no_sign_request") {
             if let Some(v) = c.no_sign_request {
                 args.no_sign_request = v;
             }
         }
-        if !args.signed {
+        if !cli_explicit(matches, "signed") {
             if let Some(v) = c.signed {
                 args.signed = v;
             }
         }
-        if args.delete_files {
+        if !cli_explicit(matches, "delete_files") {
             if let Some(v) = c.delete_files {
                 args.delete_files = v;
             }
         }
-        if !args.no_delete {
+        if !cli_explicit(matches, "no_delete") {
             if let Some(v) = c.no_delete {
                 args.no_delete = v;
-            }
-        }
-        if !args.skip_validate {
-            if let Some(v) = c.skip_validate {
-                args.skip_validate = v;
             }
         }
     }
 }
 
-fn apply_validate_download_config(args: &mut ValidateDownloadArgs, cfg: Option<&AppConfig>) {
+fn apply_validate_download_config(
+    args: &mut ValidateDownloadArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &d.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &d.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.profile == Profile::Balanced {
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.workers == 4 {
+        if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.workers = v;
             }
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
-        if args.state_flush_every == 25 {
+        if !cli_explicit(matches, "state_flush_every") {
             if let Some(v) = d.state_flush_every {
                 args.state_flush_every = v;
             }
         }
     }
     if let Some(c) = &cfg.verify_download {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.s3_uri == "s3://openalex" {
+        if !cli_explicit(matches, "s3_uri") {
             if let Some(v) = &c.s3_uri {
                 args.s3_uri = v.clone();
             }
         }
-        if args.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.aws_bin == PathBuf::from("aws") {
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "state_flush_every") {
+            if let Some(v) = c.state_flush_every {
+                args.state_flush_every = v;
+            }
+        }
+        if !cli_explicit(matches, "aws_bin") {
             if let Some(v) = &c.aws_bin {
                 args.aws_bin = v.clone();
             }
         }
-        if args.endpoint_url.is_none() {
+        if !cli_explicit(matches, "endpoint_url") {
             args.endpoint_url = c.endpoint_url.clone();
         }
-        if args.region.is_none() {
+        if !cli_explicit(matches, "region") {
             args.region = c.region.clone();
         }
-        if args.profile_name.is_none() {
+        if !cli_explicit(matches, "profile_name") {
             args.profile_name = c.profile_name.clone();
         }
-        if args.no_sign_request {
+        if !cli_explicit(matches, "no_sign_request") {
             if let Some(v) = c.no_sign_request {
                 args.no_sign_request = v;
             }
         }
-        if !args.signed {
+        if !cli_explicit(matches, "signed") {
             if let Some(v) = c.signed {
                 args.signed = v;
             }
         }
-        if args.check_extra {
+        if !cli_explicit(matches, "check_extra") {
             if let Some(v) = c.check_extra {
                 args.check_extra = v;
             }
@@ -2275,84 +2500,115 @@ fn apply_validate_download_config(args: &mut ValidateDownloadArgs, cfg: Option<&
     }
 }
 
-fn apply_verify_index_config(args: &mut VerifyIndexArgs, cfg: Option<&AppConfig>) {
+fn apply_verify_index_config(
+    args: &mut VerifyIndexArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(d) = &cfg.defaults {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &d.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "works" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &d.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.workers == 4 {
+        if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.workers = v;
             }
         }
-        if args.duckdb_bin.is_none() {
+        if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &d.duckdb_bin {
                 args.duckdb_bin = Some(v.clone());
             }
         }
-        if args.profile == Profile::Balanced {
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
-        if args.progress && d.progress == Some(false) {
-            args.progress = false;
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
         }
     }
     if let Some(c) = &cfg.verify_index {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.dataset == "works" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.index_file.is_none() {
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "profile") {
+            if let Some(v) = &c.profile {
+                args.profile = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "index_file") {
             args.index_file = c.index_file.clone();
         }
     }
 }
 
-fn apply_report_config(args: &mut ReportArgs, cfg: Option<&AppConfig>) {
+fn apply_report_config(args: &mut ReportArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(c) = &cfg.report {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.source == ReportSource::All {
+        if !cli_explicit(matches, "source") {
             if let Some(v) = &c.source {
                 args.source = v.clone();
             }
         }
-        if args.command.is_none() {
+        if !cli_explicit(matches, "command") {
             args.command = c.command.clone();
         }
-        if !args.latest {
+        if !cli_explicit(matches, "latest") {
             if let Some(v) = c.latest {
                 args.latest = v;
             }
         }
-        if !args.full {
+        if !cli_explicit(matches, "full") {
             if let Some(v) = c.full {
                 args.full = v;
             }
@@ -2360,30 +2616,34 @@ fn apply_report_config(args: &mut ReportArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_prune_reports_config(args: &mut PruneReportsArgs, cfg: Option<&AppConfig>) {
+fn apply_prune_reports_config(
+    args: &mut PruneReportsArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(c) = &cfg.prune_reports {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.source == ReportSource::All {
+        if !cli_explicit(matches, "source") {
             if let Some(v) = &c.source {
                 args.source = v.clone();
             }
         }
-        if args.command.is_none() {
+        if !cli_explicit(matches, "command") {
             args.command = c.command.clone();
         }
-        if args.keep_per_command == 1 {
+        if !cli_explicit(matches, "keep_per_command") {
             if let Some(v) = c.keep_per_command {
                 args.keep_per_command = v;
             }
         }
-        if !args.dry_run {
+        if !cli_explicit(matches, "dry_run") {
             if let Some(v) = c.dry_run {
                 args.dry_run = v;
             }
@@ -2391,35 +2651,35 @@ fn apply_prune_reports_config(args: &mut PruneReportsArgs, cfg: Option<&AppConfi
     }
 }
 
-fn apply_progress_config(args: &mut ProgressArgs, cfg: Option<&AppConfig>) {
+fn apply_progress_config(args: &mut ProgressArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     let Some(cfg) = cfg else {
         return;
     };
     if let Some(c) = &cfg.progress {
-        if args.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.root_dir = v.clone();
             }
         }
-        if args.command.is_none() {
+        if !cli_explicit(matches, "command") {
             args.command = c.command.clone();
         }
-        if args.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.dataset = v.clone();
             }
         }
-        if args.interval_sec == 2 {
+        if !cli_explicit(matches, "interval_sec") {
             if let Some(v) = c.interval_sec {
                 args.interval_sec = v;
             }
         }
-        if args.watch {
+        if !cli_explicit(matches, "watch") {
             if let Some(v) = c.watch {
                 args.watch = v;
             }
         }
-        if !args.json {
+        if !cli_explicit(matches, "json") {
             if let Some(v) = c.json {
                 args.json = v;
             }
@@ -2427,116 +2687,116 @@ fn apply_progress_config(args: &mut ProgressArgs, cfg: Option<&AppConfig>) {
     }
 }
 
-fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>) {
+fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
     if let Some(d) = cfg.and_then(|c| c.defaults.as_ref()) {
-        if args.shared.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &d.root_dir {
                 args.shared.root_dir = v.clone();
             }
         }
-        if args.shared.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &d.dataset {
                 args.shared.dataset = v.clone();
             }
         }
-        if args.shared.workers == 4 {
+        if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.shared.workers = v;
             }
         }
-        if args.shared.duckdb_bin.is_none() {
+        if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &d.duckdb_bin {
                 args.shared.duckdb_bin = Some(v.clone());
             }
         }
-        if args.profile == Profile::Balanced {
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &d.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             if let Some(v) = d.max_memory_mb {
                 args.max_memory_mb = Some(v);
             }
         }
     }
     if let Some(c) = cfg.and_then(|x| x.check.as_ref()) {
-        if args.shared.root_dir == PathBuf::from(".") {
+        if !cli_explicit(matches, "root_dir") {
             if let Some(v) = &c.root_dir {
                 args.shared.root_dir = v.clone();
             }
         }
-        if args.shared.dataset == "all" {
+        if !cli_explicit(matches, "dataset") {
             if let Some(v) = &c.dataset {
                 args.shared.dataset = v.clone();
             }
         }
-        if args.shared.workers == 4 {
+        if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.shared.workers = v;
             }
         }
-        if args.shared.duckdb_bin.is_none() {
+        if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.shared.duckdb_bin = Some(v.clone());
             }
         }
-        if args.aws_bin == PathBuf::from("aws") {
+        if !cli_explicit(matches, "aws_bin") {
             if let Some(v) = &c.aws_bin {
                 args.aws_bin = v.clone();
             }
         }
-        if args.s3_uri == "s3://openalex" {
+        if !cli_explicit(matches, "s3_uri") {
             if let Some(v) = &c.s3_uri {
                 args.s3_uri = v.clone();
             }
         }
-        if args.endpoint_url.is_none() {
+        if !cli_explicit(matches, "endpoint_url") {
             if let Some(v) = &c.endpoint_url {
                 args.endpoint_url = Some(v.clone());
             }
         }
-        if args.region.is_none() {
+        if !cli_explicit(matches, "region") {
             if let Some(v) = &c.region {
                 args.region = Some(v.clone());
             }
         }
-        if args.profile_name.is_none() {
+        if !cli_explicit(matches, "profile_name") {
             if let Some(v) = &c.profile_name {
                 args.profile_name = Some(v.clone());
             }
         }
-        if args.no_sign_request {
+        if !cli_explicit(matches, "no_sign_request") {
             if let Some(v) = c.no_sign_request {
                 args.no_sign_request = v;
             }
         }
-        if !args.signed {
+        if !cli_explicit(matches, "signed") {
             if let Some(v) = c.signed {
                 args.signed = v;
             }
         }
-        if args.profile == Profile::Balanced {
+        if !cli_explicit(matches, "profile") {
             if let Some(v) = &c.profile {
                 args.profile = v.clone();
             }
         }
-        if args.max_memory_mb.is_none() {
+        if !cli_explicit(matches, "max_memory_mb") {
             if let Some(v) = c.max_memory_mb {
                 args.max_memory_mb = Some(v);
             }
         }
-        if args.precise {
+        if !cli_explicit(matches, "precise") {
             if let Some(v) = c.precise {
                 args.precise = v;
             }
         }
-        if !args.strict {
+        if !cli_explicit(matches, "strict") {
             if let Some(v) = c.strict {
                 args.strict = v;
             }
         }
-        if !args.json {
+        if !cli_explicit(matches, "json") {
             if let Some(v) = c.json {
                 args.json = v;
             }
@@ -2546,401 +2806,477 @@ fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>) {
 
 fn config_template(mode: ConfigTemplateMode) -> String {
     match mode {
-        ConfigTemplateMode::Simple => config_template_simple(),
         ConfigTemplateMode::Complete => config_template_complete(),
-        ConfigTemplateMode::Expert => config_template_expert(),
+        ConfigTemplateMode::Safe => config_template_safe(),
+        ConfigTemplateMode::Fast => config_template_fast(),
     }
 }
 
-fn config_template_simple() -> String {
-    r#"# openalex-snapshot.yaml (simple)
-# Beginner template for the standard OpenAlex pipeline.
-# Precedence:
-#   1) built-in defaults
-#   2) defaults section below
-#   3) command-specific section below
-#   4) explicit CLI flags (highest precedence)
-#
-# Root layout (when root_dir is "."):
-#   ./openalex-snapshot
-#   ./parquet
-#   ./.openalex-snapshot_metadata
+fn config_template_safe() -> String {
+    r#"# openalex-snapshot.yaml (safe)
+# Minimal low-memory preset.
+# Only profile-relevant overrides are set here.
+# Everything else falls back to built-in defaults (or CLI).
 
 defaults:
+  # Keep root explicit so path model remains obvious.
   root_dir: .
-  dataset: all
-  workers: 4
-  profile: balanced
-  progress: true
-  state_flush_every: 25
 
-all:
-  retry: 1
-  enable_download: true
-  enable_verify_download: true
-  enable_convert: true
-  enable_verify_convert: true
-  enable_repair_convert: true
-  enable_index: true
-  enable_verify_index: true
+  # Safe profile: conservative memory and throughput.
+  profile: safe
+  workers: 1
 
-download:
+  # Optional explicit cap for constrained systems.
+  # max_memory_mb: 4096
+"#
+    .to_string()
+}
+
+fn config_template_fast() -> String {
+    r#"# openalex-snapshot.yaml (fast)
+# Minimal high-throughput preset.
+# Only profile-relevant overrides are set here.
+# Everything else falls back to built-in defaults (or CLI).
+
+defaults:
+  # Keep root explicit so path model remains obvious.
   root_dir: .
-  s3_uri: s3://openalex
-  dataset: all
-  no_sign_request: true
-  delete_files: true
-  skip_validate: false
 
-verify_download:
-  root_dir: .
-  dataset: all
-  no_sign_request: true
-  check_extra: true
+  # Fast profile: favors throughput, may increase resource usage.
+  profile: fast
+  workers: 8
 
-convert:
-  row_group_rows: 100000
-  batch_rows: 5000
-  compression: snappy
-  verify_scope: dataset
-  verify_metadata_level: both
-  verify_file_sample_n: 50
-  seed: 42
-  skip_verify: false
-
-verify_convert:
-  scope: dataset
-  metadata_level: both
-  file_sample_n: 50
-  seed: 42
-
-index:
-  root_dir: .
-  dataset: works
-  overwrite: false
-
-verify_index:
-  root_dir: .
-  dataset: works
-
-check:
-  root_dir: .
-  dataset: all
-  profile: balanced
-  precise: true
-  strict: false
-  json: false
+  # Optional explicit cap for high-memory hosts.
+  # max_memory_mb: 16384
 "#
     .to_string()
 }
 
 fn config_template_complete() -> String {
-    r#"# openalex-snapshot.yaml
-# Generated template for openalex-snapshot.
-# Precedence:
-#   1) built-in defaults
-#   2) defaults section below
-#   3) command-specific section below
-#   4) explicit CLI flags (highest precedence)
+    r#"# openalex-snapshot.yaml (complete)
+# Full operational template for openalex-snapshot.
+# This template is intentionally verbose and designed as living documentation.
+# Read top-to-bottom once before first pipeline run.
 #
-# Root layout (when root_dir is "."):
-#   ./openalex-snapshot
-#   ./parquet
-#   ./.openalex-snapshot_metadata
+# ---------------------------------------------------------------------------
+# 0) Quick start (recommended)
+# ---------------------------------------------------------------------------
+# 1) Edit root_dir to your working location.
+# 2) Keep profile/workers conservative until first successful full run.
+# 3) Verify config:
+#      openalex-snapshot config --verify --config ./openalex-snapshot.yaml
+# 4) Run pipeline:
+#      openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
+#
+# ---------------------------------------------------------------------------
+# 1) How values are resolved
+# ---------------------------------------------------------------------------
+# Highest precedence wins:
+#   1) explicit CLI flags
+#   2) config file values (defaults + command section)
+#   3) built-in defaults
+#
+# Example:
+# - config sets workers: 4
+# - CLI passes --workers 1
+# -> effective workers = 1 for that run only.
+#
+# ---------------------------------------------------------------------------
+# 2) Path model (root-centric)
+# ---------------------------------------------------------------------------
+# With root_dir="." the tool uses:
+#   ./openalex-snapshot               (download/source snapshot)
+#   ./parquet                         (converted parquet outputs)
+#   ./.openalex-snapshot_metadata     (reports, logs, caches, manifests)
+#
+# Metadata is centralized under .openalex-snapshot_metadata.
+# Avoid editing metadata files manually unless debugging.
+#
+# ---------------------------------------------------------------------------
+# 3) Pipeline order (all command)
+# ---------------------------------------------------------------------------
+#   1) download
+#   2) verify_download
+#   3) convert
+#   4) verify_convert
+#   5) repair_convert (only if verify_convert fails)
+#   6) index
+#   7) verify_index
+#
+# Stages can be disabled in `all:` for partial/local workflows.
+#
+# This is the default template mode for:
+#   openalex-snapshot config --create
 
 defaults:
+  # ---------------------------------------------------------------------------
+  # Global defaults
+  # Applied to most commands unless overridden by command section and/or CLI.
+  # ---------------------------------------------------------------------------
+
   # Global default root for root-based commands.
+  # allowed values: any valid path
   root_dir: .
 
   # Default dataset scope where supported.
   # Use "all" or a single dataset name (works, authors, ...).
+  # allowed values: all | <dataset-name>
   dataset: all
 
   # Shared runtime defaults.
+  # allowed values: integer >= 1
   workers: 4
+  # allowed values: any valid executable path
   # duckdb_bin: /usr/local/bin/duckdb
+  # allowed values: safe | balanced | fast
   profile: balanced
+  # allowed values: integer >= 1
   # max_memory_mb: 8192
+  # allowed values: true | false
   progress: true
 
   # Crash-resilience: flush state/report every N items.
+  # allowed values: integer >= 1
   state_flush_every: 25
 
 all:
+  # ---------------------------------------------------------------------------
+  # Full pipeline orchestrator (openalex-snapshot all --config ...)
+  # ---------------------------------------------------------------------------
+
   # Max number of repair_convert attempts in verify/repair loop.
+  # 0 means: run verify_convert once and fail immediately on errors.
+  # allowed values: integer >= 0
   retry: 1
 
   # Stage toggles (default pipeline shown below).
+  # Disable stages you do not want in `all` (e.g., skip download for local runs).
+  # allowed values: true | false
   enable_download: true
+  # allowed values: true | false
   enable_verify_download: true
+  # allowed values: true | false
   enable_convert: true
+  # allowed values: true | false
   enable_verify_convert: true
+  # allowed values: true | false
   enable_repair_convert: true
+  # allowed values: true | false
   enable_index: true
+  # allowed values: true | false
   enable_verify_index: true
 
 convert:
+  # ---------------------------------------------------------------------------
+  # Convert snapshot JSON.GZ files into parquet (core data build step)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
   # Parquet write behavior.
+  # row_group_rows:
+  #   Larger row groups can improve scan speed but increase write memory pressure.
+  # batch_rows:
+  #   Controls chunk size for conversion internals; smaller can reduce peak memory.
+  # allowed values: integer >= 1
   row_group_rows: 100000
+  # allowed values: integer >= 1
   batch_rows: 5000
+  # allowed values: snappy | zstd | gzip | uncompressed
   compression: snappy
 
   # Schema inference behavior.
+  # sample_size controls how many files are sampled during schema inference.
+  # refresh_cache forces schema cache rebuild.
+  # allowed values: integer >= 1
   sample_size: 100
+  # allowed values: true | false
   refresh_cache: false
 
-  # Post-convert verification behavior.
-  verify_scope: dataset
-  verify_metadata_level: both
-  verify_file_sample_n: 50
+  # allowed values: integer >= 0
   seed: 42
-  skip_verify: false
 
 verify_convert:
+  # ---------------------------------------------------------------------------
+  # Verify converted parquet against snapshot source (integrity gate)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
   # Verification scope:
   # - file: sample of file pairs
   # - dataset: all files in dataset
   # - snapshot: all selected datasets
+  # allowed values: file | dataset | snapshot
   scope: dataset
+  # allowed values: row-count | id-hash | both
   metadata_level: both
+  # allowed values: integer >= 1
   file_sample_n: 50
+  # allowed values: integer >= 0
   seed: 42
 
 schema:
+  # ---------------------------------------------------------------------------
+  # Schema inspection and cache management (source/cache/parquet)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # state_flush_every: 25
+
   # Schema source preference: auto|source|cache|parquet
+  # allowed values: auto | source | cache | parquet
   from: auto
 
   # Output format: table|json|yaml|arrow-r
+  # allowed values: table | json | yaml | arrow-r
   format: table
 
   # Optional comparison source.
+  # allowed values: source | cache | parquet
   # diff_with: parquet
 
   # Optional output file (stdout if omitted).
+  # allowed values: any valid path
   # output: ./schema.json
 
+  # allowed values: integer >= 1
   sample_size: 100
+  # allowed values: true | false
   refresh_cache: false
 
 index:
+  # ---------------------------------------------------------------------------
+  # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
   root_dir: .
-  dataset: works
+  # allowed values: all | <dataset-name>
+  dataset: all
 
   # Optional index output file.
-  # index_file: ./parquet/works_id_idx.parquet
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
 
+  # allowed values: true | false
   overwrite: false
 
 verify_index:
+  # ---------------------------------------------------------------------------
+  # Verify index integrity and corpus coverage
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+
+  # allowed values: any valid path
   root_dir: .
-  dataset: works
-  # index_file: ./parquet/works_id_idx.parquet
+  # allowed values: all | <dataset-name>
+  dataset: all
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
 
 repair_convert:
+  # ---------------------------------------------------------------------------
+  # Repair failed conversion outputs based on verify_convert report
+  # Typical use: rerun only broken files after a failed verify_convert.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
   # Repair is driven by an existing verify_convert report.
   # No corpus_dir here by design (root_dir + dataset model).
+  # allowed values: any valid report path
   # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
 
 download:
+  # ---------------------------------------------------------------------------
+  # Download snapshot from OpenAlex S3
+  # Uses AWS CLI wrapper behavior; defaults follow OpenAlex guidance.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # progress: true
+  # state_flush_every: 25
+
   # Defaults mirror OpenAlex recommendation.
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: any valid s3:// URI
   s3_uri: s3://openalex
+  # allowed values: all | <dataset-name>
   dataset: all
+  # allowed values: any valid executable path
   aws_bin: aws
+  # allowed values: any valid URL
   # endpoint_url: https://s3.amazonaws.com
+  # allowed values: any valid AWS region string
   # region: us-east-1
+  # allowed values: any configured AWS profile name
   # profile_name: default
+  # allowed values: true | false
   no_sign_request: true
+  # allowed values: true | false
   signed: false
+  # allowed values: true | false
   delete_files: true
+  # allowed values: true | false
   no_delete: false
-  skip_validate: false
 
 verify_download:
+  # ---------------------------------------------------------------------------
+  # Verify downloaded snapshot against remote manifest + gzip integrity
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # profile: balanced
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: any valid s3:// URI
   # s3_uri: s3://openalex
+  # allowed values: all | <dataset-name>
   dataset: all
+  # allowed values: any valid executable path
   aws_bin: aws
+  # allowed values: true | false
   no_sign_request: true
+  # allowed values: true | false
   signed: false
+  # allowed values: true | false
   check_extra: true
 
 report:
+  # ---------------------------------------------------------------------------
+  # Read and display stored reports
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: all | parquet-global | download
   source: all
+  # allowed values: any command name
   # command: verify_convert
+  # allowed values: true | false
   latest: false
+  # allowed values: true | false
   full: false
 
 prune_reports:
+  # ---------------------------------------------------------------------------
+  # Prune old reports while keeping the newest per command
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: all | parquet-global | download
   source: all
+  # allowed values: any command name
   # command: verify_convert
+  # allowed values: integer >= 1
   keep_per_command: 1
+  # allowed values: true | false
   dry_run: false
 
 progress:
+  # ---------------------------------------------------------------------------
+  # Monitor active/recent runs from reports and logs
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: any command name
   # command: convert
+  # allowed values: all | <dataset-name>
   dataset: all
+  # allowed values: integer >= 1
   interval_sec: 2
+  # allowed values: true | false
   watch: true
+  # allowed values: true | false
   json: false
 
 check:
+  # ---------------------------------------------------------------------------
+  # Preflight dependency/path/disk/memory checks before running pipeline
+  # Recommended before first full run on a new machine or mount.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # profile: balanced
+
+  # allowed values: any valid path
   root_dir: .
+  # allowed values: all | <dataset-name>
   dataset: all
+  # allowed values: safe | balanced | fast
   profile: balanced
+  # allowed values: true | false
   precise: true
+  # allowed values: true | false
   strict: false
+  # allowed values: true | false
   json: false
 
-# Typical pipeline:
-# 1) download
-# 2) verify_download
-# 3) convert
-# 4) verify_convert
-# 5) repair_convert (when verify_convert reports file failures)
-# 6) index
-# 7) verify_index
-"#
-    .to_string()
-}
-
-fn config_template_expert() -> String {
-    r#"# openalex-snapshot.yaml (expert)
-# Exhaustive template for advanced operators.
-# Every known configuration key is listed explicitly.
-# Precedence:
-#   1) built-in defaults
-#   2) defaults section below
-#   3) command-specific section below
-#   4) explicit CLI flags (highest precedence)
-#
-# Root layout (when root_dir is "."):
-#   ./openalex-snapshot
-#   ./parquet
-#   ./.openalex-snapshot_metadata
-
-defaults:
-  root_dir: .
-  dataset: all
-  workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  profile: balanced
-  # max_memory_mb: 8192
-  progress: true
-  state_flush_every: 25
-
-all:
-  retry: 1
-  enable_download: true
-  enable_verify_download: true
-  enable_convert: true
-  enable_verify_convert: true
-  enable_repair_convert: true
-  enable_index: true
-  enable_verify_index: true
-
-convert:
-  row_group_rows: 100000
-  batch_rows: 5000
-  compression: snappy
-  sample_size: 100
-  refresh_cache: false
-  verify_scope: dataset
-  verify_metadata_level: both
-  verify_file_sample_n: 50
-  seed: 42
-  skip_verify: false
-
-verify_convert:
-  scope: dataset
-  metadata_level: both
-  file_sample_n: 50
-  seed: 42
-
-schema:
-  from: auto
-  format: table
-  # diff_with: parquet
-  # output: ./schema.json
-  sample_size: 100
-  refresh_cache: false
-
-index:
-  root_dir: .
-  dataset: works
-  # index_file: ./parquet/works_id_idx.parquet
-  overwrite: false
-
-verify_index:
-  root_dir: .
-  dataset: works
-  # index_file: ./parquet/works_id_idx.parquet
-
-repair_convert:
-  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
-
-download:
-  root_dir: .
-  s3_uri: s3://openalex
-  dataset: all
-  aws_bin: aws
-  # endpoint_url: https://s3.amazonaws.com
-  # region: us-east-1
-  # profile_name: default
-  no_sign_request: true
-  signed: false
-  delete_files: true
-  no_delete: false
-  skip_validate: false
-
-verify_download:
-  root_dir: .
-  # s3_uri: s3://openalex
-  dataset: all
-  aws_bin: aws
-  # endpoint_url: https://s3.amazonaws.com
-  # region: us-east-1
-  # profile_name: default
-  no_sign_request: true
-  signed: false
-  check_extra: true
-
-report:
-  root_dir: .
-  source: all
-  # command: verify_convert
-  latest: false
-  full: false
-
-prune_reports:
-  root_dir: .
-  source: all
-  # command: verify_convert
-  keep_per_command: 1
-  dry_run: false
-
-progress:
-  root_dir: .
-  # command: convert
-  dataset: all
-  interval_sec: 2
-  watch: true
-  json: false
-
-check:
-  root_dir: .
-  dataset: all
-  aws_bin: aws
-  s3_uri: s3://openalex
-  no_sign_request: true
-  signed: false
-  profile: balanced
-  precise: true
-  strict: false
-  json: false
+# ---------------------------------------------------------------------------
+# 4) Example workflow
+# ---------------------------------------------------------------------------
+#   openalex-snapshot config --verify --config ./openalex-snapshot.yaml
+#   openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
 "#
     .to_string()
 }
@@ -2948,16 +3284,18 @@ check:
 fn run_config(args: ConfigArgs) -> Result<()> {
     let modes = (args.create.is_some() as u8) + (args.verify as u8);
     if modes != 1 {
-        bail!("config requires exactly one mode: use --create <simple|complete|expert> or --verify");
+        bail!(
+            "config requires exactly one mode: use --create <complete|safe|fast> or --verify"
+        );
     }
     if args.explain {
         let create_mode = args
             .create
             .as_ref()
             .map(|m| match m {
-                ConfigTemplateMode::Simple => "simple",
                 ConfigTemplateMode::Complete => "complete",
-                ConfigTemplateMode::Expert => "expert",
+                ConfigTemplateMode::Safe => "safe",
+                ConfigTemplateMode::Fast => "fast",
             })
             .unwrap_or("-");
         println!(
@@ -3875,17 +4213,13 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             signed: false,
             delete_files: true,
             no_delete: false,
-            skip_validate: false,
             skip_disk_check: false,
-            profile: Profile::Balanced,
-            workers: 4,
-            max_memory_mb: None,
             progress: true,
             explain: false,
             state_flush_every: 25,
         };
         fill_download_dirs(&mut da);
-        apply_download_config(&mut da, Some(cfg));
+        apply_download_config(&mut da, Some(cfg), None);
         fill_download_dirs(&mut da);
         record_all_step(
             &mut report,
@@ -3923,7 +4257,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             state_flush_every: 25,
         };
         fill_validate_download_dirs(&mut va);
-        apply_validate_download_config(&mut va, Some(cfg));
+        apply_validate_download_config(&mut va, Some(cfg), None);
         fill_validate_download_dirs(&mut va);
         record_all_step(
             &mut report,
@@ -3959,11 +4293,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             sample_size: 100,
             input_files: Vec::new(),
             progress: true,
-            verify_scope: VerifyScope::Dataset,
-            verify_metadata_level: VerifyMetadataLevel::Both,
-            verify_file_sample_n: 50,
             seed: 42,
-            skip_verify: true,
             skip_disk_check: false,
             disk_check_scope: DiskCheckScope::Dataset,
             refresh_cache: false,
@@ -3971,9 +4301,8 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             state_flush_every: 25,
         };
         fill_shared_dirs(&mut ca.shared);
-        apply_convert_config(&mut ca, Some(cfg));
+        apply_convert_config(&mut ca, Some(cfg), None);
         fill_shared_dirs(&mut ca.shared);
-        ca.skip_verify = true;
         record_all_step(
             &mut report,
             &mut step_failed,
@@ -4014,7 +4343,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                 state_flush_every: 25,
             };
             fill_shared_dirs(&mut va.shared);
-            apply_verify_config(&mut va, Some(cfg));
+            apply_verify_config(&mut va, Some(cfg), None);
             fill_shared_dirs(&mut va.shared);
             let verify_res = run_verify(va);
             let verify_failed = verify_res.is_err();
@@ -4046,7 +4375,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                     workers: 4,
                     duckdb_bin: None,
                 },
-                from_verify_report: report_path,
+                from_verify_report: report_path.clone(),
                 profile: Profile::Balanced,
                 max_memory_mb: None,
                 progress: true,
@@ -4054,11 +4383,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                 state_flush_every: 25,
             };
             fill_shared_dirs(&mut ra.shared);
-            apply_repair_config(&mut ra, Some(cfg));
+            apply_repair_config(&mut ra, Some(cfg), None);
             fill_shared_dirs(&mut ra.shared);
             // Always repair from loop-selected verify report.
-            let loop_report = ra.from_verify_report.clone();
-            ra.from_verify_report = loop_report;
+            ra.from_verify_report = report_path;
             record_all_step(
                 &mut report,
                 &mut step_failed,
@@ -4091,7 +4419,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
     if resolved.enable_index {
         let mut ia = IndexArgs {
             root_dir: resolved.root_dir.clone(),
-            dataset: "works".to_string(),
+            dataset: "all".to_string(),
             index_file: None,
             workers: 4,
             profile: Profile::Balanced,
@@ -4102,7 +4430,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             explain: false,
             state_flush_every: 25,
         };
-        apply_index_config(&mut ia, Some(cfg));
+        apply_index_config(&mut ia, Some(cfg), None);
         record_all_step(
             &mut report,
             &mut step_failed,
@@ -4122,7 +4450,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
     if resolved.enable_verify_index {
         let mut via = VerifyIndexArgs {
             root_dir: resolved.root_dir.clone(),
-            dataset: "works".to_string(),
+            dataset: "all".to_string(),
             index_file: None,
             workers: 4,
             profile: Profile::Balanced,
@@ -4131,7 +4459,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             progress: true,
             explain: false,
         };
-        apply_verify_index_config(&mut via, Some(cfg));
+        apply_verify_index_config(&mut via, Some(cfg), None);
         record_all_step(
             &mut report,
             &mut step_failed,
@@ -4197,6 +4525,43 @@ fn run_progress(mut args: ProgressArgs) -> Result<()> {
 }
 
 fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
+    if args.dataset == "all" {
+        if args.index_file.is_some() {
+            bail!("--index-file cannot be used with --dataset all");
+        }
+        let parquet_dir = args.root_dir.join("parquet");
+        let mut datasets: Vec<String> = fs::read_dir(&parquet_dir)
+            .with_context(|| format!("failed to read {}", parquet_dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    e.file_name().to_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.starts_with('.'))
+            .collect();
+        datasets.sort();
+        if datasets.is_empty() {
+            bail!("no parquet datasets found under {}", parquet_dir.display());
+        }
+        let mut failures = 0u64;
+        for ds in datasets {
+            let mut sub = args.clone();
+            sub.dataset = ds;
+            if let Err(e) = run_verify_index(sub) {
+                failures += 1;
+                eprintln!("[verify-index] dataset failure: {e:#}");
+            }
+        }
+        if failures > 0 {
+            bail!("[verify-index] failures detected across datasets: {}", failures);
+        }
+        return Ok(());
+    }
+
     let bin = duckdb_bin_from_option(&args.duckdb_bin);
     ensure_duckdb_bin(&bin)?;
     let parquet_dir = args.root_dir.join("parquet");
@@ -4539,8 +4904,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             dataset,
             "convert",
             &format!(
-                "start workers={} memory_mb={:?} compression={} row_group_rows={} verify_scope={:?}",
-                tuning.workers, tuning.memory_mb, args.compression, args.row_group_rows, args.verify_scope
+                "start workers={} memory_mb={:?} compression={} row_group_rows={}",
+                tuning.workers, tuning.memory_mb, args.compression, args.row_group_rows
             ),
         );
         eprintln!("[convert] dataset={dataset} scanning input files ...");
@@ -4809,32 +5174,6 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         let _ = write_run_reports(&args.shared.parquet_dir, &report);
     }
 
-    if !args.skip_verify {
-        eprintln!("[convert] conversion complete, starting verify stage ...");
-        let verify_args = VerifyArgs {
-            shared: args.shared.clone(),
-            profile: args.profile.clone(),
-            max_memory_mb: args.max_memory_mb,
-            scope: args.verify_scope,
-            metadata_level: args.verify_metadata_level,
-            file_sample_n: args.verify_file_sample_n,
-            seed: args.seed,
-            progress: args.progress,
-            explain: false,
-            state_flush_every: args.state_flush_every,
-        };
-        if let Err(e) = run_verify(verify_args) {
-            report.failures.push(FailureEntry {
-                dataset: args.shared.dataset.clone(),
-                phase: "post_verify".to_string(),
-                rel_path: None,
-                source_path: None,
-                output_path: None,
-                error_message: format!("{e:#}"),
-                suggested_recovery: Some("run verify separately for detailed report".to_string()),
-            });
-        }
-    }
     report_finalize(&mut report);
     let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
     eprintln!(
@@ -4855,6 +5194,63 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 }
 
 fn run_index(args: IndexArgs) -> Result<()> {
+    if args.dataset == "all" {
+        if args.index_file.is_some() {
+            eprintln!(
+                "[index] --index-file is ignored when --dataset all; using per-dataset default paths"
+            );
+        }
+        let parquet_dir = args.root_dir.join("parquet");
+        let mut datasets: Vec<String> = fs::read_dir(&parquet_dir)
+            .with_context(|| format!("failed to read {}", parquet_dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    e.file_name().to_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.starts_with('.'))
+            .collect();
+        datasets.sort();
+        if datasets.is_empty() {
+            bail!("no parquet datasets found under {}", parquet_dir.display());
+        }
+        let mut failures = 0u64;
+        for ds in datasets {
+            let corpus_dir = parquet_dir.join(&ds);
+            match list_parquet_files(&corpus_dir) {
+                Ok(v) if v.is_empty() => {
+                    eprintln!(
+                        "[index] dataset={} skipped (no parquet files under {})",
+                        ds,
+                        corpus_dir.display()
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("[index] dataset={} scan failure: {e:#}", ds);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let mut sub = args.clone();
+            sub.dataset = ds;
+            sub.index_file = None;
+            if let Err(e) = run_index(sub) {
+                failures += 1;
+                eprintln!("[index] dataset failure: {e:#}");
+            }
+        }
+        if failures > 0 {
+            bail!("[index] failures detected across datasets: {}", failures);
+        }
+        return Ok(());
+    }
+
     let bin = duckdb_bin_from_option(&args.duckdb_bin);
     ensure_duckdb_bin(&bin)?;
     let parquet_dir = args.root_dir.join("parquet");
@@ -4986,7 +5382,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
                     }
                     sql.push_str(&format!(
                         "COPY (SELECT id, \
-                         CAST(FLOOR(CAST(regexp_extract(CAST(id AS VARCHAR), '([0-9]+)$', 1) AS BIGINT) / 10000) AS INTEGER) AS id_block, \
+                         CAST(FLOOR(TRY_CAST(regexp_extract(CAST(id AS VARCHAR), '([0-9]+)$', 1) AS BIGINT) / 10000) AS INTEGER) AS id_block, \
                          '{}' AS parquet_file, \
                          file_row_number \
                          FROM read_parquet({}, file_row_number = true)) \
@@ -6110,9 +6506,8 @@ fn run_repair(args: RepairArgs) -> Result<()> {
 fn run_download(args: DownloadArgs) -> Result<()> {
     ensure_aws_cli(&args.aws_bin)?;
     fs::create_dir_all(&args.snapshot_dir)?;
-    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
     if args.explain {
-        explain_download(&args, &tuning)?;
+        explain_download(&args)?;
         return Ok(());
     }
     let mut report_args = BTreeMap::new();
@@ -6126,7 +6521,6 @@ fn run_download(args: DownloadArgs) -> Result<()> {
     let effective_delete = args.delete_files && !args.no_delete;
     report_args.insert("no_sign_request".to_string(), effective_no_sign.to_string());
     report_args.insert("delete_files".to_string(), effective_delete.to_string());
-    report_args.insert("skip_validate".to_string(), args.skip_validate.to_string());
     report_args.insert(
         "state_flush_every".to_string(),
         args.state_flush_every.to_string(),
@@ -6145,8 +6539,8 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         no_sign_request: effective_no_sign,
         signed: args.signed,
         check_extra: effective_delete,
-        profile: args.profile.clone(),
-        workers: args.workers,
+        profile: Profile::Balanced,
+        workers: 4,
         progress: false,
         explain: false,
         state_flush_every: args.state_flush_every,
@@ -6253,67 +6647,13 @@ fn run_download(args: DownloadArgs) -> Result<()> {
     }
     append_download_log(&args.snapshot_dir, "download", "sync complete")?;
 
-    if args.skip_validate {
-        report.datasets.push(DatasetReportSummary {
-            dataset: args.dataset.clone(),
-            items_scanned: 1,
-            succeeded: 1,
-            failed: 0,
-            skipped: 0,
-        });
-        report_finalize(&mut report);
-        let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
-        eprintln!(
-            "[download] summary scanned={} ok={} failed={} reports={}",
-            report.totals_items_scanned,
-            report.totals_succeeded,
-            report.totals_failed,
-            report_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        return Ok(());
-    }
-
-    let v_args = ValidateDownloadArgs {
-        root_dir: args.root_dir.clone(),
-        snapshot_dir: args.snapshot_dir.clone(),
-        s3_uri: args.s3_uri.clone(),
+    report.datasets.push(DatasetReportSummary {
         dataset: args.dataset.clone(),
-        aws_bin: args.aws_bin.clone(),
-        endpoint_url: args.endpoint_url.clone(),
-        region: args.region.clone(),
-        profile_name: args.profile_name.clone(),
-        no_sign_request: effective_no_sign,
-        signed: args.signed,
-        check_extra: effective_delete,
-        profile: args.profile.clone(),
-        workers: args.workers,
-        progress: args.progress,
-        explain: false,
-        state_flush_every: args.state_flush_every,
-    };
-    if let Err(e) = run_validate_download(v_args) {
-        report.failures.push(FailureEntry {
-            dataset: args.dataset.clone(),
-            phase: "download_validate".to_string(),
-            rel_path: None,
-            source_path: Some(args.s3_uri.clone()),
-            output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
-            error_message: format!("{e:#}"),
-            suggested_recovery: Some("run verify_download for detailed failures".to_string()),
-        });
-    } else {
-        report.datasets.push(DatasetReportSummary {
-            dataset: args.dataset.clone(),
-            items_scanned: 1,
-            succeeded: 1,
-            failed: 0,
-            skipped: 0,
-        });
-    }
+        items_scanned: 1,
+        succeeded: 1,
+        failed: 0,
+        skipped: 0,
+    });
 
     report_finalize(&mut report);
     let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
@@ -6653,13 +6993,7 @@ fn explain_convert(args: &ConvertArgs, datasets: &[String], duckdb_bin: &Path, t
     } else {
         println!("input_filter: {}", args.input_files.len());
     }
-    println!("post_verify: {}", !args.skip_verify);
-    if !args.skip_verify {
-        println!(
-            "verify_plan: scope={:?}, metadata_level={:?}, file_sample_n={}, seed={}",
-            args.verify_scope, args.verify_metadata_level, args.verify_file_sample_n, args.seed
-        );
-    }
+    println!("verify: not part of convert; run verify_convert separately");
 }
 
 fn explain_verify(args: &VerifyArgs, datasets: &[String], duckdb_bin: &Path, tuning: &Tuning) {
@@ -7189,7 +7523,7 @@ fn append_download_log(snapshot_dir: &Path, command: &str, msg: &str) -> Result<
 }
 
 fn write_download_reports(snapshot_dir: &Path, report: &RunReport) -> Result<Vec<PathBuf>> {
-    let fname = report_file_name(&report.command, report.started_at_unix);
+    let fname = report_file_name(&report.command, report.started_at_unix, report.report_nonce);
     let payload = serde_json::to_vec_pretty(report)?;
     let p = download_reports_dir(snapshot_dir).join(fname);
     write_json_atomic(&p, &payload)?;
@@ -7414,7 +7748,7 @@ fn gzip_integrity_ok(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn explain_download(args: &DownloadArgs, tuning: &Tuning) -> Result<()> {
+fn explain_download(args: &DownloadArgs) -> Result<()> {
     let cmd = aws_sync_command(args)?;
     let effective_no_sign = args.no_sign_request && !args.signed;
     let effective_delete = args.delete_files && !args.no_delete;
@@ -7425,9 +7759,7 @@ fn explain_download(args: &DownloadArgs, tuning: &Tuning) -> Result<()> {
     println!("no_sign_request: {}", effective_no_sign);
     println!("delete_files: {}", effective_delete);
     println!("sync_command: {} {}", args.aws_bin.display(), cmd.join(" "));
-    println!("auto_validate: {}", !args.skip_validate);
-    println!("workers(validate): {}", tuning.workers);
-    println!("memory_mb(validate): {:?}", tuning.memory_mb);
+    println!("verify: not part of download; run verify_download separately");
     Ok(())
 }
 
@@ -7707,6 +8039,14 @@ fn bytes_to_gib(bytes: u64) -> u64 {
     bytes / (1024 * 1024 * 1024)
 }
 
+fn now_unix_millis() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn check_path_writable(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     let probe = path.join(".openalex-check-write-probe.tmp");
@@ -7764,6 +8104,12 @@ These skills help AI coding agents operate `openalex-snapshot` safely and consis
 Core requirements:
 - `duckdb` for conversion/verify/schema/index paths
 - `aws` for download/verify_download paths
+
+Argument precedence to apply in all commands:
+1. explicit CLI flags
+2. config subcommand section values
+3. config defaults section values
+4. built-in defaults
 
 ## How to use these skills
 
@@ -8021,12 +8367,21 @@ fn command_flow_rank(cmd: &str) -> usize {
     }
 }
 
-fn report_file_name(command: &str, started_at_unix: i64) -> String {
-    format!(
-        "{}-{}.json",
-        sanitize_command_name(command),
-        started_at_unix
-    )
+fn report_file_name(command: &str, started_at_unix: i64, report_nonce: u128) -> String {
+    if report_nonce == 0 {
+        format!(
+            "{}-{}.json",
+            sanitize_command_name(command),
+            started_at_unix
+        )
+    } else {
+        format!(
+            "{}-{}-{}.json",
+            sanitize_command_name(command),
+            started_at_unix,
+            report_nonce
+        )
+    }
 }
 
 fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -8041,7 +8396,7 @@ fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn write_run_reports(parquet_dir: &Path, report: &RunReport) -> Result<Vec<PathBuf>> {
     let mut out_paths = Vec::new();
-    let fname = report_file_name(&report.command, report.started_at_unix);
+    let fname = report_file_name(&report.command, report.started_at_unix, report.report_nonce);
     let payload = serde_json::to_vec_pretty(report)?;
 
     let global = global_reports_dir(parquet_dir).join(&fname);
@@ -8060,6 +8415,7 @@ fn report_new(command: &str, args: BTreeMap<String, String>) -> RunReport {
     RunReport {
         command: command.to_string(),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        report_nonce: now_unix_millis(),
         started_at_unix: now_unix(),
         finished_at_unix: None,
         duration_seconds: None,
@@ -9126,6 +9482,7 @@ mod tests {
         let report = RunReport {
             command: "verify".to_string(),
             cli_version: "0.1.0".to_string(),
+            report_nonce: 1,
             started_at_unix: 1,
             finished_at_unix: Some(2),
             duration_seconds: Some(1.0),

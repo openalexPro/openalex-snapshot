@@ -1,19 +1,19 @@
-site_name: openalex-convert
+site_name: openalex-snapshot
 theme:
   name: material
 nav:
   - Home: README.md
   - Quickstart: quickstart.md
   - Commands:
-      - convert: commands/convert.md
-      - verify: commands/verify.md
-      - schema: commands/schema.md
-      - index: commands/index.md
-      - repair: commands/repair.md
+      - check: commands/check.md
       - download: commands/download.md
       - verify_download: commands/verify_download.md
+      - convert: commands/convert.md
+      - verify_convert: commands/verify.md
+      - repair_convert: commands/repair.md
+      - index: commands/index.md
+      - schema: commands/schema.md
       - skills: commands/skills.md
-      - check: commands/check.md
   - Operations:
       - Low memory: operations/low-memory.md
       - Cache precompute: operations/cache-precompute.md
