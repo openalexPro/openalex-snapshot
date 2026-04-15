@@ -2,10 +2,57 @@
 
 Standalone CLI for OpenAlex snapshot download, conversion, verification, schema inspection, and indexing.
 
+## What It Does
+
+`openalex-snapshot` manages the full snapshot pipeline in one CLI:
+
+- `download` + `verify_download` for snapshot sync and integrity checks
+- `convert` + `verify_convert` + `repair_convert` for JSON.GZ -> parquet with validation/recovery
+- `index` + `verify_index` for ID lookup indexes
+- `extract` for targeted parquet extraction by OpenAlex IDs
+- `schema` + `verify_schema` for schema inspection and parity checks
+- `report` / `progress` for run-state visibility
+- `all` for config-driven orchestration
+
+Default root layout:
+- snapshot: `<root>/openalex-snapshot`
+- parquet: `<root>/parquet`
+- metadata: `<root>/.openalex-snapshot_metadata`
+
 ## Requirements
 
 - `duckdb` available in `PATH` (or pass `--duckdb-bin` where supported)
 - `aws` CLI available in `PATH` for `download` / `verify_download`
+
+## Install
+
+### 1. Build from source
+
+```bash
+git clone https://github.com/rkrug/openalex-snapshot.git
+cd openalex-snapshot
+cargo build --release
+./target/release/openalex-snapshot --help
+```
+
+### 2. Install with Cargo
+
+```bash
+git clone https://github.com/rkrug/openalex-snapshot.git
+cd openalex-snapshot
+cargo install --path .
+openalex-snapshot --help
+```
+
+### 3. Install from GitHub release binaries
+
+Download the archive for your platform from GitHub Releases:
+- Linux: `openalex-snapshot-<tag>-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Intel: `openalex-snapshot-<tag>-x86_64-apple-darwin.tar.gz`
+- macOS Apple Silicon: `openalex-snapshot-<tag>-aarch64-apple-darwin.tar.gz`
+- Windows: `openalex-snapshot-<tag>-x86_64-pc-windows-msvc.zip`
+
+Then unpack and place `openalex-snapshot` (or `openalex-snapshot.exe`) on your `PATH`.
 
 Version:
 
@@ -43,6 +90,10 @@ Argument precedence (highest wins):
 ```bash
 # preflight
 openalex-snapshot check --root-dir /Volumes/openalex --dataset all
+
+# download + verify snapshot
+openalex-snapshot download --root-dir /Volumes/openalex
+openalex-snapshot verify_download --root-dir /Volumes/openalex
 
 # convert one dataset
 openalex-snapshot convert \

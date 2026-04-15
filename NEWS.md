@@ -15,6 +15,11 @@ All notable changes to `openalex-snapshot` are documented in this file.
 - Config templates now include a `check:` section.
 - `index`/`verify_index` default dataset changed from `works` to `all`.
 - `index --dataset all` now skips existing per-dataset index files and continues building missing ones (and ignores `--index-file` in `all` mode).
+- Documentation + AI consistency sweep:
+  - README now includes install guidance (source build, cargo install, release binaries)
+  - MkDocs command coverage expanded to include `all`, `config`, `report`, `prune-reports`, `progress`, `verify_schema`, `verify_index`
+  - stale migration reference removed from docs index
+  - AI skills guidance/templates now include explicit `extract` runbook coverage
 - Documentation consistency sweep across README/docs/man/skills references:
   - precedence clarified as `CLI > command section > defaults section > built-in defaults`
   - naming aligned to `openalex-snapshot` repo/binary usage

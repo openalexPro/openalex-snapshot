@@ -6,6 +6,13 @@ This project supports a repo-local `skills/` folder to help AI coding agents exe
 
 Provide operational skills that are specific to `openalex-snapshot` behavior, not generic AI prompting advice.
 
+Core operational flow:
+1. `download` / `verify_download`
+2. `convert` / `verify_convert` / `repair_convert`
+3. `index` / `verify_index`
+4. `extract`
+5. `schema` / `verify_schema`
+
 Configuration precedence to follow in all skills:
 1. explicit CLI flags
 2. config subcommand section values
@@ -50,6 +57,7 @@ Skills should reference these docs as source-of-truth:
 - `ARCHITECTURE_AND_DECISIONS.md`
 - `NEWS.md`
 - command docs/man pages
+- `docs/commands/extract.md` for ID routing and output behavior
 
 ## Maintenance
 

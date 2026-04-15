@@ -62,6 +62,7 @@ This document captures project invariants and decision records so human and AI c
 - Preserve root-dir path derivation and metadata conventions.
 - Add tests for CLI parsing + behavior whenever new flags/commands are introduced.
 - Update `NEWS.md`, docs, and man pages in the same change set as behavior changes.
+- Keep README install pathways current (source build, cargo install, release binaries) and aligned with release artifact naming.
 
 ## Extension Checklist
 

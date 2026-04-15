@@ -8926,8 +8926,9 @@ These skills help AI coding agents operate `openalex-snapshot` safely and consis
 1. `download` / `verify_download`
 2. `convert` / `verify_convert` / `repair_convert`
 3. `index` / `verify_index`
-4. `schema` / `verify_schema`
-5. reporting and progress (`report`, `prune-reports`, `progress`)
+4. `extract`
+5. `schema` / `verify_schema`
+6. reporting and progress (`report`, `prune-reports`, `progress`)
 
 Core requirements:
 - `duckdb` for conversion/verify/schema/index paths
@@ -8974,6 +8975,7 @@ Run subcommands with correct root-dir model and predictable outputs.
 - Preflight: `openalex-snapshot check --root-dir <root> --dataset all`
 - Convert one dataset: `openalex-snapshot convert --root-dir <root> --dataset works --profile safe --workers 1`
 - Verify one dataset: `openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both`
+- Extract by IDs: `openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.parquet>`
 - Repair from report: `openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>`
 
 ## Failure Handling
@@ -8984,6 +8986,7 @@ Run subcommands with correct root-dir model and predictable outputs.
 - If memory is constrained, use `--profile safe --workers 1`.
 - If debugging a single problematic file, use repeated `--input-file` on `convert`.
 - Prefer `verify_convert --scope file` for quick checks, `--scope dataset|snapshot` for full checks.
+- Run `index` before `extract`; extraction requires `<dataset>_id_idx.parquet`.
 
 ## Done Criteria
 - command exits successfully,
@@ -9007,6 +9010,7 @@ Execute the recommended end-to-end flow safely.
 6. `repair_convert` (only when verify reports failures)
 7. `index`
 8. `verify_index`
+9. `extract`
 
 ## Decision Rules
 - Keep `profile=safe` for constrained memory hosts.
@@ -9020,6 +9024,7 @@ Execute the recommended end-to-end flow safely.
   3. `verify_convert`
   4. `index`
   5. `verify_index`
+  6. `extract`
 
 - Auto orchestration:
   - `openalex-snapshot all --config <path> --retry <N>`
