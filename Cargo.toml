@@ -1,5 +1,5 @@
 [package]
-name = "openalex-convert"
+name = "openalex-snapshot"
 version = "0.1.0"
 edition = "2021"
 
