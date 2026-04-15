@@ -32,7 +32,7 @@ jobs:
           pip install mkdocs mkdocs-material
 
       - name: Build docs
-        run: mkdocs build --config-file docs/mkdocs.yml --site-dir site
+        run: mkdocs build --config-file mkdocs.yml --site-dir site
 
       - name: Publish to gh-pages branch
         uses: peaceiris/actions-gh-pages@v4
