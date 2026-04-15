@@ -500,7 +500,12 @@ fn precedence_config_over_default_when_cli_unset() {
         .unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("corpus_dir: ./parquet/authors"), "{}", s);
+    assert!(
+        s.contains("corpus_dir: ./parquet/authors")
+            || s.contains("corpus_dir: .\\parquet\\authors"),
+        "{}",
+        s
+    );
 }
 
 #[test]
@@ -516,7 +521,11 @@ fn precedence_default_when_cli_and_config_unset() {
         .unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("corpus_dir: ./parquet/all"), "{}", s);
+    assert!(
+        s.contains("corpus_dir: ./parquet/all") || s.contains("corpus_dir: .\\parquet\\all"),
+        "{}",
+        s
+    );
 }
 
 #[test]
