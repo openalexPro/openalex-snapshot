@@ -1,4 +1,5 @@
 target/
+.claude/
 
 # macOS filesystem metadata
 .DS_Store

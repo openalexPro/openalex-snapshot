@@ -9,7 +9,7 @@ This project was built with significant AI assistance:
 - **[OpenAI Codex](https://openai.com/codex)** was used for the initial implementation, generating the core architecture, command structure, and the majority of the Rust source code.
 - **[Claude Code](https://claude.ai/code)** (Anthropic) was used for ongoing development, refinement, bug fixes, and documentation.
 
-All AI-generated code was reviewed and directed by the project author.
+All AI-generated code was directed and tested by the project author.
 
 ## What It Does
 
