@@ -2,6 +2,15 @@
 
 Standalone CLI for OpenAlex snapshot download, conversion, verification, schema inspection, and indexing.
 
+## AI Contribution
+
+This project was built with significant AI assistance:
+
+- **[OpenAI Codex](https://openai.com/codex)** was used for the initial implementation, generating the core architecture, command structure, and the majority of the Rust source code.
+- **[Claude Code](https://claude.ai/code)** (Anthropic) was used for ongoing development, refinement, bug fixes, and documentation.
+
+All AI-generated code was reviewed and directed by the project author.
+
 ## What It Does
 
 `openalex-snapshot` manages the full snapshot pipeline in one CLI:
@@ -53,6 +62,14 @@ Download the archive for your platform from GitHub Releases:
 - Windows: `openalex-snapshot-<tag>-x86_64-pc-windows-msvc.zip`
 
 Then unpack and place `openalex-snapshot` (or `openalex-snapshot.exe`) on your `PATH`.
+
+> **macOS note:** Because the binaries are not notarized with Apple, macOS Gatekeeper will block them on first run with a warning that the app "cannot be opened". To allow the binary, run this once after unpacking:
+>
+> ```bash
+> xattr -dr com.apple.quarantine openalex-snapshot
+> ```
+>
+> Alternatively, open System Settings → Privacy & Security and click "Open Anyway". This is a one-time step per binary. To avoid it entirely, install via Cargo (option 1 or 2 above), which compiles locally and bypasses Gatekeeper.
 
 Version:
 
