@@ -1,3 +1,10 @@
+<!-- badges section begin -->
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19596862.svg)](https://doi.org/10.5281/zenodo.19596862)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/rkrug/openalex-snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/rkrug/openalex-snapshot/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/rkrug/openalex-snapshot)](https://github.com/rkrug/openalex-snapshot/releases/latest)
+<!-- badges section end -->
+
 # openalex-snapshot
 
 Standalone CLI for OpenAlex snapshot download, conversion, verification, schema inspection, and indexing.
