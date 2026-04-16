@@ -31,6 +31,6 @@ Expected structure:
 
 Ensure canonical schema cache exists:
 
-- `.<dataset>_metadata/schemata/unified_schema.csv`
+- `.openalex-snapshot_metadata/datasets/<dataset>/schemata/unified_schema.csv`
 
 If stale, re-run with schema refresh options.
