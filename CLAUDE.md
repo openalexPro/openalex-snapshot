@@ -22,7 +22,7 @@ The entire application is a single binary implemented in `src/main.rs` (~10,400 
 **Path model** — all runtime paths derive from a single `--root-dir`:
 - `<root>/snapshot/` — downloaded snapshot (JSON.GZ files)
 - `<root>/parquet/` — converted parquet output
-- `<root>/.openalex-snapshot_metadata/` — reports, logs, schema caches, verify state
+- `<root>/openalex-snapshot_metadata/` — reports, logs, schema caches, verify state
 
 **Argument precedence** (highest wins):
 1. Explicit CLI flags
@@ -32,7 +32,7 @@ The entire application is a single binary implemented in `src/main.rs` (~10,400 
 
 **Execution model** — commands use continue-and-report rather than fail-fast: failures accumulate and are written to timestamped JSON reports; the process exits non-zero only if failure entries exist.
 
-**Schema caching** — canonical schema is `unified_schema.csv` (`col_name,col_type`) under `.openalex-snapshot_metadata/datasets/<dataset>/schemata/`. JSON schema caches are auxiliary and never canonical. CSV always takes precedence over JSON.
+**Schema caching** — canonical schema is `unified_schema.csv` (`col_name,col_type`) under `openalex-snapshot_metadata/<dataset>/schemata/`. JSON schema caches are auxiliary and never canonical. CSV always takes precedence over JSON.
 
 **Indexing** — two-stage: per-file shard indexes are built first (resumable), then combined into `<dataset>_id_idx.parquet` with columns `id, id_block, parquet_file, file_row_number`.
 

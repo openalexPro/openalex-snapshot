@@ -557,7 +557,7 @@ fn canonical_unified_schema_csv_written() {
         .unwrap()
         .success());
 
-    let csv = root.join(".openalex-snapshot_metadata/datasets/authors/schemata/unified_schema.csv");
+    let csv = root.join("openalex-snapshot_metadata/authors/schemata/unified_schema.csv");
     assert!(csv.exists());
     let txt = fs::read_to_string(csv).unwrap();
     let first = txt.lines().next().unwrap_or("");
@@ -595,7 +595,7 @@ fn csv_cache_precedence_over_json_cache() {
 
     // Corrupt JSON cache on purpose; canonical CSV must still drive schema loading.
     let json_cache =
-        root.join(".openalex-snapshot_metadata/datasets/works/schemata/source_schema.json");
+        root.join("openalex-snapshot_metadata/works/schemata/source_schema.json");
     fs::write(&json_cache, "{ not valid json").unwrap();
 
     let out = Command::new(&exe)
@@ -693,7 +693,7 @@ fn legacy_schema_cache_is_auto_migrated() {
     assert!(out.status.success());
 
     let new_csv =
-        root.join(".openalex-snapshot_metadata/datasets/authors/schemata/unified_schema.csv");
+        root.join("openalex-snapshot_metadata/authors/schemata/unified_schema.csv");
     assert!(new_csv.exists());
     assert!(!legacy.exists());
 }
@@ -749,7 +749,7 @@ fn repair_reconverts_failed_verify_files() {
         .unwrap();
     assert!(!failed_verify.success());
 
-    let reports_dir = root.join(".openalex-snapshot_metadata/datasets/authors/reports");
+    let reports_dir = root.join("openalex-snapshot_metadata/reports");
     let mut verify_reports: Vec<PathBuf> = fs::read_dir(&reports_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -830,7 +830,7 @@ fn download_and_validate_download_with_mock_aws() {
     assert!(status.success());
     assert!(snapshot.join("data/authors/part_000/part1.gz").exists());
     assert!(root
-        .join(".openalex-snapshot_metadata/download/reports")
+        .join("openalex-snapshot_metadata/download/reports")
         .exists());
 
     // Corrupt local gzip and verify strict validation fails.
@@ -857,7 +857,7 @@ fn download_and_validate_download_with_mock_aws() {
 fn report_lists_latest_and_prune_keeps_latest() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let global_reports = root.join(".openalex-snapshot_metadata/reports");
+    let global_reports = root.join("openalex-snapshot_metadata/reports");
     fs::create_dir_all(&global_reports).unwrap();
     write_report_json(&global_reports.join("verify-100.json"), "verify", 100, 1);
     write_report_json(&global_reports.join("verify-200.json"), "verify", 200, 0);
@@ -998,7 +998,7 @@ fn config_verify_fails_for_unknown_key() {
 fn progress_once_reads_latest_active_report() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let reports = root.join(".openalex-snapshot_metadata/reports");
+    let reports = root.join("openalex-snapshot_metadata/reports");
     fs::create_dir_all(&reports).unwrap();
     let active = serde_json::json!({
         "command":"convert",
@@ -1167,7 +1167,7 @@ verify_index:
         .status()
         .unwrap();
     assert!(status.success());
-    let reports = root.join(".openalex-snapshot_metadata/reports");
+    let reports = root.join("openalex-snapshot_metadata/reports");
     let has_all = fs::read_dir(&reports)
         .unwrap()
         .filter_map(|e| e.ok())

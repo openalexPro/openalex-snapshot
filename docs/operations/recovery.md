@@ -9,7 +9,7 @@ Re-run the same convert command; existing outputs are skipped.
 ```bash
 openalex-snapshot repair_convert \
   --root-dir /data \
-  --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-<ts>.json
+  --from-verify-report /data/openalex-snapshot_metadata/reports/verify_convert-<ts>.json
 ```
 
 ## Diagnose failures

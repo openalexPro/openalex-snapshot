@@ -33,7 +33,7 @@ All AI-generated code was directed and tested by the project author.
 Default root layout:
 - snapshot: `<root>/snapshot`
 - parquet: `<root>/parquet`
-- metadata: `<root>/.openalex-snapshot_metadata`
+- metadata: `<root>/openalex-snapshot_metadata`
 
 ## Requirements
 
@@ -142,7 +142,7 @@ openalex-snapshot extract \
 # repair from verify report
 openalex-snapshot repair_convert \
   --root-dir /Volumes/openalex \
-  --from-verify-report /Volumes/openalex/.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  --from-verify-report /Volumes/openalex/openalex-snapshot_metadata/reports/verify_convert-123456.json
 
 # bootstrap AI skills folder
 openalex-snapshot skills --root-dir /Volumes/openalex
@@ -150,11 +150,16 @@ openalex-snapshot skills --root-dir /Volumes/openalex
 
 ## Metadata layout
 
-Under `<root>/.openalex-snapshot_metadata`:
+Under `<root>/openalex-snapshot_metadata`:
 
-- `reports/` (global)
-- `datasets/<dataset>/{schemata,verify,logs,reports}`
-- `download/{manifests,logs,reports}`
+- `reports/` — latest report per command (current run)
+- `archived/<timestamp>/` — previous completed runs
+- `download/download.log`
+- `<dataset>/schemata/` — schema cache
+- `<dataset>/convert/` — convert logs (created when convert runs)
+- `<dataset>/conversion-verify/` — verify_convert logs + metrics
+- `<dataset>/index/` — index logs
+- `<dataset>/index-verify/` — verify_index logs
 
 ## Documentation
 

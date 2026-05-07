@@ -68,5 +68,5 @@ cargo build --release
 ```bash
 ./target/release/openalex-snapshot repair_convert \
   --root-dir /Volumes/openalex \
-  --from-verify-report /Volumes/openalex/.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  --from-verify-report /Volumes/openalex/openalex-snapshot_metadata/reports/verify_convert-123456.json
 ```

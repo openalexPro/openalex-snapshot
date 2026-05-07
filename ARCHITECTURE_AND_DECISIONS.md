@@ -8,13 +8,21 @@ This document captures project invariants and decision records so human and AI c
 - Root-first path model:
   - snapshot: `<root>/snapshot`
   - parquet: `<root>/parquet`
-  - metadata: `<root>/.openalex-snapshot_metadata`
+  - metadata: `<root>/openalex-snapshot_metadata`
 - Dataset metadata layout:
-  - `<root>/.openalex-snapshot_metadata/datasets/<dataset>/{schemata,verify,logs,reports}`
+  - `<root>/openalex-snapshot_metadata/<dataset>/schemata/` — schema cache
+  - `<root>/openalex-snapshot_metadata/<dataset>/convert/` — convert logs
+  - `<root>/openalex-snapshot_metadata/<dataset>/conversion-verify/` — verify_convert logs + metrics
+  - `<root>/openalex-snapshot_metadata/<dataset>/index/` — index logs
+  - `<root>/openalex-snapshot_metadata/<dataset>/index-verify/` — verify_index logs
 - Download metadata layout:
-  - `<root>/.openalex-snapshot_metadata/download/{manifests,logs,reports}`
-- Global reports:
-  - `<root>/.openalex-snapshot_metadata/reports`
+  - `<root>/openalex-snapshot_metadata/download/download.log`
+- Global reports (current run only):
+  - `<root>/openalex-snapshot_metadata/reports/`
+- Archived runs:
+  - `<root>/openalex-snapshot_metadata/archived/<timestamp>/`
+- Lockfile (present while a command runs):
+  - `<root>/openalex-snapshot_metadata/openalex-snapshot.lock`
 
 ## Runtime Invariants
 

@@ -14,5 +14,5 @@ openalex-snapshot schema \
 
 ## Notes
 
-- canonical cache: `.openalex-snapshot_metadata/datasets/<dataset>/schemata/unified_schema.csv`
+- canonical cache: `openalex-snapshot_metadata/<dataset>/schemata/unified_schema.csv`
 - `arrow-r` format is stable JSON for R Arrow comparisons
