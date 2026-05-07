@@ -86,7 +86,7 @@ repair_convert (detailed):
 
 download/verify_download (detailed):
   - default sync command:
-    aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+    aws s3 sync --delete s3://openalex ./snapshot --no-sign-request
   - disk preflight:
     required free space = remote manifest size + 10%
   - strict validation compares remote manifest vs local files
@@ -143,7 +143,7 @@ const DOWNLOAD_LONG_ABOUT: &str = "\
 Download OpenAlex snapshot via AWS CLI sync.
 
 Defaults (zero-config):
-  aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+  aws s3 sync --delete s3://openalex ./snapshot --no-sign-request
   dataset scope: all
   disk preflight: remote manifest size + 10% free space required
 
@@ -313,7 +313,7 @@ const CONVERT_LONG_ABOUT: &str = "\
 Convert OpenAlex snapshot JSON.GZ files into parquet files.
 
 Behavior:
-1) Discovers source files under <root_dir>/openalex-snapshot/data/<dataset>/**/*.gz
+1) Discovers source files under <root_dir>/snapshot/data/<dataset>/**/*.gz
 2) Infers a unified schema per dataset (with cache + optional refresh)
 3) Converts each source file to one parquet file
 4) Preserves dataset-relative folder/file structure in output
@@ -1909,30 +1909,30 @@ fn load_optional_config(explicit: Option<&Path>) -> Result<Option<AppConfig>> {
 }
 
 fn fill_shared_dirs(shared: &mut SharedArgs) {
-    shared.snapshot_dir = shared.root_dir.join("openalex-snapshot");
+    shared.snapshot_dir = shared.root_dir.join("snapshot");
     shared.parquet_dir = shared.root_dir.join("parquet");
 }
 
 fn fill_download_dirs(args: &mut DownloadArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
 }
 
 fn fill_validate_download_dirs(args: &mut ValidateDownloadArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
 }
 
 fn fill_report_dirs(args: &mut ReportArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_prune_report_dirs(args: &mut PruneReportsArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_progress_dirs(args: &mut ProgressArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
@@ -3147,7 +3147,7 @@ fn config_template_complete() -> String {
 # 2) Path model (root-centric)
 # ---------------------------------------------------------------------------
 # With root_dir="." the tool uses:
-#   ./openalex-snapshot               (download/source snapshot)
+#   ./snapshot                         (download/source snapshot)
 #   ./parquet                         (converted parquet outputs)
 #   ./.openalex-snapshot_metadata     (reports, logs, caches, manifests)
 #
@@ -3180,7 +3180,7 @@ defaults:
   # allowed values: any valid path
   root_dir: .
 
-  # Default dataset scope where supported.
+  # Default dataset scope — set once here, applies to all commands.
   # Use "all" or a single dataset name (works, authors, ...).
   # allowed values: all | <dataset-name>
   dataset: all
@@ -3232,6 +3232,68 @@ all:
   # Use when disk check estimates are too conservative for partial dataset runs.
   # allowed values: true | false
   # skip_disk_check: false
+
+download:
+  # ---------------------------------------------------------------------------
+  # Download snapshot from OpenAlex S3
+  # Uses AWS CLI wrapper behavior; defaults follow OpenAlex guidance.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # progress: true
+  # state_flush_every: 25
+
+  # Defaults mirror OpenAlex recommendation.
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid s3:// URI
+  s3_uri: s3://openalex
+  # allowed values: any valid executable path
+  aws_bin: aws
+  # allowed values: any valid URL
+  # endpoint_url: https://s3.amazonaws.com
+  # allowed values: any valid AWS region string
+  # region: us-east-1
+  # allowed values: any configured AWS profile name
+  # profile_name: default
+  # allowed values: true | false
+  no_sign_request: true
+  # allowed values: true | false
+  signed: false
+  # allowed values: true | false
+  delete_files: true
+  # allowed values: true | false
+  no_delete: false
+
+  # Skip free disk space preflight check for download.
+  # allowed values: true | false
+  # skip_disk_check: false
+
+verify_download:
+  # ---------------------------------------------------------------------------
+  # Verify downloaded snapshot against remote manifest + gzip integrity
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # profile: balanced
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid s3:// URI
+  # s3_uri: s3://openalex
+  # allowed values: any valid executable path
+  aws_bin: aws
+  # allowed values: true | false
+  no_sign_request: true
+  # allowed values: true | false
+  signed: false
+  # allowed values: true | false
+  check_extra: true
 
 convert:
   # ---------------------------------------------------------------------------
@@ -3302,6 +3364,68 @@ verify_convert:
   # allowed values: integer >= 0
   seed: 42
 
+repair_convert:
+  # ---------------------------------------------------------------------------
+  # Repair failed conversion outputs based on verify_convert report
+  # Typical use: rerun only broken files after a failed verify_convert.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # Repair is driven by an existing verify_convert report.
+  # No corpus_dir here by design (root_dir + dataset model).
+  # allowed values: any valid report path
+  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
+
+index:
+  # ---------------------------------------------------------------------------
+  # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
+  root_dir: .
+
+  # Optional index output file.
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
+
+  # allowed values: true | false
+  overwrite: false
+
+verify_index:
+  # ---------------------------------------------------------------------------
+  # Verify index integrity and corpus coverage
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
+
 schema:
   # ---------------------------------------------------------------------------
   # Schema inspection and cache management (source/cache/parquet)
@@ -3336,32 +3460,6 @@ schema:
   # allowed values: true | false
   refresh_cache: false
 
-index:
-  # ---------------------------------------------------------------------------
-  # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
-
-  # Optional index output file.
-  # allowed values: any valid path
-  # index_file: ./parquet/all_id_idx.parquet
-
-  # allowed values: true | false
-  overwrite: false
-
 extract:
   # ---------------------------------------------------------------------------
   # Extract rows by OpenAlex IDs from CSV using per-dataset indexes
@@ -3384,112 +3482,6 @@ extract:
   # <base>_<dataset>.parquet
   # allowed values: any valid path
   # output: ./extract.parquet
-
-verify_index:
-  # ---------------------------------------------------------------------------
-  # Verify index integrity and corpus coverage
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid path
-  # index_file: ./parquet/all_id_idx.parquet
-
-repair_convert:
-  # ---------------------------------------------------------------------------
-  # Repair failed conversion outputs based on verify_convert report
-  # Typical use: rerun only broken files after a failed verify_convert.
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # Repair is driven by an existing verify_convert report.
-  # No corpus_dir here by design (root_dir + dataset model).
-  # allowed values: any valid report path
-  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
-
-download:
-  # ---------------------------------------------------------------------------
-  # Download snapshot from OpenAlex S3
-  # Uses AWS CLI wrapper behavior; defaults follow OpenAlex guidance.
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # progress: true
-  # state_flush_every: 25
-
-  # Defaults mirror OpenAlex recommendation.
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: any valid s3:// URI
-  s3_uri: s3://openalex
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid executable path
-  aws_bin: aws
-  # allowed values: any valid URL
-  # endpoint_url: https://s3.amazonaws.com
-  # allowed values: any valid AWS region string
-  # region: us-east-1
-  # allowed values: any configured AWS profile name
-  # profile_name: default
-  # allowed values: true | false
-  no_sign_request: true
-  # allowed values: true | false
-  signed: false
-  # allowed values: true | false
-  delete_files: true
-  # allowed values: true | false
-  no_delete: false
-
-  # Skip free disk space preflight check for download.
-  # allowed values: true | false
-  # skip_disk_check: false
-
-verify_download:
-  # ---------------------------------------------------------------------------
-  # Verify downloaded snapshot against remote manifest + gzip integrity
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # profile: balanced
-  # progress: true
-  # state_flush_every: 25
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: any valid s3:// URI
-  # s3_uri: s3://openalex
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid executable path
-  aws_bin: aws
-  # allowed values: true | false
-  no_sign_request: true
-  # allowed values: true | false
-  signed: false
-  # allowed values: true | false
-  check_extra: true
 
 report:
   # ---------------------------------------------------------------------------
@@ -3539,8 +3531,6 @@ progress:
   root_dir: .
   # allowed values: any command name
   # command: convert
-  # allowed values: all | <dataset-name>
-  dataset: all
   # allowed values: integer >= 1
   interval_sec: 2
   # allowed values: true | false
@@ -3560,8 +3550,6 @@ check:
 
   # allowed values: any valid path
   root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
   # allowed values: safe | balanced | fast
   profile: balanced
   # allowed values: true | false
@@ -4467,7 +4455,7 @@ fn latest_report_path_for_command(
 
 fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
     let resolved = resolve_all_settings(&args, cfg);
-    let snapshot_dir = resolved.root_dir.join("openalex-snapshot");
+    let snapshot_dir = resolved.root_dir.join("snapshot");
     let parquet_dir = resolved.root_dir.join("parquet");
     fs::create_dir_all(&parquet_dir)?;
 
@@ -8149,7 +8137,7 @@ fn resolve_report_path_for_root(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let norm = path_str.trim_start_matches("./");
-    if norm == "openalex-snapshot" || norm.starts_with("openalex-snapshot/") {
+    if norm == "snapshot" || norm.starts_with("snapshot/") {
         return root.join(norm);
     }
     if norm == "parquet" || norm.starts_with("parquet/") {

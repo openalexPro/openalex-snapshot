@@ -31,7 +31,7 @@ All AI-generated code was directed and tested by the project author.
 - `all` for config-driven orchestration
 
 Default root layout:
-- snapshot: `<root>/openalex-snapshot`
+- snapshot: `<root>/snapshot`
 - parquet: `<root>/parquet`
 - metadata: `<root>/.openalex-snapshot_metadata`
 
