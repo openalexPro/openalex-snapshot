@@ -8438,7 +8438,11 @@ fn download_manifests_dir(snapshot_dir: &Path) -> PathBuf {
 }
 
 fn download_reports_dir(snapshot_dir: &Path) -> PathBuf {
-    download_metadata_root(snapshot_dir).join("reports")
+    let root = snapshot_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join("openalex-snapshot_metadata").join("reports")
 }
 
 fn download_log_path(snapshot_dir: &Path) -> PathBuf {
@@ -8777,24 +8781,9 @@ fn parse_report_filename(name: &str) -> Option<(String, i64)> {
     Some((cmd, ts))
 }
 
-fn parquet_report_roots(parquet_dir: &Path) -> Vec<PathBuf> {
-    vec![global_reports_dir(parquet_dir)]
-}
-
-fn download_report_roots(snapshot_dir: &Path) -> Vec<PathBuf> {
+fn report_roots(snapshot_dir: &Path, _parquet_dir: &Path, _source: &ReportSource) -> Vec<PathBuf> {
+    // All commands (including download) write to the same global reports dir.
     vec![download_reports_dir(snapshot_dir)]
-}
-
-fn report_roots(snapshot_dir: &Path, parquet_dir: &Path, source: &ReportSource) -> Vec<PathBuf> {
-    match source {
-        ReportSource::Parquet => parquet_report_roots(parquet_dir),
-        ReportSource::Download => download_report_roots(snapshot_dir),
-        ReportSource::All => {
-            let mut v = parquet_report_roots(parquet_dir);
-            v.extend(download_report_roots(snapshot_dir));
-            v
-        }
-    }
 }
 
 fn load_report_records(

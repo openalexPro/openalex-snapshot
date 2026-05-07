@@ -594,8 +594,7 @@ fn csv_cache_precedence_over_json_cache() {
         .success());
 
     // Corrupt JSON cache on purpose; canonical CSV must still drive schema loading.
-    let json_cache =
-        root.join("openalex-snapshot_metadata/works/schemata/source_schema.json");
+    let json_cache = root.join("openalex-snapshot_metadata/works/schemata/source_schema.json");
     fs::write(&json_cache, "{ not valid json").unwrap();
 
     let out = Command::new(&exe)
@@ -692,8 +691,7 @@ fn legacy_schema_cache_is_auto_migrated() {
         .unwrap();
     assert!(out.status.success());
 
-    let new_csv =
-        root.join("openalex-snapshot_metadata/authors/schemata/unified_schema.csv");
+    let new_csv = root.join("openalex-snapshot_metadata/authors/schemata/unified_schema.csv");
     assert!(new_csv.exists());
     assert!(!legacy.exists());
 }
@@ -829,9 +827,7 @@ fn download_and_validate_download_with_mock_aws() {
         .unwrap();
     assert!(status.success());
     assert!(snapshot.join("data/authors/part_000/part1.gz").exists());
-    assert!(root
-        .join("openalex-snapshot_metadata/download/reports")
-        .exists());
+    assert!(root.join("openalex-snapshot_metadata/reports").exists());
 
     // Corrupt local gzip and verify strict validation fails.
     fs::write(snapshot.join("data/authors/part_000/part1.gz"), b"bad").unwrap();
