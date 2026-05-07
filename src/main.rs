@@ -491,6 +491,12 @@ struct AllArgs {
     retry: usize,
 
     #[arg(long, default_value_t = false)]
+    #[arg(
+        help = "Skip free disk space preflight checks in all pipeline stages (overrides config)"
+    )]
+    skip_disk_check: bool,
+
+    #[arg(long, default_value_t = false)]
     #[arg(help = "Explain resolved execution plan and exit")]
     explain: bool,
 }
@@ -1348,6 +1354,7 @@ struct AllConfig {
     enable_index: Option<bool>,
     enable_verify_index: Option<bool>,
     retry: Option<usize>,
+    skip_disk_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1380,6 +1387,7 @@ struct ConvertConfig {
     sample_size: Option<usize>,
     seed: Option<u64>,
     refresh_cache: Option<bool>,
+    skip_disk_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1477,6 +1485,7 @@ struct DownloadConfig {
     signed: Option<bool>,
     delete_files: Option<bool>,
     no_delete: Option<bool>,
+    skip_disk_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2092,6 +2101,11 @@ fn apply_convert_config(
                 args.refresh_cache = v;
             }
         }
+        if !cli_explicit(matches, "skip_disk_check") {
+            if let Some(v) = c.skip_disk_check {
+                args.skip_disk_check = v;
+            }
+        }
     }
 }
 
@@ -2622,6 +2636,11 @@ fn apply_download_config(
         if !cli_explicit(matches, "no_delete") {
             if let Some(v) = c.no_delete {
                 args.no_delete = v;
+            }
+        }
+        if !cli_explicit(matches, "skip_disk_check") {
+            if let Some(v) = c.skip_disk_check {
+                args.skip_disk_check = v;
             }
         }
     }
@@ -3209,6 +3228,11 @@ all:
   # allowed values: true | false
   enable_verify_index: true
 
+  # Skip disk space checks for all stages that support it (download, convert).
+  # Use when disk check estimates are too conservative for partial dataset runs.
+  # allowed values: true | false
+  # skip_disk_check: false
+
 convert:
   # ---------------------------------------------------------------------------
   # Convert snapshot JSON.GZ files into parquet (core data build step)
@@ -3245,6 +3269,11 @@ convert:
 
   # allowed values: integer >= 0
   seed: 42
+
+  # Skip free disk space preflight check for conversion.
+  # Useful when converting a single small dataset where the global estimate is too conservative.
+  # allowed values: true | false
+  # skip_disk_check: false
 
 verify_convert:
   # ---------------------------------------------------------------------------
@@ -3430,6 +3459,10 @@ download:
   delete_files: true
   # allowed values: true | false
   no_delete: false
+
+  # Skip free disk space preflight check for download.
+  # allowed values: true | false
+  # skip_disk_check: false
 
 verify_download:
   # ---------------------------------------------------------------------------
@@ -3872,7 +3905,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     status: "fail".to_string(),
                     details: msg.clone(),
                     recommendation: Some(
-                        "free disk space or use download --skip-disk-check".to_string(),
+                        "Free up disk space, or set skip_disk_check: true under download: in your config, or pass --skip-disk-check to the download/all command".to_string(),
                     ),
                 });
                 report.failures.push(FailureEntry {
@@ -3883,7 +3916,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     output_path: Some(args.shared.snapshot_dir.to_string_lossy().to_string()),
                     error_message: msg,
                     suggested_recovery: Some(
-                        "free disk space or use download --skip-disk-check".to_string(),
+                        "Free up disk space, or set skip_disk_check: true under download: in your config, or pass --skip-disk-check to the download/all command".to_string(),
                     ),
                 });
             }
@@ -3950,7 +3983,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                 status: "fail".to_string(),
                 details: msg.clone(),
                 recommendation: Some(
-                    "free disk space or use convert --skip-disk-check".to_string(),
+                    "Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string(),
                 ),
             });
             report.failures.push(FailureEntry {
@@ -3961,7 +3994,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                 output_path: Some(args.shared.parquet_dir.to_string_lossy().to_string()),
                 error_message: msg,
                 suggested_recovery: Some(
-                    "free disk space or use convert --skip-disk-check".to_string(),
+                    "Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string(),
                 ),
             });
         }
@@ -4359,10 +4392,13 @@ struct AllResolved {
     enable_repair_convert: bool,
     enable_index: bool,
     enable_verify_index: bool,
+    skip_disk_check: bool,
 }
 
 fn resolve_all_settings(args: &AllArgs, cfg: &AppConfig) -> AllResolved {
     let c = cfg.all.clone().unwrap_or_default();
+    // CLI --skip-disk-check wins; fall back to all.skip_disk_check in config
+    let skip_disk_check = args.skip_disk_check || c.skip_disk_check.unwrap_or(false);
     AllResolved {
         root_dir: args.root_dir.clone(),
         retry: c.retry.unwrap_or(args.retry),
@@ -4373,6 +4409,7 @@ fn resolve_all_settings(args: &AllArgs, cfg: &AppConfig) -> AllResolved {
         enable_repair_convert: c.enable_repair_convert.unwrap_or(true),
         enable_index: c.enable_index.unwrap_or(true),
         enable_verify_index: c.enable_verify_index.unwrap_or(true),
+        skip_disk_check,
     }
 }
 
@@ -4483,7 +4520,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             signed: false,
             delete_files: true,
             no_delete: false,
-            skip_disk_check: false,
+            skip_disk_check: resolved.skip_disk_check,
             progress: true,
             explain: false,
             state_flush_every: 25,
@@ -4491,6 +4528,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
         fill_download_dirs(&mut da);
         apply_download_config(&mut da, Some(cfg), None);
         fill_download_dirs(&mut da);
+        // CLI --skip-disk-check always wins over config
+        if resolved.skip_disk_check {
+            da.skip_disk_check = true;
+        }
         record_all_step(
             &mut report,
             &mut step_failed,
@@ -4564,7 +4605,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             input_files: Vec::new(),
             progress: true,
             seed: 42,
-            skip_disk_check: false,
+            skip_disk_check: resolved.skip_disk_check,
             disk_check_scope: DiskCheckScope::Dataset,
             refresh_cache: false,
             explain: false,
@@ -4573,6 +4614,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
         fill_shared_dirs(&mut ca.shared);
         apply_convert_config(&mut ca, Some(cfg), None);
         fill_shared_dirs(&mut ca.shared);
+        // CLI --skip-disk-check always wins over config
+        if resolved.skip_disk_check {
+            ca.skip_disk_check = true;
+        }
         record_all_step(
             &mut report,
             &mut step_failed,
@@ -5155,7 +5200,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                     bytes_to_gib(free_bytes),
                     bytes_to_gib(required_min_bytes)
                 ),
-                suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+                suggested_recovery: Some(
+                    "Free up disk space, or set skip_disk_check: true under convert: in your config file, or pass --skip-disk-check to the convert/all command.".to_string()
+                ),
             });
             report_finalize(&mut report);
             let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
@@ -5171,7 +5218,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                     .join(", ")
             );
             bail!(
-                "[convert] insufficient disk space at {}: available {} GiB, required at least {} GiB (or use --skip-disk-check)",
+                "[convert] Not enough disk space.\n  Location : {}\n  Available: {} GiB\n  Required : {} GiB (estimated 20% overhead over source size)\n\nTo proceed anyway, either:\n  - Set skip_disk_check: true under the convert: section in your config file\n  - Pass --skip-disk-check when running the convert or all command",
                 args.shared.parquet_dir.display(),
                 bytes_to_gib(free_bytes),
                 bytes_to_gib(required_min_bytes)
@@ -5365,7 +5412,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                                                 bytes_to_gib(free_bytes),
                                                 bytes_to_gib(required_bytes)
                                             ),
-                                            suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+                                            suggested_recovery: Some("Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string()),
                                         });
                                     }
                                 }
@@ -5378,7 +5425,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                                         source_path: Some(pair.input_gz.to_string_lossy().to_string()),
                                         output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
                                         error_message: format!("disk space check failed: {e:#}"),
-                                        suggested_recovery: Some("retry with --skip-disk-check".to_string()),
+                                        suggested_recovery: Some("Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string()),
                                     });
                                 }
                             }
@@ -7301,7 +7348,9 @@ fn run_download(args: DownloadArgs) -> Result<()> {
                     bytes_to_gib(free_bytes),
                     bytes_to_gib(required_bytes)
                 ),
-                suggested_recovery: Some("free disk space or use --skip-disk-check".to_string()),
+                suggested_recovery: Some(
+                    "Free up disk space, or set skip_disk_check: true under download: in your config file, or pass --skip-disk-check to the download/all command.".to_string()
+                ),
             });
             report_finalize(&mut report);
             let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
@@ -7317,10 +7366,11 @@ fn run_download(args: DownloadArgs) -> Result<()> {
                     .join(", ")
             );
             bail!(
-                "[download] insufficient disk space at {}: available {} GiB, required {} GiB (or use --skip-disk-check)",
+                "[download] Not enough disk space.\n  Location : {}\n  Available: {} GiB\n  Required : {} GiB (remote {} GiB + 10% buffer)\n\nTo proceed anyway, either:\n  - Set skip_disk_check: true under the download: section in your config file\n  - Pass --skip-disk-check when running the download or all command",
                 args.snapshot_dir.display(),
                 bytes_to_gib(free_bytes),
-                bytes_to_gib(required_bytes)
+                bytes_to_gib(required_bytes),
+                bytes_to_gib(remote_total_bytes)
             );
         }
     }
