@@ -4335,7 +4335,7 @@ fn select_progress_record(
         .filter(|r| r.report.finished_at_unix.is_none())
         .cloned()
         .collect();
-    active.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    active.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     if let Some(r) = active.into_iter().next() {
         return Some(r);
     }
@@ -4355,7 +4355,7 @@ fn select_progress_record(
             })
         })
         .collect();
-    recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    recent.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     recent.into_iter().next()
 }
 
@@ -5148,7 +5148,7 @@ fn run_prune_reports(args: PruneReportsArgs) -> Result<()> {
     let mut prune_names: BTreeSet<String> = BTreeSet::new();
     let mut kept = 0usize;
     for (_cmd, mut items) in by_command {
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        items.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         kept += items.len().min(keep_n);
         for rec in items.into_iter().skip(keep_n) {
             if let Some(name) = rec.path.file_name().and_then(|s| s.to_str()) {
