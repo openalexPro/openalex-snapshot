@@ -3180,7 +3180,7 @@ defaults:
   # allowed values: any valid path
   root_dir: .
 
-  # Default dataset scope where supported.
+  # Default dataset scope — set once here, applies to all commands.
   # Use "all" or a single dataset name (works, authors, ...).
   # allowed values: all | <dataset-name>
   dataset: all
@@ -3232,6 +3232,68 @@ all:
   # Use when disk check estimates are too conservative for partial dataset runs.
   # allowed values: true | false
   # skip_disk_check: false
+
+download:
+  # ---------------------------------------------------------------------------
+  # Download snapshot from OpenAlex S3
+  # Uses AWS CLI wrapper behavior; defaults follow OpenAlex guidance.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # progress: true
+  # state_flush_every: 25
+
+  # Defaults mirror OpenAlex recommendation.
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid s3:// URI
+  s3_uri: s3://openalex
+  # allowed values: any valid executable path
+  aws_bin: aws
+  # allowed values: any valid URL
+  # endpoint_url: https://s3.amazonaws.com
+  # allowed values: any valid AWS region string
+  # region: us-east-1
+  # allowed values: any configured AWS profile name
+  # profile_name: default
+  # allowed values: true | false
+  no_sign_request: true
+  # allowed values: true | false
+  signed: false
+  # allowed values: true | false
+  delete_files: true
+  # allowed values: true | false
+  no_delete: false
+
+  # Skip free disk space preflight check for download.
+  # allowed values: true | false
+  # skip_disk_check: false
+
+verify_download:
+  # ---------------------------------------------------------------------------
+  # Verify downloaded snapshot against remote manifest + gzip integrity
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # profile: balanced
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid s3:// URI
+  # s3_uri: s3://openalex
+  # allowed values: any valid executable path
+  aws_bin: aws
+  # allowed values: true | false
+  no_sign_request: true
+  # allowed values: true | false
+  signed: false
+  # allowed values: true | false
+  check_extra: true
 
 convert:
   # ---------------------------------------------------------------------------
@@ -3302,6 +3364,68 @@ verify_convert:
   # allowed values: integer >= 0
   seed: 42
 
+repair_convert:
+  # ---------------------------------------------------------------------------
+  # Repair failed conversion outputs based on verify_convert report
+  # Typical use: rerun only broken files after a failed verify_convert.
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # Repair is driven by an existing verify_convert report.
+  # No corpus_dir here by design (root_dir + dataset model).
+  # allowed values: any valid report path
+  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
+
+index:
+  # ---------------------------------------------------------------------------
+  # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+  # state_flush_every: 25
+
+  # allowed values: any valid path
+  root_dir: .
+
+  # Optional index output file.
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
+
+  # allowed values: true | false
+  overwrite: false
+
+verify_index:
+  # ---------------------------------------------------------------------------
+  # Verify index integrity and corpus coverage
+  # ---------------------------------------------------------------------------
+  # Shared-default overrides supported here (optional, uncomment to override defaults):
+  # root_dir: .
+  # dataset: all
+  # workers: 4
+  # duckdb_bin: /usr/local/bin/duckdb
+  # profile: balanced
+  # max_memory_mb: 8192
+  # progress: true
+
+  # allowed values: any valid path
+  root_dir: .
+  # allowed values: any valid path
+  # index_file: ./parquet/all_id_idx.parquet
+
 schema:
   # ---------------------------------------------------------------------------
   # Schema inspection and cache management (source/cache/parquet)
@@ -3336,32 +3460,6 @@ schema:
   # allowed values: true | false
   refresh_cache: false
 
-index:
-  # ---------------------------------------------------------------------------
-  # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
-
-  # Optional index output file.
-  # allowed values: any valid path
-  # index_file: ./parquet/all_id_idx.parquet
-
-  # allowed values: true | false
-  overwrite: false
-
 extract:
   # ---------------------------------------------------------------------------
   # Extract rows by OpenAlex IDs from CSV using per-dataset indexes
@@ -3384,112 +3482,6 @@ extract:
   # <base>_<dataset>.parquet
   # allowed values: any valid path
   # output: ./extract.parquet
-
-verify_index:
-  # ---------------------------------------------------------------------------
-  # Verify index integrity and corpus coverage
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid path
-  # index_file: ./parquet/all_id_idx.parquet
-
-repair_convert:
-  # ---------------------------------------------------------------------------
-  # Repair failed conversion outputs based on verify_convert report
-  # Typical use: rerun only broken files after a failed verify_convert.
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # Repair is driven by an existing verify_convert report.
-  # No corpus_dir here by design (root_dir + dataset model).
-  # allowed values: any valid report path
-  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
-
-download:
-  # ---------------------------------------------------------------------------
-  # Download snapshot from OpenAlex S3
-  # Uses AWS CLI wrapper behavior; defaults follow OpenAlex guidance.
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # progress: true
-  # state_flush_every: 25
-
-  # Defaults mirror OpenAlex recommendation.
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: any valid s3:// URI
-  s3_uri: s3://openalex
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid executable path
-  aws_bin: aws
-  # allowed values: any valid URL
-  # endpoint_url: https://s3.amazonaws.com
-  # allowed values: any valid AWS region string
-  # region: us-east-1
-  # allowed values: any configured AWS profile name
-  # profile_name: default
-  # allowed values: true | false
-  no_sign_request: true
-  # allowed values: true | false
-  signed: false
-  # allowed values: true | false
-  delete_files: true
-  # allowed values: true | false
-  no_delete: false
-
-  # Skip free disk space preflight check for download.
-  # allowed values: true | false
-  # skip_disk_check: false
-
-verify_download:
-  # ---------------------------------------------------------------------------
-  # Verify downloaded snapshot against remote manifest + gzip integrity
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # profile: balanced
-  # progress: true
-  # state_flush_every: 25
-
-  # allowed values: any valid path
-  root_dir: .
-  # allowed values: any valid s3:// URI
-  # s3_uri: s3://openalex
-  # allowed values: all | <dataset-name>
-  dataset: all
-  # allowed values: any valid executable path
-  aws_bin: aws
-  # allowed values: true | false
-  no_sign_request: true
-  # allowed values: true | false
-  signed: false
-  # allowed values: true | false
-  check_extra: true
 
 report:
   # ---------------------------------------------------------------------------
@@ -3539,8 +3531,6 @@ progress:
   root_dir: .
   # allowed values: any command name
   # command: convert
-  # allowed values: all | <dataset-name>
-  dataset: all
   # allowed values: integer >= 1
   interval_sec: 2
   # allowed values: true | false
@@ -3560,8 +3550,6 @@ check:
 
   # allowed values: any valid path
   root_dir: .
-  # allowed values: all | <dataset-name>
-  dataset: all
   # allowed values: safe | balanced | fast
   profile: balanced
   # allowed values: true | false
