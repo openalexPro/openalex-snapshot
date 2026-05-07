@@ -100,7 +100,7 @@ Examples:
   openalex-snapshot index --root-dir /data --dataset works --profile balanced
   openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
   openalex-snapshot verify_index --root-dir /data --dataset works
-  openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/openalex-snapshot_metadata/reports/verify_convert-123456.json
   openalex-snapshot report --root-dir /data --latest
   openalex-snapshot prune-reports --root-dir /data
   openalex-snapshot skills --root-dir /data
@@ -134,8 +134,7 @@ Selection rules:
 
 Output:
   - shared run report schema written to:
-    <root>/.openalex-snapshot_metadata/reports/repair_convert-<timestamp>.json
-    <root>/.openalex-snapshot_metadata/datasets/<dataset>/reports/repair_convert-<timestamp>.json
+    <root>/openalex-snapshot_metadata/reports/repair_convert-<timestamp>.json
   - non-zero exit if any repair/delete/re-verify failures remain
 ";
 
@@ -503,7 +502,7 @@ struct AllArgs {
 
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -564,7 +563,7 @@ enum ConfigTemplateMode {
 struct SharedArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -862,7 +861,7 @@ struct VerifySchemaArgs {
 struct IndexArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -991,7 +990,7 @@ struct RepairArgs {
 struct DownloadArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1061,7 +1060,7 @@ struct DownloadArgs {
 struct ValidateDownloadArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1133,7 +1132,7 @@ struct ValidateDownloadArgs {
 struct VerifyIndexArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1178,7 +1177,7 @@ struct VerifyIndexArgs {
 struct ReportArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1211,7 +1210,7 @@ struct ReportArgs {
 struct PruneReportsArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1244,7 +1243,7 @@ struct PruneReportsArgs {
 struct ProgressArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1285,7 +1284,7 @@ struct ProgressArgs {
 struct SkillsArgs {
     #[arg(long, default_value = ".")]
     #[arg(
-        help = "Root directory containing openalex-snapshot/, parquet/, and .openalex-snapshot_metadata/"
+        help = "Root directory containing openalex-snapshot/, parquet/, and openalex-snapshot_metadata/"
     )]
     root_dir: PathBuf,
 
@@ -1978,8 +1977,116 @@ fn fill_progress_dirs(args: &mut ProgressArgs) {
 }
 
 fn try_migrate_metadata_root(root_dir: &Path) {
-    let new_root = root_dir.join(".openalex-snapshot_metadata");
+    // Step 1: rename .openalex-snapshot_metadata -> openalex-snapshot_metadata
+    let old_dot = root_dir.join(".openalex-snapshot_metadata");
+    let new_root = root_dir.join("openalex-snapshot_metadata");
+    if old_dot.exists() && !new_root.exists() {
+        let _ = fs::rename(&old_dot, &new_root);
+    }
     let _ = fs::create_dir_all(&new_root);
+
+    // Step 2: migrate datasets/ subfolder -> directly under metadata root
+    let datasets_subdir = new_root.join("datasets");
+    if datasets_subdir.exists() {
+        if let Ok(entries) = fs::read_dir(&datasets_subdir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    let name = e.file_name();
+                    let target = new_root.join(&name);
+                    if !target.exists() {
+                        let _ = fs::rename(&p, &target);
+                    } else {
+                        let _ = merge_dir_with_fallback(&p, &target);
+                    }
+                }
+            }
+        }
+        // Remove empty datasets/ dir
+        let _ = fs::remove_dir(&datasets_subdir);
+    }
+
+    // Step 3: migrate old per-dataset logs/ -> per-step subdirs
+    if let Ok(entries) = fs::read_dir(&new_root) {
+        for e in entries.flatten() {
+            let ds_dir = e.path();
+            if !ds_dir.is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), "reports" | "archived" | "download") {
+                continue;
+            }
+            let logs_dir = ds_dir.join("logs");
+            if logs_dir.exists() {
+                // Move convert.log -> convert/convert.log
+                for (log_name, step_dir) in &[
+                    ("convert.log", "convert"),
+                    ("index.log", "index"),
+                    ("verify.log", "conversion-verify"),
+                    ("verify-index.log", "index-verify"),
+                    ("verify_convert.log", "conversion-verify"),
+                    ("verify_index.log", "index-verify"),
+                ] {
+                    let old_log = logs_dir.join(log_name);
+                    if old_log.exists() {
+                        let dest_dir = ds_dir.join(step_dir);
+                        let _ = fs::create_dir_all(&dest_dir);
+                        let _ = fs::rename(&old_log, dest_dir.join(log_name));
+                    }
+                }
+                // Remove empty logs/ dir
+                let _ = fs::remove_dir(&logs_dir);
+            }
+            // Migrate verify/ -> conversion-verify/
+            let old_verify = ds_dir.join("verify");
+            let new_conv_verify = ds_dir.join("conversion-verify");
+            if old_verify.exists() && !new_conv_verify.exists() {
+                let _ = fs::rename(&old_verify, &new_conv_verify);
+            } else if old_verify.exists() && new_conv_verify.exists() {
+                let _ = merge_dir_with_fallback(&old_verify, &new_conv_verify);
+            }
+            // Remove per-dataset reports/ dir (no longer used)
+            let ds_reports = ds_dir.join("reports");
+            if ds_reports.exists() {
+                // Move any report JSON files up to global reports dir
+                let global = new_root.join("reports");
+                let _ = fs::create_dir_all(&global);
+                if let Ok(rents) = fs::read_dir(&ds_reports) {
+                    for rent in rents.flatten() {
+                        let rp = rent.path();
+                        if rp.is_file() {
+                            let fname = rent.file_name();
+                            let dest = global.join(&fname);
+                            if !dest.exists() {
+                                let _ = fs::rename(&rp, &dest);
+                            }
+                        }
+                    }
+                }
+                let _ = fs::remove_dir(&ds_reports);
+            }
+        }
+    }
+
+    // Step 4: migrate old download logs/download.log -> download/download.log
+    let old_dl_log_dir = new_root.join("download").join("logs");
+    if old_dl_log_dir.exists() {
+        let dl_dir = new_root.join("download");
+        for log_name in &["download.log", "verify_download.log"] {
+            let old_log = old_dl_log_dir.join(log_name);
+            if old_log.exists() {
+                let dest = dl_dir.join("download.log");
+                if !dest.exists() {
+                    let _ = fs::rename(&old_log, &dest);
+                }
+            }
+        }
+        let _ = fs::remove_dir(&old_dl_log_dir);
+    }
+
+    // Step 5: migrate legacy very-old paths
     let parquet = root_dir.join("parquet");
     let snapshot = root_dir.join("openalex-snapshot");
     let old_global = parquet.join(".openalex_metadata");
@@ -1997,7 +2104,7 @@ fn try_migrate_metadata_root(root_dir: &Path) {
                             .trim_start_matches('.')
                             .trim_end_matches("_metadata")
                             .to_string();
-                        let target = new_root.join("datasets").join(&ds);
+                        let target = new_root.join(&ds);
                         let _ = merge_dir_with_fallback(&p, &target);
                     }
                 }
@@ -3190,9 +3297,9 @@ fn config_template_complete() -> String {
 # With root_dir="." the tool uses:
 #   ./snapshot                         (download/source snapshot)
 #   ./parquet                         (converted parquet outputs)
-#   ./.openalex-snapshot_metadata     (reports, logs, caches, manifests)
+#   ./openalex-snapshot_metadata      (reports, logs, caches, manifests)
 #
-# Metadata is centralized under .openalex-snapshot_metadata.
+# Metadata is centralized under openalex-snapshot_metadata.
 # Avoid editing metadata files manually unless debugging.
 #
 # ---------------------------------------------------------------------------
@@ -3430,7 +3537,7 @@ repair_convert:
   # Repair is driven by an existing verify_convert report.
   # No corpus_dir here by design (root_dir + dataset model).
   # allowed values: any valid report path
-  # from_verify_report: ./.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  # from_verify_report: ./openalex-snapshot_metadata/reports/verify_convert-123456.json
 
 index:
   # ---------------------------------------------------------------------------
@@ -3854,7 +3961,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    let meta_dir = args.shared.root_dir.join(".openalex-snapshot_metadata");
+    let meta_dir = args.shared.root_dir.join("openalex-snapshot_metadata");
     for (name, p) in [
         ("root_dir", args.shared.root_dir.clone()),
         ("snapshot_dir", args.shared.snapshot_dir.clone()),
@@ -4282,13 +4389,12 @@ fn log_paths_for_report(
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if report.command == "download" || report.command == "verify_download" {
-        out.push(download_logs_dir(snapshot_dir).join(format!("{}.log", report.command)));
+        out.push(download_log_path(snapshot_dir));
         return out;
     }
     for ds in &report.datasets {
-        out.push(
-            dataset_logs_dir(parquet_dir, &ds.dataset).join(format!("{}.log", report.command)),
-        );
+        let dir = dataset_log_dir_for_command(parquet_dir, &ds.dataset, &report.command);
+        out.push(dir.join(format!("{}.log", report.command)));
     }
     out
 }
@@ -4523,6 +4629,8 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
         );
         return Ok(());
     }
+    let _lock = acquire_lock(&parquet_dir, "all")?;
+    let _ = archive_completed_run(&parquet_dir, &snapshot_dir);
     let _ = cleanup_command_reports(&parquet_dir, "all");
 
     let mut report_args = BTreeMap::new();
@@ -4865,16 +4973,24 @@ fn run_progress(mut args: ProgressArgs) -> Result<()> {
     }
 
     loop {
-        let view = progress_snapshot(&args)?;
-        if args.json {
-            println!("{}", serde_json::to_string(&view)?);
-        } else {
-            print!("\x1B[2J\x1B[H");
-            print_progress_human(&view);
-            stdout().flush()?;
-        }
-        if view.finished_at_unix.is_some() {
-            return Ok(());
+        match progress_snapshot(&args) {
+            Ok(view) => {
+                if args.json {
+                    println!("{}", serde_json::to_string(&view)?);
+                } else {
+                    print!("\x1B[2J\x1B[H");
+                    print_progress_human(&view);
+                    stdout().flush()?;
+                }
+                if !args.watch {
+                    return Ok(());
+                }
+                match check_lock(&args.parquet_dir) {
+                    Some(_) => {} // pipeline running, keep watching
+                    None => return Ok(()),
+                }
+            }
+            Err(_) => return Ok(()),
         }
         thread::sleep(Duration::from_secs(args.interval_sec.max(1)));
     }
@@ -5208,6 +5324,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         explain_convert(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
+    let _lock = acquire_lock(&args.shared.parquet_dir, "convert")?;
+    let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
     let mut report_args = BTreeMap::new();
@@ -5645,6 +5763,9 @@ fn run_index(args: IndexArgs) -> Result<()> {
         let _ = cleanup_command_reports(&parquet_dir, "index");
         let _ = cleanup_command_dataset_logs(&parquet_dir, "index");
     }
+    let snapshot_dir = args.root_dir.join("snapshot");
+    let _lock = acquire_lock(&parquet_dir, "index")?;
+    let _ = archive_completed_run(&parquet_dir, &snapshot_dir);
     let mut report_args = BTreeMap::new();
     report_args.insert(
         "root_dir".to_string(),
@@ -6294,6 +6415,8 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
         explain_verify(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
+    let _lock = acquire_lock(&args.shared.parquet_dir, "verify")?;
+    let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "verify_convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "verify");
     let mut report_args = BTreeMap::new();
@@ -6970,6 +7093,8 @@ fn run_repair(args: RepairArgs) -> Result<()> {
         explain_repair(&args, &datasets, &duckdb_bin, &tuning)?;
         return Ok(());
     }
+    let _lock = acquire_lock(&args.shared.parquet_dir, "repair")?;
+    // Do NOT archive here — repair reads an existing verify report at a user-specified path
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "repair_convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "repair_convert");
 
@@ -7297,6 +7422,9 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         explain_download(&args)?;
         return Ok(());
     }
+    let parquet_dir = args.root_dir.join("parquet");
+    let _lock = acquire_lock(&parquet_dir, "download")?;
+    let _ = archive_completed_run(&parquet_dir, &args.snapshot_dir);
     let _ = cleanup_download_reports(&args.snapshot_dir, "download");
     let _ = cleanup_download_log(&args.snapshot_dir, "download");
     let mut report_args = BTreeMap::new();
@@ -8302,7 +8430,7 @@ fn download_metadata_root(snapshot_dir: &Path) -> PathBuf {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    root.join(".openalex-snapshot_metadata").join("download")
+    root.join("openalex-snapshot_metadata").join("download")
 }
 
 fn download_manifests_dir(snapshot_dir: &Path) -> PathBuf {
@@ -8310,17 +8438,22 @@ fn download_manifests_dir(snapshot_dir: &Path) -> PathBuf {
 }
 
 fn download_reports_dir(snapshot_dir: &Path) -> PathBuf {
-    download_metadata_root(snapshot_dir).join("reports")
+    let root = snapshot_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    root.join("openalex-snapshot_metadata").join("reports")
 }
 
-fn download_logs_dir(snapshot_dir: &Path) -> PathBuf {
-    download_metadata_root(snapshot_dir).join("logs")
+fn download_log_path(snapshot_dir: &Path) -> PathBuf {
+    download_metadata_root(snapshot_dir).join("download.log")
 }
 
 fn append_download_log(snapshot_dir: &Path, command: &str, msg: &str) -> Result<()> {
-    let dir = download_logs_dir(snapshot_dir);
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{command}.log"));
+    let path = download_log_path(snapshot_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -8357,8 +8490,8 @@ fn cleanup_download_reports(snapshot_dir: &Path, command: &str) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_download_log(snapshot_dir: &Path, command: &str) -> Result<()> {
-    let p = download_logs_dir(snapshot_dir).join(format!("{command}.log"));
+fn cleanup_download_log(snapshot_dir: &Path, _command: &str) -> Result<()> {
+    let p = download_log_path(snapshot_dir);
     if p.exists() {
         let _ = fs::remove_file(p);
     }
@@ -8648,44 +8781,9 @@ fn parse_report_filename(name: &str) -> Option<(String, i64)> {
     Some((cmd, ts))
 }
 
-fn parquet_report_roots(parquet_dir: &Path) -> Vec<PathBuf> {
-    let mut out = vec![global_reports_dir(parquet_dir)];
-    if let Ok(entries) = fs::read_dir(parquet_dir) {
-        let mut extra = Vec::new();
-        for e in entries.flatten() {
-            let p = e.path();
-            if !p.is_dir() {
-                continue;
-            }
-            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with('.')
-                    && name.ends_with("_metadata")
-                    && name != ".openalex_metadata"
-                {
-                    extra.push(p.join("reports"));
-                }
-            }
-        }
-        extra.sort();
-        out.extend(extra);
-    }
-    out
-}
-
-fn download_report_roots(snapshot_dir: &Path) -> Vec<PathBuf> {
+fn report_roots(snapshot_dir: &Path, _parquet_dir: &Path, _source: &ReportSource) -> Vec<PathBuf> {
+    // All commands (including download) write to the same global reports dir.
     vec![download_reports_dir(snapshot_dir)]
-}
-
-fn report_roots(snapshot_dir: &Path, parquet_dir: &Path, source: &ReportSource) -> Vec<PathBuf> {
-    match source {
-        ReportSource::Parquet => parquet_report_roots(parquet_dir),
-        ReportSource::Download => download_report_roots(snapshot_dir),
-        ReportSource::All => {
-            let mut v = parquet_report_roots(parquet_dir);
-            v.extend(download_report_roots(snapshot_dir));
-            v
-        }
-    }
 }
 
 fn load_report_records(
@@ -8737,14 +8835,16 @@ fn load_report_records(
     Ok(out)
 }
 
-fn dataset_metadata_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+fn metadata_root(parquet_dir: &Path) -> PathBuf {
     let root = parquet_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    root.join(".openalex-snapshot_metadata")
-        .join("datasets")
-        .join(dataset)
+    root.join("openalex-snapshot_metadata")
+}
+
+fn dataset_metadata_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    metadata_root(parquet_dir).join(dataset)
 }
 
 fn prev_dataset_metadata_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
@@ -8759,74 +8859,75 @@ fn dataset_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
     dataset_metadata_dir(parquet_dir, dataset).join("schemata")
 }
 
-fn dataset_logs_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
-    dataset_metadata_dir(parquet_dir, dataset).join("logs")
+fn dataset_convert_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("convert")
 }
 
-fn dataset_reports_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
-    dataset_metadata_dir(parquet_dir, dataset).join("reports")
+fn dataset_conversion_verify_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("conversion-verify")
 }
 
-fn datasets_metadata_root(parquet_dir: &Path) -> PathBuf {
-    let root = parquet_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join(".openalex-snapshot_metadata").join("datasets")
+fn dataset_index_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("index")
+}
+
+fn dataset_index_verify_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
+    dataset_metadata_dir(parquet_dir, dataset).join("index-verify")
+}
+
+fn archived_root_dir(parquet_dir: &Path) -> PathBuf {
+    metadata_root(parquet_dir).join("archived")
+}
+
+fn lock_file_path(parquet_dir: &Path) -> PathBuf {
+    metadata_root(parquet_dir).join("openalex-snapshot.lock")
 }
 
 fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
-    let root = parquet_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join(".openalex-snapshot_metadata").join("reports")
+    metadata_root(parquet_dir).join("reports")
 }
 
 fn cleanup_command_reports(parquet_dir: &Path, command: &str) -> Result<()> {
     let prefix = format!("{}-", sanitize_command_name(command));
-    let mut dirs = vec![global_reports_dir(parquet_dir)];
-    let datasets_root = datasets_metadata_root(parquet_dir);
-    if datasets_root.exists() {
-        for ent in fs::read_dir(&datasets_root)? {
-            let ent = ent?;
-            if ent.path().is_dir() {
-                dirs.push(ent.path().join("reports"));
-            }
-        }
+    let dir = global_reports_dir(parquet_dir);
+    if !dir.exists() {
+        return Ok(());
     }
-    for dir in dirs {
-        if !dir.exists() {
+    for ent in fs::read_dir(&dir)? {
+        let ent = ent?;
+        if !ent.path().is_file() {
             continue;
         }
-        for ent in fs::read_dir(&dir)? {
-            let ent = ent?;
-            if !ent.path().is_file() {
-                continue;
-            }
-            let name = ent.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(".json") {
-                let _ = fs::remove_file(ent.path());
-            }
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".json") {
+            let _ = fs::remove_file(ent.path());
         }
     }
     Ok(())
 }
 
 fn cleanup_command_dataset_logs(parquet_dir: &Path, log_command: &str) -> Result<()> {
-    let datasets_root = datasets_metadata_root(parquet_dir);
-    if !datasets_root.exists() {
+    let meta_root = metadata_root(parquet_dir);
+    if !meta_root.exists() {
         return Ok(());
     }
-    for ent in fs::read_dir(&datasets_root)? {
+    for ent in fs::read_dir(&meta_root)? {
         let ent = ent?;
         if !ent.path().is_dir() {
             continue;
         }
-        let p = ent.path().join("logs").join(format!("{log_command}.log"));
-        if p.exists() {
-            let _ = fs::remove_file(p);
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if matches!(name.as_ref(), "reports" | "archived" | "download") {
+            continue;
+        }
+        // Clean logs from step subdirectories
+        for step in &["convert", "conversion-verify", "index", "index-verify"] {
+            let p = ent.path().join(step).join(format!("{log_command}.log"));
+            if p.exists() {
+                let _ = fs::remove_file(p);
+            }
         }
     }
     Ok(())
@@ -8960,6 +9061,129 @@ fn now_unix_millis() -> u128 {
         .as_millis()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LockInfo {
+    pid: u32,
+    command: String,
+    started_at_unix: i64,
+}
+
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn acquire_lock(parquet_dir: &Path, command: &str) -> Result<LockGuard> {
+    let path = lock_file_path(parquet_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let info = LockInfo {
+        pid: std::process::id(),
+        command: command.to_string(),
+        started_at_unix: now_unix(),
+    };
+    let payload = serde_json::to_vec_pretty(&info)?;
+    write_json_atomic(&path, &payload)?;
+    Ok(LockGuard { path })
+}
+
+fn check_lock(parquet_dir: &Path) -> Option<LockInfo> {
+    let path = lock_file_path(parquet_dir);
+    let txt = fs::read_to_string(&path).ok()?;
+    let info: LockInfo = serde_json::from_str(&txt).ok()?;
+    if pid_is_alive(info.pid) {
+        Some(info)
+    } else {
+        None // stale lock
+    }
+}
+
+fn archive_completed_run(parquet_dir: &Path, snapshot_dir: &Path) -> Result<()> {
+    let meta_root = metadata_root(parquet_dir);
+    let archived_root = archived_root_dir(parquet_dir);
+    let timestamp = now_unix();
+    let archive_base = archived_root.join(timestamp.to_string());
+
+    let mut moved_any = false;
+
+    // Move finished reports
+    let reports_dir = global_reports_dir(parquet_dir);
+    if reports_dir.exists() {
+        for entry in fs::read_dir(&reports_dir)?.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let txt = fs::read_to_string(&p).unwrap_or_default();
+            if let Ok(r) = serde_json::from_str::<RunReport>(&txt) {
+                if r.finished_at_unix.is_some() {
+                    let dest = archive_base.join("reports").join(p.file_name().unwrap());
+                    fs::create_dir_all(dest.parent().unwrap())?;
+                    fs::rename(&p, &dest)?;
+                    moved_any = true;
+                }
+            }
+        }
+    }
+
+    // Move download log
+    let dl_log = download_log_path(snapshot_dir);
+    if dl_log.exists() {
+        let dest = archive_base.join("download").join("download.log");
+        fs::create_dir_all(dest.parent().unwrap())?;
+        fs::rename(&dl_log, &dest)?;
+        moved_any = true;
+    }
+
+    // Move dataset logs
+    if meta_root.exists() {
+        for entry in fs::read_dir(&meta_root)?.flatten() {
+            let ds_dir = entry.path();
+            if !ds_dir.is_dir() {
+                continue;
+            }
+            let name = ds_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if matches!(name, "reports" | "archived" | "download") {
+                continue;
+            }
+            for step in &["convert", "conversion-verify", "index", "index-verify"] {
+                let log_dir = ds_dir.join(step);
+                if log_dir.exists() {
+                    let dest = archive_base.join(name).join(step);
+                    fs::create_dir_all(&dest)?;
+                    for f in fs::read_dir(&log_dir)?.flatten() {
+                        let fp = f.path();
+                        if fp.is_file() {
+                            fs::rename(&fp, dest.join(fp.file_name().unwrap()))?;
+                            moved_any = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !moved_any && archive_base.exists() {
+        let _ = fs::remove_dir_all(&archive_base);
+    }
+
+    Ok(())
+}
+
 fn check_path_writable(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     let probe = path.join(".openalex-check-write-probe.tmp");
@@ -9076,7 +9300,7 @@ Run subcommands with correct root-dir model and predictable outputs.
 
 ## Done Criteria
 - command exits successfully,
-- expected report written to `.openalex-snapshot_metadata/reports/`.
+- expected report written to `openalex-snapshot_metadata/reports/`.
 "#
             .to_string(),
         ),
@@ -9240,8 +9464,20 @@ fn available_disk_bytes(path: &Path) -> Result<u64> {
     Ok(avail_kb.saturating_mul(1024))
 }
 
+fn dataset_log_dir_for_command(parquet_dir: &Path, dataset: &str, command: &str) -> PathBuf {
+    match command {
+        "convert" | "convert-preview" => dataset_convert_dir(parquet_dir, dataset),
+        "index" | "index-preview" => dataset_index_dir(parquet_dir, dataset),
+        "verify" | "verify_convert" | "verify-convert" => {
+            dataset_conversion_verify_dir(parquet_dir, dataset)
+        }
+        "verify-index" | "verify_index" => dataset_index_verify_dir(parquet_dir, dataset),
+        _ => dataset_convert_dir(parquet_dir, dataset),
+    }
+}
+
 fn append_dataset_log(parquet_dir: &Path, dataset: &str, command: &str, msg: &str) -> Result<()> {
-    let dir = dataset_logs_dir(parquet_dir, dataset);
+    let dir = dataset_log_dir_for_command(parquet_dir, dataset, command);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{command}.log"));
     let mut f = fs::OpenOptions::new()
@@ -9323,11 +9559,6 @@ fn write_run_reports(parquet_dir: &Path, report: &RunReport) -> Result<Vec<PathB
     write_json_atomic(&global, &payload)?;
     out_paths.push(global);
 
-    for ds in &report.datasets {
-        let p = dataset_reports_dir(parquet_dir, &ds.dataset).join(&fname);
-        write_json_atomic(&p, &payload)?;
-        out_paths.push(p);
-    }
     Ok(out_paths)
 }
 
@@ -9718,7 +9949,7 @@ fn prev_verify_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
 }
 
 fn verify_cache_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
-    dataset_metadata_dir(parquet_dir, dataset).join("verify")
+    dataset_conversion_verify_dir(parquet_dir, dataset)
 }
 
 fn migrate_legacy_verify_cache_if_needed(parquet_dir: &Path, dataset: &str) -> Result<()> {

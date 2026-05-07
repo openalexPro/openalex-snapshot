@@ -8,7 +8,7 @@ Re-convert files that failed in a prior `verify_convert` report.
 openalex-snapshot repair_convert \
   --root-dir /data \
   --dataset works \
-  --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
+  --from-verify-report /data/openalex-snapshot_metadata/reports/verify_convert-123456.json
 ```
 
 ## Behavior

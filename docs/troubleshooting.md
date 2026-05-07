@@ -19,13 +19,18 @@ Progress is item-based, not byte-based.
 
 Current canonical location is:
 
-- `.openalex-snapshot_metadata/`
+- `openalex-snapshot_metadata/`
 
 Expected structure:
 
-- `.openalex-snapshot_metadata/reports`
-- `.openalex-snapshot_metadata/download/{manifests,logs,reports}`
-- `.openalex-snapshot_metadata/datasets/<dataset>/{schemata,verify,logs,reports}`
+- `openalex-snapshot_metadata/reports/` — latest report per command
+- `openalex-snapshot_metadata/archived/<timestamp>/` — previous runs
+- `openalex-snapshot_metadata/download/download.log`
+- `openalex-snapshot_metadata/<dataset>/schemata/`
+- `openalex-snapshot_metadata/<dataset>/convert/`
+- `openalex-snapshot_metadata/<dataset>/conversion-verify/`
+- `openalex-snapshot_metadata/<dataset>/index/`
+- `openalex-snapshot_metadata/<dataset>/index-verify/`
 
 ## Schema errors around nested types
 
