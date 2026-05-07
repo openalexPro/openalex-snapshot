@@ -20,7 +20,7 @@ Tests in `tests/cli_smoke.rs` require `duckdb` to be available in `PATH` and wil
 The entire application is a single binary implemented in `src/main.rs` (~10,400 lines). There are no library crates or submodules.
 
 **Path model** — all runtime paths derive from a single `--root-dir`:
-- `<root>/openalex-snapshot/` — downloaded snapshot (JSON.GZ files)
+- `<root>/snapshot/` — downloaded snapshot (JSON.GZ files)
 - `<root>/parquet/` — converted parquet output
 - `<root>/.openalex-snapshot_metadata/` — reports, logs, schema caches, verify state
 

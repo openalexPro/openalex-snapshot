@@ -86,7 +86,7 @@ repair_convert (detailed):
 
 download/verify_download (detailed):
   - default sync command:
-    aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+    aws s3 sync --delete s3://openalex ./snapshot --no-sign-request
   - disk preflight:
     required free space = remote manifest size + 10%
   - strict validation compares remote manifest vs local files
@@ -143,7 +143,7 @@ const DOWNLOAD_LONG_ABOUT: &str = "\
 Download OpenAlex snapshot via AWS CLI sync.
 
 Defaults (zero-config):
-  aws s3 sync --delete s3://openalex ./openalex-snapshot --no-sign-request
+  aws s3 sync --delete s3://openalex ./snapshot --no-sign-request
   dataset scope: all
   disk preflight: remote manifest size + 10% free space required
 
@@ -313,7 +313,7 @@ const CONVERT_LONG_ABOUT: &str = "\
 Convert OpenAlex snapshot JSON.GZ files into parquet files.
 
 Behavior:
-1) Discovers source files under <root_dir>/openalex-snapshot/data/<dataset>/**/*.gz
+1) Discovers source files under <root_dir>/snapshot/data/<dataset>/**/*.gz
 2) Infers a unified schema per dataset (with cache + optional refresh)
 3) Converts each source file to one parquet file
 4) Preserves dataset-relative folder/file structure in output
@@ -1909,30 +1909,30 @@ fn load_optional_config(explicit: Option<&Path>) -> Result<Option<AppConfig>> {
 }
 
 fn fill_shared_dirs(shared: &mut SharedArgs) {
-    shared.snapshot_dir = shared.root_dir.join("openalex-snapshot");
+    shared.snapshot_dir = shared.root_dir.join("snapshot");
     shared.parquet_dir = shared.root_dir.join("parquet");
 }
 
 fn fill_download_dirs(args: &mut DownloadArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
 }
 
 fn fill_validate_download_dirs(args: &mut ValidateDownloadArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
 }
 
 fn fill_report_dirs(args: &mut ReportArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_prune_report_dirs(args: &mut PruneReportsArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_progress_dirs(args: &mut ProgressArgs) {
-    args.snapshot_dir = args.root_dir.join("openalex-snapshot");
+    args.snapshot_dir = args.root_dir.join("snapshot");
     args.parquet_dir = args.root_dir.join("parquet");
 }
 
@@ -3147,7 +3147,7 @@ fn config_template_complete() -> String {
 # 2) Path model (root-centric)
 # ---------------------------------------------------------------------------
 # With root_dir="." the tool uses:
-#   ./openalex-snapshot               (download/source snapshot)
+#   ./snapshot                         (download/source snapshot)
 #   ./parquet                         (converted parquet outputs)
 #   ./.openalex-snapshot_metadata     (reports, logs, caches, manifests)
 #
@@ -4467,7 +4467,7 @@ fn latest_report_path_for_command(
 
 fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
     let resolved = resolve_all_settings(&args, cfg);
-    let snapshot_dir = resolved.root_dir.join("openalex-snapshot");
+    let snapshot_dir = resolved.root_dir.join("snapshot");
     let parquet_dir = resolved.root_dir.join("parquet");
     fs::create_dir_all(&parquet_dir)?;
 
@@ -8149,7 +8149,7 @@ fn resolve_report_path_for_root(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let norm = path_str.trim_start_matches("./");
-    if norm == "openalex-snapshot" || norm.starts_with("openalex-snapshot/") {
+    if norm == "snapshot" || norm.starts_with("snapshot/") {
         return root.join(norm);
     }
     if norm == "parquet" || norm.starts_with("parquet/") {

@@ -6,7 +6,7 @@ This document captures project invariants and decision records so human and AI c
 
 - Binary name: `openalex-snapshot`.
 - Root-first path model:
-  - snapshot: `<root>/openalex-snapshot`
+  - snapshot: `<root>/snapshot`
   - parquet: `<root>/parquet`
   - metadata: `<root>/.openalex-snapshot_metadata`
 - Dataset metadata layout:
