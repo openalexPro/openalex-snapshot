@@ -520,6 +520,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#profile-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Profile / tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1057,6 +1068,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#profile-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Profile / tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1090,6 +1112,42 @@
 <li>verification is separate via <code>verify_convert</code></li>
 <li>supports selected-file conversion via repeated <code>--input-file</code></li>
 </ul>
+<h2 id="profile-tuning">Profile / tuning</h2>
+<p><code>--profile</code> controls the DuckDB memory budget per worker (derived from 80% of usable RAM,
+clamped to a range). Only <code>safe</code> also caps the worker count.</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>Workers cap</th>
+<th>Memory fraction</th>
+<th>Memory range</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>safe</code></td>
+<td>max 2</td>
+<td>15% of usable RAM</td>
+<td>1 – 8 GiB</td>
+</tr>
+<tr>
+<td><code>balanced</code></td>
+<td>(none)</td>
+<td>35% of usable RAM</td>
+<td>4 – 24 GiB</td>
+</tr>
+<tr>
+<td><code>fast</code></td>
+<td>(none)</td>
+<td>55% of usable RAM</td>
+<td>8 – 32 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>Fallback when RAM cannot be detected: <code>safe</code>=2 GiB, <code>balanced</code>=6 GiB, <code>fast</code>=12 GiB.</p>
+<p>Use <code>--max-memory-mb</code> to override the profile memory calculation entirely.
+Workers set via <code>--workers</code> or config are respected unless <code>safe</code> clamps them.</p>
 
 
 
