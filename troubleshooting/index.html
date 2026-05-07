@@ -1129,13 +1129,18 @@ Progress is item-based, not byte-based.</p>
 <h2 id="mixed-oldnew-metadata-folders">Mixed old/new metadata folders</h2>
 <p>Current canonical location is:</p>
 <ul>
-<li><code>.openalex-snapshot_metadata/</code></li>
+<li><code>openalex-snapshot_metadata/</code></li>
 </ul>
 <p>Expected structure:</p>
 <ul>
-<li><code>.openalex-snapshot_metadata/reports</code></li>
-<li><code>.openalex-snapshot_metadata/download/{manifests,logs,reports}</code></li>
-<li><code>.openalex-snapshot_metadata/datasets/&lt;dataset&gt;/{schemata,verify,logs,reports}</code></li>
+<li><code>openalex-snapshot_metadata/reports/</code> — latest report per command</li>
+<li><code>openalex-snapshot_metadata/archived/&lt;timestamp&gt;/</code> — previous runs</li>
+<li><code>openalex-snapshot_metadata/download/download.log</code></li>
+<li><code>openalex-snapshot_metadata/&lt;dataset&gt;/schemata/</code></li>
+<li><code>openalex-snapshot_metadata/&lt;dataset&gt;/convert/</code></li>
+<li><code>openalex-snapshot_metadata/&lt;dataset&gt;/conversion-verify/</code></li>
+<li><code>openalex-snapshot_metadata/&lt;dataset&gt;/index/</code></li>
+<li><code>openalex-snapshot_metadata/&lt;dataset&gt;/index-verify/</code></li>
 </ul>
 <h2 id="schema-errors-around-nested-types">Schema errors around nested types</h2>
 <p>Ensure canonical schema cache exists:</p>

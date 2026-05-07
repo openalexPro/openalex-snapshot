@@ -1075,15 +1075,27 @@
 
 
 <h1 id="command-report">Command: report</h1>
-<p>Show run reports written under <code>.openalex-snapshot_metadata</code>.</p>
+<p>Show run reports written under <code>openalex-snapshot_metadata</code>.</p>
 <h2 id="usage">Usage</h2>
-<pre><code class="language-bash">openalex-snapshot report --root-dir /data --latest
+<pre><code class="language-bash"># show current run reports
+openalex-snapshot report --root-dir /data --latest
+
+# show full JSON details
 openalex-snapshot report --root-dir /data --latest --full
+
+# list available archived run timestamps
+openalex-snapshot report --root-dir /data --list
+
+# show a specific archived run
+openalex-snapshot report --root-dir /data --archived 1715000000 --latest
 </code></pre>
 <h2 id="notes">Notes</h2>
 <ul>
-<li>use <code>--command &lt;name&gt;</code> to filter (for example <code>verify_convert</code>, <code>repair_convert</code>)</li>
-<li>use <code>--full</code> to print full JSON details</li>
+<li>default view shows <code>openalex-snapshot_metadata/reports/</code> (current run)</li>
+<li><code>--list</code> shows timestamps available under <code>openalex-snapshot_metadata/archived/</code></li>
+<li><code>--archived &lt;timestamp&gt;</code> reads <code>openalex-snapshot_metadata/archived/&lt;timestamp&gt;/reports/</code></li>
+<li><code>--command &lt;name&gt;</code> filters by command (e.g. <code>verify_convert</code>, <code>repair_convert</code>)</li>
+<li><code>--full</code> prints full JSON details</li>
 </ul>
 
 
