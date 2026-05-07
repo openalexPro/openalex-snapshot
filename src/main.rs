@@ -651,7 +651,9 @@ struct ConvertArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -719,7 +721,9 @@ struct VerifyArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -765,7 +769,9 @@ struct SchemaArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -815,7 +821,9 @@ struct VerifySchemaArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -871,7 +879,9 @@ struct IndexArgs {
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -915,7 +925,9 @@ struct ExtractArgs {
     output: PathBuf,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -949,7 +961,9 @@ struct RepairArgs {
     from_verify_report: PathBuf,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -1091,7 +1105,9 @@ struct ValidateDownloadArgs {
     check_extra: bool,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long, default_value_t = 4)]
@@ -1134,7 +1150,9 @@ struct VerifyIndexArgs {
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -1320,7 +1338,9 @@ struct CheckArgs {
     signed: bool,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
