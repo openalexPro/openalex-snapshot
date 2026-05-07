@@ -4,7 +4,10 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-07
+
 ### Added
+
 - `skills` subcommand to bootstrap a project-local `skills/` folder for AI agents.
 - `check` subcommand for dependency/path/disk/memory preflight checks.
 - `extract` subcommand to extract records by OpenAlex IDs using per-dataset parquet indexes.
