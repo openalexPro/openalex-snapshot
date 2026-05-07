@@ -120,7 +120,7 @@ fn convert_and_verify_structure() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
 
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
 
     let ds = snapshot.join("data/authors/part_000");
@@ -173,7 +173,7 @@ fn schema_arrow_r_output() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
 
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let _parquet = root.join("parquet");
 
     let ds = snapshot.join("data/works/part_000");
@@ -230,7 +230,7 @@ fn index_builds_expected_columns() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
 
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
     let ds = snapshot.join("data/works/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -297,7 +297,7 @@ fn index_skip_and_overwrite() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
 
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -371,7 +371,7 @@ fn index_all_builds_multiple_datasets() {
 
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
 
     let works = snapshot.join("data/works/part_000");
@@ -424,7 +424,7 @@ fn index_cli_dataset_not_overridden_by_config() {
 
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
 
     let works = snapshot.join("data/works/part_000");
@@ -535,7 +535,7 @@ fn canonical_unified_schema_csv_written() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let _parquet = root.join("parquet");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -571,7 +571,7 @@ fn csv_cache_precedence_over_json_cache() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let _parquet = root.join("parquet");
     let ds = snapshot.join("data/works/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -622,7 +622,7 @@ fn convert_only_selected_input_file() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -663,7 +663,7 @@ fn legacy_schema_cache_is_auto_migrated() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
     fs::create_dir_all(snapshot.join("data/authors/part_000")).unwrap();
 
@@ -705,7 +705,7 @@ fn repair_reconverts_failed_verify_files() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let parquet = root.join("parquet");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
@@ -801,7 +801,7 @@ fn download_and_validate_download_with_mock_aws() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let s3 = root.join("mock-s3");
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     fs::create_dir_all(s3.join("data/authors/part_000")).unwrap();
     write_gz_ndjson(
         &s3.join("data/authors/part_000/part1.gz"),
@@ -1128,7 +1128,7 @@ fn all_pipeline_runs_without_download_when_disabled() {
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
-    let snapshot = root.join("openalex-snapshot");
+    let snapshot = root.join("snapshot");
     let ds = snapshot.join("data/authors/part_000");
     fs::create_dir_all(&ds).unwrap();
     write_gz_ndjson(

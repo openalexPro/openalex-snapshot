@@ -307,6 +307,18 @@ Defaults:
   index path: <root_dir>/parquet/<dataset>_id_idx.parquet
   existing index: skip (use --overwrite to rebuild)
   --index-file is ignored with --dataset all
+
+Profile / tuning:
+  Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
+  clamped to a min/max). Workers is only capped by 'safe'.
+
+  profile    workers cap   memory fraction   memory range
+  safe       max 2         15% of usable     1 – 8 GiB
+  balanced   (none)        35% of usable     4 – 24 GiB
+  fast       (none)        55% of usable     8 – 32 GiB
+
+  Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
+  Set --max-memory-mb to override the profile memory calculation entirely.
 ";
 
 const CONVERT_LONG_ABOUT: &str = "\
@@ -329,8 +341,17 @@ Defaults:
   memory: auto-detected from system RAM unless --max-memory-mb is provided
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
-Tuning:
-  profile, workers, and max-memory-mb share semantics with index
+Profile / tuning:
+  Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
+  clamped to a min/max). Workers is only capped by 'safe'.
+
+  profile    workers cap   memory fraction   memory range
+  safe       max 2         15% of usable     1 – 8 GiB
+  balanced   (none)        35% of usable     4 – 24 GiB
+  fast       (none)        55% of usable     8 – 32 GiB
+
+  Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
+  Set --max-memory-mb to override the profile memory calculation entirely.
 ";
 
 const VERIFY_LONG_ABOUT: &str = "\
@@ -630,7 +651,9 @@ struct ConvertArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -698,7 +721,9 @@ struct VerifyArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -744,7 +769,9 @@ struct SchemaArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -794,7 +821,9 @@ struct VerifySchemaArgs {
     shared: SharedArgs,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as schema)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -850,7 +879,9 @@ struct IndexArgs {
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as convert)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -894,7 +925,9 @@ struct ExtractArgs {
     output: PathBuf,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as convert/index)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -928,7 +961,9 @@ struct RepairArgs {
     from_verify_report: PathBuf,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile (same semantics as convert/verify/index)")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -1070,7 +1105,9 @@ struct ValidateDownloadArgs {
     check_extra: bool,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile for local integrity checks")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long, default_value_t = 4)]
@@ -1113,7 +1150,9 @@ struct VerifyIndexArgs {
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -1299,7 +1338,9 @@ struct CheckArgs {
     signed: bool,
 
     #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(help = "Performance/memory profile")]
+    #[arg(
+        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+    )]
     profile: Profile,
 
     #[arg(long)]
@@ -3190,6 +3231,13 @@ defaults:
   workers: 4
   # allowed values: any valid executable path
   # duckdb_bin: /usr/local/bin/duckdb
+  # Performance/memory profile (safe | balanced | fast).
+  # Controls DuckDB memory budget per worker (80% of RAM × fraction, clamped):
+  #   safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
+  #   balanced — workers uncapped,    memory 35% of usable RAM (4–24 GiB)
+  #   fast     — workers uncapped,    memory 55% of usable RAM (8–32 GiB)
+  # Fallback when RAM is undetectable: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
+  # Override memory independently with max_memory_mb.
   # allowed values: safe | balanced | fast
   profile: balanced
   # allowed values: integer >= 1
@@ -4287,7 +4335,7 @@ fn select_progress_record(
         .filter(|r| r.report.finished_at_unix.is_none())
         .cloned()
         .collect();
-    active.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    active.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     if let Some(r) = active.into_iter().next() {
         return Some(r);
     }
@@ -4307,7 +4355,7 @@ fn select_progress_record(
             })
         })
         .collect();
-    recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    recent.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     recent.into_iter().next()
 }
 
@@ -5100,7 +5148,7 @@ fn run_prune_reports(args: PruneReportsArgs) -> Result<()> {
     let mut prune_names: BTreeSet<String> = BTreeSet::new();
     let mut kept = 0usize;
     for (_cmd, mut items) in by_command {
-        items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        items.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         kept += items.len().min(keep_n);
         for rec in items.into_iter().skip(keep_n) {
             if let Some(name) = rec.path.file_name().and_then(|s| s.to_str()) {
