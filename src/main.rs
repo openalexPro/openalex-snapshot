@@ -956,8 +956,10 @@ struct RepairArgs {
     shared: SharedArgs,
 
     #[arg(long)]
-    #[arg(help = "Path to verify report JSON (RunReport format)")]
-    from_verify_report: PathBuf,
+    #[arg(
+        help = "Path to verify_convert report JSON; if omitted, the latest verify_convert report under <root>/openalex-snapshot_metadata/reports/ is used automatically"
+    )]
+    from_verify_report: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value = "balanced")]
     #[arg(
@@ -2690,7 +2692,7 @@ fn apply_repair_config(
         }
         if !cli_explicit(matches, "from_verify_report") {
             if let Some(v) = &c.from_verify_report {
-                args.from_verify_report = v.clone();
+                args.from_verify_report = Some(v.clone());
             }
         }
     }
@@ -5024,7 +5026,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                     workers: 4,
                     duckdb_bin: None,
                 },
-                from_verify_report: report_path.clone(),
+                from_verify_report: Some(report_path.clone()),
                 profile: Profile::Balanced,
                 max_memory_mb: None,
                 progress: true,
@@ -5035,7 +5037,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             apply_repair_config(&mut ra, Some(cfg), None);
             fill_shared_dirs(&mut ra.shared);
             // Always repair from loop-selected verify report.
-            ra.from_verify_report = report_path;
+            ra.from_verify_report = Some(report_path);
             record_all_step(
                 &mut report,
                 &mut step_failed,
@@ -7237,20 +7239,21 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
 
 fn explain_repair(
     args: &RepairArgs,
+    verify_report_path: &Path,
     datasets: &[String],
     duckdb_bin: &Path,
     tuning: &Tuning,
 ) -> Result<()> {
-    let txt = fs::read_to_string(&args.from_verify_report).with_context(|| {
+    let txt = fs::read_to_string(verify_report_path).with_context(|| {
         format!(
             "failed to read verify report {}",
-            args.from_verify_report.display()
+            verify_report_path.display()
         )
     })?;
     let verify_report: RunReport = serde_json::from_str(&txt).with_context(|| {
         format!(
             "failed to parse verify report {}",
-            args.from_verify_report.display()
+            verify_report_path.display()
         )
     })?;
     let targets = collect_repair_targets(
@@ -7263,7 +7266,7 @@ fn explain_repair(
     println!("duckdb_bin: {}", duckdb_bin.display());
     println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
     println!("parquet_dir: {}", args.shared.parquet_dir.display());
-    println!("from_verify_report: {}", args.from_verify_report.display());
+    println!("from_verify_report: {}", verify_report_path.display());
     println!("datasets filter: {}", datasets.join(", "));
     println!("workers: {}", tuning.workers);
     println!("memory_mb: {:?}", tuning.memory_mb);
@@ -7271,6 +7274,18 @@ fn explain_repair(
     println!("selected_files: {}", targets.len());
     println!("post_verify: targeted file-level verify enabled");
     Ok(())
+}
+
+fn resolve_verify_report_path(args: &RepairArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.from_verify_report {
+        return Ok(p.clone());
+    }
+    latest_verify_convert_report(&args.shared.parquet_dir).ok_or_else(|| {
+        anyhow!(
+            "no verify_convert report found under {}; run verify_convert first or pass --from-verify-report",
+            global_reports_dir(&args.shared.parquet_dir).display()
+        )
+    })
 }
 
 fn run_repair(args: RepairArgs) -> Result<()> {
@@ -7283,13 +7298,14 @@ fn run_repair(args: RepairArgs) -> Result<()> {
         args.shared.workers,
         args.max_memory_mb,
     );
+    let verify_report_path = resolve_verify_report_path(&args)?;
 
     if args.explain {
-        explain_repair(&args, &datasets, &duckdb_bin, &tuning)?;
+        explain_repair(&args, &verify_report_path, &datasets, &duckdb_bin, &tuning)?;
         return Ok(());
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "repair")?;
-    // Do NOT archive here — repair reads an existing verify report at a user-specified path
+    // Do NOT archive here — repair reads an existing verify report
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "repair_convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "repair_convert");
 
@@ -7297,7 +7313,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
     report_args.insert(
         "from_verify_report".to_string(),
-        args.from_verify_report.to_string_lossy().to_string(),
+        verify_report_path.to_string_lossy().to_string(),
     );
     report_args.insert("workers".to_string(), tuning.workers.to_string());
     report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
@@ -7308,18 +7324,18 @@ fn run_repair(args: RepairArgs) -> Result<()> {
     let mut report = report_new("repair_convert", report_args);
     let flush_every = args.state_flush_every.max(1);
 
-    let verify_report: RunReport = match fs::read_to_string(&args.from_verify_report)
+    let verify_report: RunReport = match fs::read_to_string(&verify_report_path)
         .with_context(|| {
             format!(
                 "failed to read verify report {}",
-                args.from_verify_report.display()
+                verify_report_path.display()
             )
         })
         .and_then(|txt| {
             serde_json::from_str(&txt).with_context(|| {
                 format!(
                     "failed to parse verify report {}",
-                    args.from_verify_report.display()
+                    verify_report_path.display()
                 )
             })
         }) {
@@ -7329,7 +7345,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
                 dataset: args.shared.dataset.clone(),
                 phase: "repair_report_parse".to_string(),
                 rel_path: None,
-                source_path: Some(args.from_verify_report.to_string_lossy().to_string()),
+                source_path: Some(verify_report_path.to_string_lossy().to_string()),
                 output_path: None,
                 error_message: format!("{e:#}"),
                 suggested_recovery: Some("provide a valid verify report JSON".to_string()),
@@ -9080,6 +9096,25 @@ fn lock_file_path(parquet_dir: &Path) -> PathBuf {
 
 fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
     metadata_root(parquet_dir).join("reports")
+}
+
+fn latest_verify_convert_report(parquet_dir: &Path) -> Option<PathBuf> {
+    let dir = global_reports_dir(parquet_dir);
+    let prefix = format!("{}-", sanitize_command_name("verify_convert"));
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().last()
 }
 
 fn cleanup_command_reports(parquet_dir: &Path, command: &str) -> Result<()> {
