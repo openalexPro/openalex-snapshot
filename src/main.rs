@@ -336,18 +336,23 @@ Output:
   optional: limit conversion to selected files via --input-file
 
 Defaults:
-  profile: balanced
+  profile: auto
   memory: auto-detected from system RAM unless --max-memory-mb is provided
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
 Profile / tuning:
   Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
-  clamped to a min/max). Workers is only capped by 'safe'.
+  clamped to a min/max). Workers is only capped by 'safe' and 'auto'.
 
-  profile    workers cap   memory fraction   memory range
+  profile    workers cap   memory fraction   memory range   notes
+  auto       —             35% balanced /    4–24 GiB /     small files: parallel balanced
+                           75% of RAM        up to 75% RAM  large files: serial, max memory
   safe       max 2         15% of usable     1 – 8 GiB
   balanced   (none)        35% of usable     4 – 24 GiB
   fast       (none)        55% of usable     8 – 32 GiB
+
+  Auto mode threshold: a file is 'large' when its estimated peak memory exceeds
+  the balanced per-worker budget (gz_size × 20). Threshold scales with system RAM.
 
   Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
   Set --max-memory-mb to override the profile memory calculation entirely.
@@ -589,6 +594,7 @@ struct SharedArgs {
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Profile {
+    Auto,
     Safe,
     Balanced,
     Fast,
@@ -649,9 +655,9 @@ struct ConvertArgs {
     #[command(flatten)]
     shared: SharedArgs,
 
-    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(long, value_enum, default_value = "auto")]
     #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
     )]
     profile: Profile,
 
@@ -961,9 +967,9 @@ struct RepairArgs {
     )]
     from_verify_report: Option<PathBuf>,
 
-    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(long, value_enum, default_value = "auto")]
     #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
     )]
     profile: Profile,
 
@@ -1637,6 +1643,7 @@ struct FilePair {
     input_gz: PathBuf,
     output_parquet: PathBuf,
     rel: PathBuf,
+    gz_size_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3335,20 +3342,20 @@ defaults:
   # allowed values: all | <dataset-name>
   dataset: all
 
-  # Shared runtime defaults.
-  # allowed values: integer >= 1
-  workers: 4
+  # Shared runtime defaults — leave commented to use built-in auto mode.
   # allowed values: any valid executable path
   # duckdb_bin: /usr/local/bin/duckdb
-  # Performance/memory profile (safe | balanced | fast).
-  # Controls DuckDB memory budget per worker (80% of RAM × fraction, clamped):
-  #   safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
-  #   balanced — workers uncapped,    memory 35% of usable RAM (4–24 GiB)
-  #   fast     — workers uncapped,    memory 55% of usable RAM (8–32 GiB)
+  # Profile controls DuckDB memory budget and worker count.
+  # auto (default) — two-tier: small files run in parallel (balanced), large files
+  #   run serially with maximised memory. Threshold derived from system RAM.
+  # safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
+  # balanced — workers uncapped,    memory 35% of usable RAM (4–24 GiB)
+  # fast     — workers uncapped,    memory 55% of usable RAM (8–32 GiB)
   # Fallback when RAM is undetectable: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
-  # Override memory independently with max_memory_mb.
-  # allowed values: safe | balanced | fast
-  profile: balanced
+  # allowed values: auto | safe | balanced | fast
+  # profile: auto
+  # allowed values: integer >= 1
+  # workers: 4
   # allowed values: integer >= 1
   # max_memory_mb: 8192
   # allowed values: true | false
@@ -5512,11 +5519,34 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
 
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    // For auto profile, compute balanced tuning for the small-file parallel pass
+    // and a maximised-memory serial tuning for large files.
+    let is_auto = args.profile == Profile::Auto;
+    let total_mb = detect_total_memory_mb();
+    let (tuning, large_tuning) = if is_auto {
+        let balanced = resolve_tuning_with_total(
+            Profile::Balanced,
+            args.shared.workers,
+            args.max_memory_mb,
+            total_mb,
+        );
+        let safe_mem = auto_profile_memory_mb(Profile::Safe, total_mb);
+        let large_mem = auto_large_file_memory_mb(total_mb.unwrap_or(0), safe_mem);
+        let large = Tuning {
+            workers: 1,
+            memory_mb: Some(large_mem),
+        };
+        (balanced, Some(large))
+    } else {
+        (
+            resolve_tuning(
+                args.profile.clone(),
+                args.shared.workers,
+                args.max_memory_mb,
+            ),
+            None,
+        )
+    };
     if args.explain {
         explain_convert(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
@@ -5632,7 +5662,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         }
         let pairs_len = pairs.len();
 
-        let todo: Vec<FilePair> = pairs
+        let mut todo: Vec<FilePair> = pairs
             .into_iter()
             .filter(|p| !p.output_parquet.exists())
             .collect();
@@ -5649,17 +5679,56 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             report.datasets.push(ds);
             continue;
         }
-        ds.items_scanned = todo.len() as u64;
+
+        // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
+        let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
+            let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
+            let threshold = auto_threshold_bytes(balanced_mem_mb, 8.0);
+            let mut large: Vec<FilePair> = todo
+                .iter()
+                .filter(|p| p.gz_size_bytes >= threshold)
+                .cloned()
+                .collect();
+            large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
+            todo.retain(|p| p.gz_size_bytes < threshold);
+            eprintln!(
+                "[convert] auto dataset={dataset} small={} large={} threshold={}MB balanced_mem={}MB large_mem={}MB",
+                todo.len(),
+                large.len(),
+                threshold / (1024 * 1024),
+                balanced_mem_mb,
+                lt.memory_mb.unwrap_or(0),
+            );
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                &format!(
+                    "auto small={} large={} threshold_mb={}",
+                    todo.len(),
+                    large.len(),
+                    threshold / (1024 * 1024)
+                ),
+            );
+            large
+        } else {
+            Vec::new()
+        };
+
+        ds.items_scanned = (todo.len() + large_todo.len()) as u64;
 
         eprintln!(
             "[convert] dataset={dataset} todo_files={} (starting schema inference)",
-            todo.len()
+            todo.len() + large_todo.len()
         );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
             "convert",
-            &format!("todo_files={} schema_inference_start", todo.len()),
+            &format!(
+                "todo_files={} schema_inference_start",
+                todo.len() + large_todo.len()
+            ),
         );
         fs::create_dir_all(dataset_cache_dir(&args.shared.parquet_dir, dataset))?;
         let schema = match load_or_infer_source_schema(
@@ -5842,6 +5911,79 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             "convert:{dataset} done in {:.1}s",
             start.elapsed().as_secs_f64()
         ));
+
+        // Auto profile: serial pass for large files with maximised memory.
+        if !large_todo.is_empty() {
+            let lt = large_tuning.as_ref().expect("large_tuning set for auto");
+            eprintln!(
+                "[convert] auto dataset={dataset} large-file pass: {} files workers=1 memory_mb={:?}",
+                large_todo.len(),
+                lt.memory_mb,
+            );
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                &format!(
+                    "auto large_pass start count={} memory_mb={:?}",
+                    large_todo.len(),
+                    lt.memory_mb
+                ),
+            );
+            let pb_large = make_progress_bar(
+                args.progress,
+                large_todo.len() as u64,
+                &format!("convert:{dataset}(large)"),
+            );
+            for pair in &large_todo {
+                let _ = fs::remove_file(&pair.output_parquet); // remove partial output
+                match convert_one(
+                    &duckdb_bin,
+                    pair,
+                    &schema_arc,
+                    &compression,
+                    row_group_rows,
+                    lt.memory_mb,
+                    &extra_json_options,
+                ) {
+                    Ok(()) => {
+                        try_log_dataset(
+                            &args.shared.parquet_dir,
+                            dataset,
+                            "convert",
+                            &format!("large file converted {}", pair.rel.to_string_lossy()),
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        ds.failed += 1;
+                        report.failures.push(FailureEntry {
+                            dataset: dataset.clone(),
+                            phase: "convert_file".to_string(),
+                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                            error_message: msg,
+                            suggested_recovery: Some(format!(
+                                "openalex-snapshot convert --root-dir {} --dataset {} --profile safe --workers 1 --input-file {}",
+                                args.shared.root_dir.display(),
+                                dataset,
+                                pair.input_gz.display(),
+                            )),
+                        });
+                    }
+                }
+                pb_large.inc(1);
+            }
+            pb_large.finish_with_message(format!("convert:{dataset}(large) done"));
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                "auto large_pass complete",
+            );
+        }
+
         eprintln!("[convert] dataset={dataset} conversion stage complete");
         try_log_dataset(
             &args.shared.parquet_dir,
@@ -7523,6 +7665,9 @@ fn run_repair(args: RepairArgs) -> Result<()> {
                             input_gz: t.source_path.clone(),
                             output_parquet: t.output_path.clone(),
                             rel: t.rel.clone(),
+                            gz_size_bytes: fs::metadata(&t.source_path)
+                                .map(|m| m.len())
+                                .unwrap_or(0),
                         };
                         if let Err(e) = convert_one(
                             &duckdb_arc,
@@ -8250,6 +8395,11 @@ fn resolve_tuning_with_total(
         memory_mb: max_memory_mb,
     };
     match profile {
+        Profile::Auto | Profile::Balanced => {
+            if out.memory_mb.is_none() {
+                out.memory_mb = Some(auto_profile_memory_mb(Profile::Balanced, total_mb));
+            }
+        }
         Profile::Safe => {
             out.workers = out.workers.clamp(1, 2);
             if out.memory_mb.is_none() {
@@ -8258,11 +8408,6 @@ fn resolve_tuning_with_total(
                     mb = mb.max(auto_profile_single_worker_safe_memory_mb(total_mb));
                 }
                 out.memory_mb = Some(mb);
-            }
-        }
-        Profile::Balanced => {
-            if out.memory_mb.is_none() {
-                out.memory_mb = Some(auto_profile_memory_mb(Profile::Balanced, total_mb));
             }
         }
         Profile::Fast => {
@@ -8288,8 +8433,8 @@ fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
 fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     // Conservative defaults when RAM cannot be detected.
     let fallback = match profile {
+        Profile::Auto | Profile::Balanced => 6144,
         Profile::Safe => 2048,
-        Profile::Balanced => 6144,
         Profile::Fast => 12_288,
     };
     let t = match total_mb {
@@ -8300,17 +8445,28 @@ fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     // Keep some headroom for OS and other processes.
     let usable = (t as f64 * 0.80).floor() as usize;
     let mb = match profile {
+        Profile::Auto | Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
         Profile::Safe => ((usable as f64) * 0.15).floor() as usize,
-        Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
         Profile::Fast => ((usable as f64) * 0.55).floor() as usize,
     };
 
     let (min_mb, max_mb) = match profile {
+        Profile::Auto | Profile::Balanced => (4096, 24_576),
         Profile::Safe => (1024, 8192),
-        Profile::Balanced => (4096, 24_576),
         Profile::Fast => (8192, 32_768),
     };
     mb.max(min_mb).min(max_mb)
+}
+
+fn auto_threshold_bytes(balanced_mem_mb: usize, expansion_factor: f64) -> u64 {
+    let overhead = 2.5_f64;
+    ((balanced_mem_mb as f64 * 1024.0 * 1024.0) / (expansion_factor * overhead)) as u64
+}
+
+fn auto_large_file_memory_mb(total_ram_mb: usize, safe_mem_mb: usize) -> usize {
+    (safe_mem_mb * 2)
+        .min(total_ram_mb * 75 / 100)
+        .max(safe_mem_mb)
 }
 
 fn detect_total_memory_mb() -> Option<usize> {
@@ -8384,10 +8540,12 @@ fn enumerate_pairs(
         out_rel.set_extension("parquet");
         let out_path = out_root.join(&out_rel);
 
+        let gz_size_bytes = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         pairs.push(FilePair {
             input_gz: p.to_path_buf(),
             output_parquet: out_path,
             rel,
+            gz_size_bytes,
         });
     }
 
