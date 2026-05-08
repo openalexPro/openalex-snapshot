@@ -5823,7 +5823,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                                 .rel
                                 .parent()
                                 .unwrap_or(Path::new(""))
-                                .join(format!("{}_{:03}.gz", stem, i + 1));
+                                .join(format!("{}_{:03}.json", stem, i + 1));
                             chunk_source.insert(chunk_rel.clone(), pair.rel.clone());
                             expanded.push(FilePair {
                                 input_gz: chunk_path,
@@ -10502,9 +10502,7 @@ fn split_gz_lines(
     target_uncompressed_bytes: usize,
 ) -> Result<Vec<PathBuf>> {
     use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::{BufRead, BufReader, BufWriter};
+    use std::io::{BufRead, BufReader, BufWriter, Write};
 
     fs::create_dir_all(chunk_dir)
         .with_context(|| format!("failed to create split temp dir {}", chunk_dir.display()))?;
@@ -10516,12 +10514,11 @@ fn split_gz_lines(
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
     let mut chunk_idx: usize = 1;
     let mut bytes_in_chunk: usize = 0;
-    let mut current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.gz"));
-    let mut writer: BufWriter<GzEncoder<fs::File>> = {
-        let f = fs::File::create(&current_path)
-            .with_context(|| format!("failed to create chunk {}", current_path.display()))?;
-        BufWriter::new(GzEncoder::new(f, Compression::default()))
-    };
+    let mut current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.json"));
+    let mut writer = BufWriter::new(
+        fs::File::create(&current_path)
+            .with_context(|| format!("failed to create chunk {}", current_path.display()))?,
+    );
 
     for line in gz_reader.lines() {
         let line = line.with_context(|| format!("read error in {}", input.display()))?;
@@ -10535,13 +10532,13 @@ fn split_gz_lines(
             chunk_paths.push(current_path);
             chunk_idx += 1;
             bytes_in_chunk = 0;
-            current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.gz"));
-            let f = fs::File::create(&current_path)
-                .with_context(|| format!("failed to create chunk {}", current_path.display()))?;
-            writer = BufWriter::new(GzEncoder::new(f, Compression::default()));
+            current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.json"));
+            writer =
+                BufWriter::new(fs::File::create(&current_path).with_context(|| {
+                    format!("failed to create chunk {}", current_path.display())
+                })?);
         }
         let b = line.as_bytes();
-        use std::io::Write;
         writer.write_all(b)?;
         writer.write_all(b"\n")?;
         bytes_in_chunk += b.len() + 1;
