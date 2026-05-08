@@ -3527,15 +3527,15 @@ convert:
   # allowed values: true | false
   # skip_disk_check: false
 
-  # Split large gz files into smaller chunks before converting.
-  # 0 = auto (balanced_mem_mb / 15 uncompressed bytes, ~87 MB on a 36 GB machine).
-  # Set explicitly to override, e.g. 512mb, 1gib, 256mib.
-  # allowed values: 0 (auto) or size string e.g. 512mb, 1gib
-  # split_size: 0
-
-  # Directory for temporary split gz chunks.
-  # Must be on the same filesystem as the parquet output directory.
-  # Defaults to <parquet_dir>/.split_tmp (auto-created and cleaned up per file).
+  # Pre-split large gz files before converting.
+  # Files larger than split_size are decompressed and split into chunks of this size,
+  # then each chunk is converted separately. Prevents DuckDB OOM on very large files.
+  # 0 = auto (balanced_mem_mb / 6 x expansion ~87MB on a 36GB system).
+  # Accepts human-readable sizes: 0 | 128mb | 256mb | 512mb | 1gb | 1gib etc.
+  # allowed values: 0 (auto) | <size with suffix>
+  split_size: 0
+  # Directory for temporary split gz chunks. Must be on the same filesystem as parquet_dir
+  # to allow efficient renames. Defaults to <parquet_dir>/.split_tmp if not set.
   # allowed values: any valid path
   # split_temp_dir: /Volumes/openalex/.split_tmp
 
