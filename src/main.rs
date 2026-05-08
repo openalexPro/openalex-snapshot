@@ -3530,10 +3530,12 @@ convert:
 
   # Pre-split large gz files before converting.
   # Files larger than split_size are decompressed and split into chunks of this size,
-  # then each chunk is converted separately. Prevents DuckDB OOM on very large files.
-  # 0 = auto (balanced_mem_mb / 6 x expansion ~87MB on a 36GB system).
+  # then each chunk is converted separately.
+  # 0 (default) = disabled: in-process DuckDB handles large files via streaming
+  # and memory-limit spill without needing pre-splitting.
+  # Only set this if a specific file causes DuckDB to OOM even with memory limits.
   # Accepts human-readable sizes: 0 | 128mb | 256mb | 512mb | 1gb | 1gib etc.
-  # allowed values: 0 (auto) | <size with suffix>
+  # allowed values: 0 (disabled) | <size with suffix>
   split_size: 0
   # Directory for temporary split gz chunks. Must be on the same filesystem as parquet_dir
   # to allow efficient renames. Defaults to <parquet_dir>/.split_tmp if not set.
@@ -5763,9 +5765,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         // All chunks + small files are then processed by the single parallel balanced pass.
         let split_target =
             parse_size_str(&args.split_size).context("invalid --split-size value")?;
-        let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
+        // split_size=0 (auto/default) means no splitting: in-process DuckDB handles large
+        // files via streaming and memory-limit spill without needing pre-splitting.
         let split_target_bytes: usize = if split_target == 0 {
-            auto_threshold_bytes(balanced_mem_mb, 6.0) as usize
+            usize::MAX
         } else {
             split_target
         };
@@ -5780,10 +5783,17 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             .count();
         let small_count = todo.len() - large_count;
         let already_done = pairs_len - todo.len();
-        let target_mb_display = split_target_bytes / 1_000_000;
-        eprintln!(
-            "[convert] dataset={dataset} pre-split: {large_count} large (>{target_mb_display}MB) + {small_count} small remaining, {already_done} already done"
-        );
+        if large_count > 0 {
+            let target_mb_display = split_target_bytes / 1_000_000;
+            eprintln!(
+                "[convert] dataset={dataset} pre-split: {large_count} large (>{target_mb_display}MB) + {small_count} small remaining, {already_done} already done"
+            );
+        } else {
+            eprintln!(
+                "[convert] dataset={dataset} todo={} already_done={already_done}",
+                todo.len()
+            );
+        }
         let split_pb = make_progress_bar(
             args.progress && large_count > 0,
             large_count as u64,
@@ -8667,10 +8677,6 @@ fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     mb.max(min_mb).min(max_mb)
 }
 
-fn auto_threshold_bytes(balanced_mem_mb: usize, expansion_factor: f64) -> u64 {
-    let overhead = 2.5_f64;
-    ((balanced_mem_mb as f64 * 1024.0 * 1024.0) / (expansion_factor * overhead)) as u64
-}
 
 /// Parse a human-readable size string to bytes.
 /// "0" → 0 (sentinel for auto). Supports kb/mb/gb (SI) and kib/mib/gib (binary), case-insensitive.
