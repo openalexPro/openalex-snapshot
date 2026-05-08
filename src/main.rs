@@ -6013,6 +6013,13 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             &format!("convert:{dataset}"),
         );
 
+        // memory_limit is a global DuckDB setting shared by all in-process connections.
+        // Set it once to the total budget (per_worker × workers) before the parallel pass,
+        // not per-query (which would cap all workers collectively at per_worker).
+        if let Some(mb) = tuning.memory_mb {
+            set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
+        }
+
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(tuning.workers)
             .build()
@@ -7814,6 +7821,9 @@ fn run_repair(args: RepairArgs) -> Result<()> {
             ds_targets.len() as u64,
             &format!("repair:{dataset}"),
         );
+        if let Some(mb) = tuning.memory_mb {
+            set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
+        }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(tuning.workers)
             .build()
@@ -10649,9 +10659,6 @@ fn convert_one(
     let out_q = sql_quote(&tmp.to_string_lossy());
 
     let mut sql = String::new();
-    if let Some(mb) = memory_mb {
-        sql.push_str(&format!("SET memory_limit='{}MB';", mb));
-    }
     sql.push_str("SET preserve_insertion_order = false;");
     sql.push_str(&format!(
         "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true)) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
@@ -10663,9 +10670,6 @@ fn convert_one(
     ));
     if !extra_json_options.is_empty() {
         sql.clear();
-        if let Some(mb) = memory_mb {
-            sql.push_str(&format!("SET memory_limit='{}MB';", mb));
-        }
         sql.push_str("SET preserve_insertion_order = false;");
         sql.push_str(&format!(
             "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true{}) ) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
@@ -10677,6 +10681,7 @@ fn convert_one(
             row_group_rows
         ));
     }
+    let _ = memory_mb; // set globally via set_duckdb_memory_limit before the parallel pass
 
     run_duckdb_sql(duckdb_bin, &sql)?;
     fs::rename(&tmp, &pair.output_parquet)?;
@@ -11412,6 +11417,14 @@ fn arrow_col_to_string(col: &dyn duckdb::arrow::array::Array, idx: usize) -> Str
         DataType::Boolean => cast_to_string!(BooleanArray),
         _ => String::new(),
     }
+}
+
+/// Set the global DuckDB memory limit (database-wide, shared by all cloned connections).
+/// With in-process DuckDB, memory_limit is a global setting — must be set once to the
+/// total budget (per_worker_mb × workers), not per-worker, or all threads share the smaller value.
+fn set_duckdb_memory_limit(total_mb: usize) {
+    let master = master_conn().lock().expect("master conn lock poisoned");
+    let _ = master.execute_batch(&format!("SET memory_limit='{total_mb}MB';"));
 }
 
 fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
