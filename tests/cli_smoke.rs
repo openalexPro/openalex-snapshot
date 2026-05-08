@@ -195,6 +195,8 @@ fn schema_arrow_r_output() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
+            "--workers",
+            "1",
         ])
         .status()
         .unwrap();
@@ -250,6 +252,8 @@ fn index_builds_expected_columns() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
+            "--workers",
+            "1",
         ])
         .status()
         .unwrap();
@@ -395,6 +399,8 @@ fn index_all_builds_multiple_datasets() {
             root.to_str().unwrap(),
             "--dataset",
             "all",
+            "--workers",
+            "1",
         ])
         .status()
         .unwrap()
@@ -448,6 +454,8 @@ fn index_cli_dataset_not_overridden_by_config() {
             root.to_str().unwrap(),
             "--dataset",
             "all",
+            "--workers",
+            "1",
         ])
         .status()
         .unwrap()
@@ -588,6 +596,8 @@ fn csv_cache_precedence_over_json_cache() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
+            "--workers",
+            "1",
         ])
         .status()
         .unwrap()
