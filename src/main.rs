@@ -5595,6 +5595,24 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         return Ok(());
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "convert")?;
+    let convert_start = Instant::now();
+    // Print resolved settings so they're visible at run start.
+    if is_auto {
+        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
+        eprintln!(
+            "[convert] profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+            large_mem,
+        );
+    } else {
+        eprintln!(
+            "[convert] profile={} workers={} memory_mb={}",
+            format!("{:?}", args.profile).to_lowercase(),
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+        );
+    }
     let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
@@ -6027,15 +6045,16 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             );
         }
 
-        eprintln!("[convert] dataset={dataset} conversion stage complete");
+        let dataset_elapsed = dataset_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[convert] dataset={dataset} done elapsed={}",
+            format_duration(dataset_elapsed)
+        );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
             "convert",
-            &format!(
-                "conversion stage complete elapsed_s={:.2}",
-                dataset_start.elapsed().as_secs_f64()
-            ),
+            &format!("conversion stage complete elapsed_s={:.2}", dataset_elapsed),
         );
         ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
         report.datasets.push(ds);
@@ -6045,11 +6064,30 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     report_finalize(&mut report);
     let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    let total_elapsed = convert_start.elapsed().as_secs_f64();
+    let settings_str = if is_auto {
+        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
+        format!(
+            " profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+            large_mem,
+        )
+    } else {
+        format!(
+            " profile={} workers={} memory_mb={}",
+            format!("{:?}", args.profile).to_lowercase(),
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+        )
+    };
     eprintln!(
-        "[convert] summary scanned={} ok={} failed={} reports={}",
+        "[convert] summary scanned={} ok={} failed={} elapsed={}{} reports={}",
         report.totals_items_scanned,
         report.totals_succeeded,
         report.totals_failed,
+        format_duration(total_elapsed),
+        settings_str,
         report_paths
             .iter()
             .map(|p| p.display().to_string())
