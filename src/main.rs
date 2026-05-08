@@ -5773,12 +5773,6 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| args.shared.parquet_dir.join(".split_tmp"));
 
-        // Maps chunk_rel → source_rel (for cleanup and success accounting)
-        let mut chunk_source: HashMap<PathBuf, PathBuf> = HashMap::new();
-        // Track how many chunks each source has, for accounting
-        let mut source_chunk_counts: HashMap<PathBuf, u64> = HashMap::new();
-        let mut expanded: Vec<FilePair> = Vec::new();
-
         let large_count = todo
             .iter()
             .filter(|p| p.gz_size_bytes as usize > split_target_bytes)
@@ -5794,17 +5788,29 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             &format!("split:{dataset}"),
         );
 
-        for pair in todo {
-            if pair.gz_size_bytes as usize <= split_target_bytes {
-                expanded.push(pair);
-            } else {
+        // Split large files in parallel; each item produces either a passthrough or a set of chunks.
+        enum SplitOutcome {
+            Pass(FilePair),
+            Chunks {
+                source_rel: PathBuf,
+                pairs: Vec<(PathBuf, FilePair)>, // (chunk_rel, chunk_pair)
+            },
+            Failed(FailureEntry),
+        }
+
+        let outcomes: Vec<SplitOutcome> = todo
+            .into_par_iter()
+            .map(|pair| {
+                if pair.gz_size_bytes as usize <= split_target_bytes {
+                    return SplitOutcome::Pass(pair);
+                }
                 let stem = pair
                     .output_parquet
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let chunk_gz_dir = split_tmp_root
+                let chunk_dir = split_tmp_root
                     .join(dataset)
                     .join(pair.rel.parent().unwrap_or(Path::new("")));
                 let chunk_out_dir = pair
@@ -5812,48 +5818,76 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                     .parent()
                     .unwrap_or(Path::new(""))
                     .to_path_buf();
-                match split_gz_lines(&pair.input_gz, &chunk_gz_dir, &stem, split_target_bytes) {
+                let result = split_gz_lines(&pair.input_gz, &chunk_dir, &stem, split_target_bytes);
+                split_pb.inc(1);
+                match result {
                     Ok(chunks) => {
-                        let n = chunks.len() as u64;
-                        source_chunk_counts.insert(pair.rel.clone(), n);
-                        for (i, chunk_path) in chunks.into_iter().enumerate() {
-                            let chunk_name = format!("{}_{:03}.parquet", stem, i + 1);
-                            let chunk_out = chunk_out_dir.join(&chunk_name);
-                            let chunk_rel = pair
-                                .rel
-                                .parent()
-                                .unwrap_or(Path::new(""))
-                                .join(format!("{}_{:03}.json", stem, i + 1));
-                            chunk_source.insert(chunk_rel.clone(), pair.rel.clone());
-                            expanded.push(FilePair {
-                                input_gz: chunk_path,
-                                output_parquet: chunk_out,
-                                rel: chunk_rel,
-                                gz_size_bytes: 0, // chunks are small by construction
-                            });
+                        let pairs = chunks
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, chunk_path)| {
+                                let chunk_out =
+                                    chunk_out_dir.join(format!("{}_{:03}.parquet", stem, i + 1));
+                                let chunk_rel = pair
+                                    .rel
+                                    .parent()
+                                    .unwrap_or(Path::new(""))
+                                    .join(format!("{}_{:03}.json", stem, i + 1));
+                                (
+                                    chunk_rel.clone(),
+                                    FilePair {
+                                        input_gz: chunk_path,
+                                        output_parquet: chunk_out,
+                                        rel: chunk_rel,
+                                        gz_size_bytes: 0,
+                                    },
+                                )
+                            })
+                            .collect();
+                        SplitOutcome::Chunks {
+                            source_rel: pair.rel,
+                            pairs,
                         }
-                        split_pb.inc(1);
                     }
-                    Err(e) => {
-                        split_pb.inc(1);
-                        ds.failed += 1;
-                        report.failures.push(FailureEntry {
-                            dataset: dataset.clone(),
-                            phase: "split".to_string(),
-                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
-                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
-                            error_message: format!("split failed: {e:#}"),
-                            suggested_recovery: Some(
-                                "retry with a larger --split-size or fix disk space".to_string(),
-                            ),
-                        });
+                    Err(e) => SplitOutcome::Failed(FailureEntry {
+                        dataset: dataset.clone(),
+                        phase: "split".to_string(),
+                        rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                        source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                        output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                        error_message: format!("split failed: {e:#}"),
+                        suggested_recovery: Some(
+                            "retry with a larger --split-size or fix disk space".to_string(),
+                        ),
+                    }),
+                }
+            })
+            .collect();
+
+        split_pb.finish_and_clear();
+
+        // Maps chunk_rel → source_rel (for cleanup and success accounting)
+        let mut chunk_source: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // Track how many chunks each source has, for accounting
+        let mut source_chunk_counts: HashMap<PathBuf, u64> = HashMap::new();
+        let mut expanded: Vec<FilePair> = Vec::new();
+
+        for outcome in outcomes {
+            match outcome {
+                SplitOutcome::Pass(pair) => expanded.push(pair),
+                SplitOutcome::Chunks { source_rel, pairs } => {
+                    source_chunk_counts.insert(source_rel.clone(), pairs.len() as u64);
+                    for (chunk_rel, pair) in pairs {
+                        chunk_source.insert(chunk_rel, source_rel.clone());
+                        expanded.push(pair);
                     }
+                }
+                SplitOutcome::Failed(f) => {
+                    ds.failed += 1;
+                    report.failures.push(f);
                 }
             }
         }
-
-        split_pb.finish_and_clear();
         let split_count: usize = source_chunk_counts.values().map(|&n| n as usize).sum();
         let unsplit_count = expanded.len() - split_count;
         if !source_chunk_counts.is_empty() {
