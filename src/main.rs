@@ -4359,6 +4359,7 @@ struct LiveDatasetStatus {
     status: String, // "done" | "in-progress" | "pending" | "error"
     scanned: u64,
     todo: u64,
+    converted: u64,
     ok: u64,
     failed: u64,
     skipped: u64,
@@ -4386,6 +4387,7 @@ fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
             status: "pending".to_string(),
             scanned: 0,
             todo: 0,
+            converted: 0,
             ok: 0,
             failed: 0,
             skipped: 0,
@@ -4396,6 +4398,7 @@ fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
     let last_log = txt.lines().last().unwrap_or("").to_string();
     let mut scanned = 0u64;
     let mut todo = 0u64;
+    let mut converted = 0u64;
     let mut ok = 0u64;
     let mut failed = 0u64;
     let mut skipped = 0u64;
@@ -4408,6 +4411,11 @@ fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
         }
         if let Some(v) = parse_u64_field(line, "todo_files") {
             todo = v;
+        }
+        // count per-file completion lines emitted by convert/index/verify
+        if line.contains(" converted ") || line.contains(" indexed ") || line.contains(" verified ")
+        {
+            converted += 1;
         }
         // summary line written at end of a stage
         if line.contains(" summary ") {
@@ -4438,7 +4446,7 @@ fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
         "error"
     } else if done {
         "done"
-    } else if scanned > 0 {
+    } else if scanned > 0 || converted > 0 {
         "in-progress"
     } else {
         "pending"
@@ -4450,6 +4458,7 @@ fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
         status,
         scanned,
         todo,
+        converted,
         ok,
         failed,
         skipped,
@@ -4485,6 +4494,7 @@ fn live_progress(parquet_dir: &Path, lock: &LockInfo) -> Vec<LiveDatasetStatus> 
                     status: "pending".to_string(),
                     scanned: 0,
                     todo: 0,
+                    converted: 0,
                     ok: 0,
                     failed: 0,
                     skipped: 0,
@@ -4506,12 +4516,32 @@ fn print_live_progress(lock: &LockInfo, datasets: &[LiveDatasetStatus]) {
         .count();
     let errors = datasets.iter().filter(|d| d.status == "error").count();
     let pending = datasets.iter().filter(|d| d.status == "pending").count();
+
+    // aggregate cross-dataset totals for a pipeline-level ETA
+    let total_converted: u64 = datasets.iter().map(|d| d.converted).sum();
+    let total_todo: u64 = datasets.iter().map(|d| d.todo).sum();
+    let eta_str = if total_todo > 0 && total_converted > 0 && runtime > 0.0 {
+        let rate = total_converted as f64 / runtime; // files/sec
+        let remaining = total_todo.saturating_sub(total_converted) as f64;
+        let eta_secs = remaining / rate;
+        format!(" eta={}", format_duration(eta_secs))
+    } else {
+        String::new()
+    };
+    let progress_str = if total_todo > 0 {
+        format!(" ({} of {})", total_converted, total_todo)
+    } else {
+        String::new()
+    };
+
     println!(
-        "[progress] command={} pid={} started={} runtime={}",
+        "[progress] command={} pid={} started={} runtime={}{}{}",
         lock.command,
         lock.pid,
         lock.started_at_unix,
-        format_duration(runtime)
+        format_duration(runtime),
+        progress_str,
+        eta_str,
     );
     println!(
         "[progress] datasets: done={} in-progress={} pending={} error={}",
@@ -4521,13 +4551,24 @@ fn print_live_progress(lock: &LockInfo, datasets: &[LiveDatasetStatus]) {
         if ds.status == "pending" && ds.last_log.is_empty() {
             continue; // omit datasets not yet started
         }
+        let ds_progress = if ds.todo > 0 {
+            format!(" ({} of {})", ds.converted, ds.todo)
+        } else if ds.converted > 0 {
+            format!(" converted={}", ds.converted)
+        } else {
+            String::new()
+        };
+        let ds_eta = if ds.todo > 0 && ds.converted > 0 && runtime > 0.0 {
+            let rate = ds.converted as f64 / runtime;
+            let remaining = ds.todo.saturating_sub(ds.converted) as f64;
+            format!(" eta={}", format_duration(remaining / rate))
+        } else {
+            String::new()
+        };
         print!(
-            "[progress] dataset={} status={} scanned={}",
-            ds.dataset, ds.status, ds.scanned
+            "[progress] dataset={} status={}{}{}",
+            ds.dataset, ds.status, ds_progress, ds_eta
         );
-        if ds.todo > 0 {
-            print!(" todo={}", ds.todo);
-        }
         if ds.ok > 0 || ds.failed > 0 || ds.skipped > 0 {
             print!(" ok={} failed={} skipped={}", ds.ok, ds.failed, ds.skipped);
         }
