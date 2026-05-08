@@ -9422,7 +9422,8 @@ fn cleanup_command_dataset_logs(parquet_dir: &Path, log_command: &str) -> Result
         if matches!(name.as_ref(), "reports" | "archived" | "download") {
             continue;
         }
-        // Clean logs from step subdirectories
+        // Clean logs from step subdirectories only — schemata/ is a persistent cache
+        // and must never be removed by log cleanup.
         for step in &["convert", "conversion-verify", "index", "index-verify"] {
             let p = ent.path().join(step).join(format!("{log_command}.log"));
             if p.exists() {
@@ -9649,7 +9650,8 @@ fn archive_completed_run(parquet_dir: &Path, snapshot_dir: &Path) -> Result<()> 
         moved_any = true;
     }
 
-    // Move dataset logs
+    // Move dataset logs — schemata/ is intentionally excluded: it is a persistent
+    // cache that should survive across runs and must not be archived or removed.
     if meta_root.exists() {
         for entry in fs::read_dir(&meta_root)?.flatten() {
             let ds_dir = entry.path();
