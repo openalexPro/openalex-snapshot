@@ -5778,9 +5778,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             .filter(|p| p.gz_size_bytes as usize > split_target_bytes)
             .count();
         let small_count = todo.len() - large_count;
+        let already_done = pairs_len - todo.len();
         let target_mb_display = split_target_bytes / 1_000_000;
         eprintln!(
-            "[convert] dataset={dataset} pre-split: {large_count} large files (>{target_mb_display}MB) + {small_count} small files"
+            "[convert] dataset={dataset} pre-split: {large_count} large (>{target_mb_display}MB) + {small_count} small remaining, {already_done} already done"
         );
         let split_pb = make_progress_bar(
             args.progress && large_count > 0,
