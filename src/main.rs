@@ -5765,16 +5765,19 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
         let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
             let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
-            // Only works uses maximum_object_size=1 GiB which forces ~1.8 GiB DuckDB
-            // pre-allocation per process regardless of file size.  All other datasets
-            // have no such fixed overhead and can safely run all files in the parallel
-            // pass, so we skip the threshold split entirely for them.
+            let large_mem_mb = lt.memory_mb.unwrap_or(4096);
+            // Only works uses maximum_object_size=1 GiB.  All other datasets have no
+            // such fixed overhead and safely run every file through the parallel pass.
+            // For works, use the large-pass memory as the threshold reference so that
+            // files a single large-pass worker can handle comfortably (large_mem/15)
+            // still go through the parallel pass; only files that stress even the
+            // serial pass are routed there.
             let threshold: u64 = if dataset != "works" {
                 u64::MAX // all files → small (parallel) pass
             } else {
                 match args.large_file_threshold_mb {
                     Some(mb) => mb as u64 * 1024 * 1024,
-                    None => auto_threshold_bytes(balanced_mem_mb, 6.0),
+                    None => auto_threshold_bytes(large_mem_mb, 6.0),
                 }
             };
             let mut large: Vec<FilePair> = todo
@@ -5784,23 +5787,27 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 .collect();
             large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
             todo.retain(|p| p.gz_size_bytes < threshold);
+            let threshold_display = if threshold == u64::MAX {
+                "all".to_string()
+            } else {
+                format!("{}MB", threshold / (1024 * 1024))
+            };
             eprintln!(
-                "[convert] auto dataset={dataset} small={} large={} threshold={}MB balanced_mem={}MB large_mem={}MB",
+                "[convert] auto dataset={dataset} small={} large={} threshold={threshold_display} balanced_mem={}MB large_mem={}MB",
                 todo.len(),
                 large.len(),
-                threshold / (1024 * 1024),
                 balanced_mem_mb,
-                lt.memory_mb.unwrap_or(0),
+                large_mem_mb,
             );
             try_log_dataset(
                 &args.shared.parquet_dir,
                 dataset,
                 "convert",
                 &format!(
-                    "auto small={} large={} threshold_mb={}",
+                    "auto small={} large={} threshold={}",
                     todo.len(),
                     large.len(),
-                    threshold / (1024 * 1024)
+                    threshold_display
                 ),
             );
             large
@@ -5810,6 +5817,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
         ds.items_scanned = (todo.len() + large_todo.len()) as u64;
 
+        let schema_start = Instant::now();
         eprintln!(
             "[convert] dataset={dataset} todo_files={} (starting schema inference)",
             todo.len() + large_todo.len()
@@ -5869,7 +5877,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 continue;
             }
         };
-        eprintln!("[convert] dataset={dataset} schema inference complete");
+        eprintln!(
+            "[convert] dataset={dataset} schema inference complete elapsed={}",
+            format_duration(schema_start.elapsed().as_secs_f64())
+        );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
@@ -6001,14 +6012,25 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             let _ = write_run_reports(&args.shared.parquet_dir, &preview);
         }
 
+        let small_elapsed = start.elapsed().as_secs_f64();
         pb.finish_with_message(format!(
             "convert:{dataset} done in {:.1}s",
-            start.elapsed().as_secs_f64()
+            small_elapsed
         ));
+        if !todo.is_empty() || large_todo.is_empty() {
+            eprintln!(
+                "[convert] dataset={dataset} small-pass done ok={} failed={} elapsed={}",
+                ds.items_scanned.saturating_sub(ds.failed),
+                ds.failed,
+                format_duration(small_elapsed),
+            );
+        }
 
         // Auto profile: serial pass for large files with maximised memory.
         if !large_todo.is_empty() {
             let lt = large_tuning.as_ref().expect("large_tuning set for auto");
+            let large_start = Instant::now();
+            let failed_before_large = ds.failed;
             eprintln!(
                 "[convert] auto dataset={dataset} large-file pass: {} files workers=1 memory_mb={:?}",
                 large_todo.len(),
@@ -6069,12 +6091,22 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 }
                 pb_large.inc(1);
             }
-            pb_large.finish_with_message(format!("convert:{dataset}(large) done"));
+            let large_elapsed = large_start.elapsed().as_secs_f64();
+            let large_failed = ds.failed - failed_before_large;
+            let large_ok = large_todo.len() as u64 - large_failed;
+            pb_large.finish_with_message(format!(
+                "convert:{dataset}(large) done in {}",
+                format_duration(large_elapsed)
+            ));
+            eprintln!(
+                "[convert] dataset={dataset} large-pass done ok={large_ok} failed={large_failed} elapsed={}",
+                format_duration(large_elapsed),
+            );
             try_log_dataset(
                 &args.shared.parquet_dir,
                 dataset,
                 "convert",
-                "auto large_pass complete",
+                &format!("auto large_pass complete elapsed_s={:.2}", large_elapsed),
             );
         }
 
