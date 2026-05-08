@@ -352,7 +352,7 @@ Profile / tuning:
   fast       (none)        55% of usable     8 – 32 GiB
 
   Auto mode threshold: a file is 'large' when its estimated peak memory exceeds
-  the balanced per-worker budget (gz_size × 20). Threshold scales with system RAM.
+  the balanced per-worker budget (gz_size × 7.5). Threshold scales with system RAM.
 
   Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
   Set --max-memory-mb to override the profile memory calculation entirely.
@@ -5744,7 +5744,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
         let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
             let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
-            let threshold = auto_threshold_bytes(balanced_mem_mb, 8.0);
+            let threshold = auto_threshold_bytes(balanced_mem_mb, 3.0);
             let mut large: Vec<FilePair> = todo
                 .iter()
                 .filter(|p| p.gz_size_bytes >= threshold)
