@@ -8525,11 +8525,12 @@ fn resolve_tuning_with_total(
         Profile::Auto | Profile::Balanced => {
             if out.memory_mb.is_none() {
                 // Divide total balanced budget across workers so aggregate stays within 35% of RAM.
-                // 4 GiB floor per worker: works uses maximum_object_size=1 GiB which causes DuckDB
-                // to pre-allocate ~1.8 GiB physical even for tiny files; a higher floor keeps
-                // concurrent-process physical memory within safe bounds.
+                // 2560 MiB floor per worker: works uses maximum_object_size=1 GiB which requires
+                // ~1.8 GiB physical per DuckDB process; this floor gives ~4 workers on a 36 GB
+                // machine (4 × 2580 MB = 10 320 MB total) while preventing the original swap
+                // pressure caused by giving each worker the full undivided budget.
                 // If that floor would need more workers than the budget allows, cap worker count.
-                const MIN_PER_WORKER_MB: usize = 4096;
+                const MIN_PER_WORKER_MB: usize = 2560;
                 let total = auto_profile_memory_mb(Profile::Balanced, total_mb);
                 let max_workers = (total / MIN_PER_WORKER_MB).max(1);
                 out.workers = out.workers.min(max_workers).max(1);
@@ -8550,7 +8551,7 @@ fn resolve_tuning_with_total(
         Profile::Fast => {
             if out.memory_mb.is_none() {
                 // Same treatment as Balanced: divide total budget across workers.
-                const MIN_PER_WORKER_MB: usize = 4096;
+                const MIN_PER_WORKER_MB: usize = 2560;
                 let total = auto_profile_memory_mb(Profile::Fast, total_mb);
                 let max_workers = (total / MIN_PER_WORKER_MB).max(1);
                 out.workers = out.workers.min(max_workers).max(1);
@@ -11175,14 +11176,14 @@ mod tests {
         assert_eq!(s1.memory_mb, Some(11_796));
 
         let b = resolve_tuning_with_total(Profile::Balanced, 8, None, Some(32_768));
-        // workers capped to 2 because total budget (9174) / MIN_PER_WORKER_MB (4096) = 2
-        assert_eq!(b.workers, 2);
-        assert_eq!(b.memory_mb, Some(9174 / 2)); // per-worker = total / capped_workers
+        // workers capped to 3 because total budget (9174) / MIN_PER_WORKER_MB (2560) = 3
+        assert_eq!(b.workers, 3);
+        assert_eq!(b.memory_mb, Some(9174 / 3)); // per-worker = total / capped_workers
 
         let f = resolve_tuning_with_total(Profile::Fast, 8, None, Some(32_768));
-        // workers capped to 3 because total budget (14417) / MIN_PER_WORKER_MB (4096) = 3
-        assert_eq!(f.workers, 3);
-        assert_eq!(f.memory_mb, Some(14_417 / 3)); // per-worker = total / capped_workers
+        // workers capped to 5 because total budget (14417) / MIN_PER_WORKER_MB (2560) = 5
+        assert_eq!(f.workers, 5);
+        assert_eq!(f.memory_mb, Some(14_417 / 5)); // per-worker = total / capped_workers
 
         let ov = resolve_tuning_with_total(Profile::Safe, 3, Some(999), Some(32_768));
         assert_eq!(ov.memory_mb, Some(999));
