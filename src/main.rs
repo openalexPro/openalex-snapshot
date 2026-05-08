@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -11294,8 +11294,27 @@ fn sql_quote(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// In-process DuckDB: one Connection per rayon/OS thread via thread_local.
+// In-process DuckDB: one shared database, one Connection per rayon/OS thread.
+//
+// DuckDB's bundled library has global state (signal handlers, allocators) that
+// crashes when multiple separate in-memory databases co-exist in the same
+// process. The safe pattern is ONE database shared by all threads, with each
+// thread holding its own Connection cloned from a master via try_clone().
 // ---------------------------------------------------------------------------
+
+static MASTER_CONN: OnceLock<Mutex<duckdb::Connection>> = OnceLock::new();
+
+fn master_conn() -> &'static Mutex<duckdb::Connection> {
+    MASTER_CONN.get_or_init(|| {
+        let conn =
+            duckdb::Connection::open_in_memory().expect("failed to init master DuckDB database");
+        conn.execute_batch(
+            "SET autoinstall_known_extensions=false; SET autoload_known_extensions=true;",
+        )
+        .ok();
+        Mutex::new(conn)
+    })
+}
 
 thread_local! {
     static DUCKDB_CONN: RefCell<Option<duckdb::Connection>> = const { RefCell::new(None) };
@@ -11308,20 +11327,18 @@ where
     DUCKDB_CONN.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
-            let conn = duckdb::Connection::open_in_memory()
-                .context("failed to open in-memory DuckDB connection")?;
-            // One DuckDB thread per connection: rayon supplies external parallelism,
-            // so we must prevent DuckDB from also spawning internal worker threads.
-            // Multiple concurrent DuckDB thread pools in the same process reliably
-            // crash (SIGSEGV) due to conflicting signal handlers and global state.
-            // Extensions are bundled; enable autoload so read_json / read_parquet
-            // resolve without explicit LOAD statements.
-            conn.execute_batch(
-                "SET threads=1; \
-                 SET autoinstall_known_extensions=false; \
-                 SET autoload_known_extensions=true;",
-            )
-            .ok();
+            // Clone a new connection from the shared master database.
+            // Connections to the same database are independent and safe to use
+            // concurrently; separate databases in the same process are not.
+            let conn = {
+                let master = master_conn().lock().expect("master conn lock poisoned");
+                master
+                    .try_clone()
+                    .context("failed to clone DuckDB connection")?
+            };
+            // One internal DuckDB thread per connection; rayon provides external
+            // file-level parallelism and must not compete with DuckDB's own pool.
+            conn.execute_batch("SET threads=1;").ok();
             *opt = Some(conn);
         }
         f(opt.as_ref().unwrap())
