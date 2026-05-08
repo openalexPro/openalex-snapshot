@@ -705,6 +705,12 @@ struct ConvertArgs {
     #[arg(help = "Disk check scope: dataset preflight or per-file")]
     disk_check_scope: DiskCheckScope,
 
+    #[arg(long)]
+    #[arg(
+        help = "Override auto large-file threshold in MB (auto profile only; files at or above this size use the serial large-file pass)"
+    )]
+    large_file_threshold_mb: Option<usize>,
+
     #[arg(long, default_value_t = false)]
     #[arg(help = "Refresh schema cache before conversion")]
     refresh_cache: bool,
@@ -1436,6 +1442,7 @@ struct ConvertConfig {
     seed: Option<u64>,
     refresh_cache: Option<bool>,
     skip_disk_check: Option<bool>,
+    large_file_threshold_mb: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2261,6 +2268,11 @@ fn apply_convert_config(
         if !cli_explicit(matches, "skip_disk_check") {
             if let Some(v) = c.skip_disk_check {
                 args.skip_disk_check = v;
+            }
+        }
+        if !cli_explicit(matches, "large_file_threshold_mb") {
+            if let Some(v) = c.large_file_threshold_mb {
+                args.large_file_threshold_mb = Some(v);
             }
         }
     }
@@ -3502,6 +3514,14 @@ convert:
   # Useful when converting a single small dataset where the global estimate is too conservative.
   # allowed values: true | false
   # skip_disk_check: false
+
+  # Auto-profile large-file threshold override (auto profile only).
+  # Files >= this size (gz, in MB) are routed to the serial large-file pass instead of the
+  # parallel balanced pass. Leave unset to use the auto formula (balanced_mem_mb / 7.5).
+  # Increase if small files are OOMing in the parallel pass; they will then be retried
+  # serially. You can also fix individual failures with repair_convert.
+  # allowed values: integer >= 1 (MB)
+  # large_file_threshold_mb: 1900
 
 verify_convert:
   # ---------------------------------------------------------------------------
@@ -4991,6 +5011,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             skip_disk_check: resolved.skip_disk_check,
             disk_check_scope: DiskCheckScope::Dataset,
             refresh_cache: false,
+            large_file_threshold_mb: None,
             explain: false,
             state_flush_every: 25,
         };
@@ -5744,7 +5765,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
         let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
             let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
-            let threshold = auto_threshold_bytes(balanced_mem_mb, 3.0);
+            let threshold = match args.large_file_threshold_mb {
+                Some(mb) => mb as u64 * 1024 * 1024,
+                None => auto_threshold_bytes(balanced_mem_mb, 3.0),
+            };
             let mut large: Vec<FilePair> = todo
                 .iter()
                 .filter(|p| p.gz_size_bytes >= threshold)
