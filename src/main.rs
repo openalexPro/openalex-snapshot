@@ -879,8 +879,8 @@ struct IndexArgs {
     #[arg(help = "Optional output index file path")]
     index_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of workers (same semantics as convert)")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of workers (0 = auto: cpus-2, same semantics as convert)")]
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
@@ -1117,8 +1117,8 @@ struct ValidateDownloadArgs {
     )]
     profile: Profile,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of worker threads for local integrity checks")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of worker threads for local integrity checks (0 = auto: cpus-2)")]
     workers: usize,
 
     #[arg(long, default_value_t = true)]
@@ -1152,8 +1152,8 @@ struct VerifyIndexArgs {
     #[arg(help = "Optional index file path (default: <parquet_dir>/<dataset>_id_idx.parquet)")]
     index_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of workers")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of workers (0 = auto: cpus-2)")]
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
