@@ -8677,7 +8677,6 @@ fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     mb.max(min_mb).min(max_mb)
 }
 
-
 /// Parse a human-readable size string to bytes.
 /// "0" → 0 (sentinel for auto). Supports kb/mb/gb (SI) and kib/mib/gib (binary), case-insensitive.
 fn parse_size_str(s: &str) -> Result<usize> {
@@ -11311,10 +11310,16 @@ where
         if opt.is_none() {
             let conn = duckdb::Connection::open_in_memory()
                 .context("failed to open in-memory DuckDB connection")?;
-            // In bundled mode, extensions are compiled in; enable autoload so
-            // read_json / read_parquet functions resolve without explicit LOAD.
+            // One DuckDB thread per connection: rayon supplies external parallelism,
+            // so we must prevent DuckDB from also spawning internal worker threads.
+            // Multiple concurrent DuckDB thread pools in the same process reliably
+            // crash (SIGSEGV) due to conflicting signal handlers and global state.
+            // Extensions are bundled; enable autoload so read_json / read_parquet
+            // resolve without explicit LOAD statements.
             conn.execute_batch(
-                "SET autoinstall_known_extensions=false; SET autoload_known_extensions=true;",
+                "SET threads=1; \
+                 SET autoinstall_known_extensions=false; \
+                 SET autoload_known_extensions=true;",
             )
             .ok();
             *opt = Some(conn);
