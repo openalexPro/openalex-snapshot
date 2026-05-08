@@ -5779,6 +5779,21 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         let mut source_chunk_counts: HashMap<PathBuf, u64> = HashMap::new();
         let mut expanded: Vec<FilePair> = Vec::new();
 
+        let large_count = todo
+            .iter()
+            .filter(|p| p.gz_size_bytes as usize > split_target_bytes)
+            .count();
+        let small_count = todo.len() - large_count;
+        let target_mb_display = split_target_bytes / 1_000_000;
+        eprintln!(
+            "[convert] dataset={dataset} pre-split: {large_count} large files (>{target_mb_display}MB) + {small_count} small files"
+        );
+        let split_pb = make_progress_bar(
+            args.progress && large_count > 0,
+            large_count as u64,
+            &format!("split:{dataset}"),
+        );
+
         for pair in todo {
             if pair.gz_size_bytes as usize <= split_target_bytes {
                 expanded.push(pair);
@@ -5817,8 +5832,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                                 gz_size_bytes: 0, // chunks are small by construction
                             });
                         }
+                        split_pb.inc(1);
                     }
                     Err(e) => {
+                        split_pb.inc(1);
                         ds.failed += 1;
                         report.failures.push(FailureEntry {
                             dataset: dataset.clone(),
@@ -5836,6 +5853,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             }
         }
 
+        split_pb.finish_and_clear();
         let split_count: usize = source_chunk_counts.values().map(|&n| n as usize).sum();
         let unsplit_count = expanded.len() - split_count;
         if !source_chunk_counts.is_empty() {
