@@ -3517,11 +3517,10 @@ convert:
 
   # Auto-profile large-file threshold override (auto profile only).
   # Files >= this size (gz, in MB) are routed to the serial large-file pass instead of the
-  # parallel balanced pass. Leave unset to use the auto formula (balanced_mem_mb / 7.5).
-  # Increase if small files are OOMing in the parallel pass; they will then be retried
-  # serially. You can also fix individual failures with repair_convert.
+  # parallel balanced pass. Leave unset to use the auto formula (per_worker_balanced_mem / 15).
+  # Lower this value if files are still OOMing in the parallel pass.
   # allowed values: integer >= 1 (MB)
-  # large_file_threshold_mb: 950
+  # large_file_threshold_mb: 80
 
 verify_convert:
   # ---------------------------------------------------------------------------
@@ -5768,19 +5767,13 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
             let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
             let large_mem_mb = lt.memory_mb.unwrap_or(4096);
-            // Only works uses maximum_object_size=1 GiB.  All other datasets have no
-            // such fixed overhead and safely run every file through the parallel pass.
-            // For works, use the large-pass memory as the threshold reference so that
-            // files a single large-pass worker can handle comfortably (large_mem/15)
-            // still go through the parallel pass; only files that stress even the
-            // serial pass are routed there.
-            let threshold: u64 = if dataset != "works" {
-                u64::MAX // all files → small (parallel) pass
-            } else {
-                match args.large_file_threshold_mb {
-                    Some(mb) => mb as u64 * 1024 * 1024,
-                    None => auto_threshold_bytes(large_mem_mb, 6.0),
-                }
+            // Route large files to the serial pass for all datasets.
+            // Threshold = estimated gz size that would exhaust one balanced worker's
+            // memory budget.  Files at or above the threshold run serially with the
+            // full large-pass budget; smaller files run in parallel.
+            let threshold: u64 = match args.large_file_threshold_mb {
+                Some(mb) => mb as u64 * 1024 * 1024,
+                None => auto_threshold_bytes(balanced_mem_mb, 6.0),
             };
             let mut large: Vec<FilePair> = todo
                 .iter()
@@ -5789,11 +5782,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 .collect();
             large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
             todo.retain(|p| p.gz_size_bytes < threshold); // already sorted largest-first from above
-            let threshold_display = if threshold == u64::MAX {
-                "all".to_string()
-            } else {
-                format!("{}MB", threshold / (1024 * 1024))
-            };
+            let threshold_display = format!("{}MB", threshold / (1024 * 1024));
             eprintln!(
                 "[convert] auto dataset={dataset} small={} large={} threshold={threshold_display} balanced_mem={}MB large_mem={}MB",
                 todo.len(),
@@ -11089,13 +11078,30 @@ fn run_duckdb_sql(duckdb_bin: &Path, sql: &str) -> Result<()> {
         .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
 
     if !out.status.success() {
-        bail!(
-            "duckdb sql failed:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let exit_info = format_exit_status(&out.status);
+        let stdout_s = String::from_utf8_lossy(&out.stdout);
+        let stderr_s = String::from_utf8_lossy(&out.stderr);
+        if stdout_s.trim().is_empty() && stderr_s.trim().is_empty() {
+            bail!("duckdb sql failed ({exit_info}, no output — likely killed by OS/OOM killer)");
+        }
+        bail!("duckdb sql failed ({exit_info}):\n{stdout_s}\n{stderr_s}");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(sig) = status.signal() {
+        format!("killed by signal {sig}")
+    } else {
+        format!("exit code {}", status.code().unwrap_or(-1))
+    }
+}
+
+#[cfg(not(unix))]
+fn format_exit_status(status: &std::process::ExitStatus) -> String {
+    format!("exit code {}", status.code().unwrap_or(-1))
 }
 
 fn with_session_settings(sql: &str, memory_mb: Option<usize>, threads: Option<usize>) -> String {
@@ -11119,11 +11125,15 @@ fn run_duckdb_csv(duckdb_bin: &Path, sql: &str) -> Result<Vec<HashMap<String, St
         .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
 
     if !out.status.success() {
-        bail!(
-            "duckdb csv query failed:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let exit_info = format_exit_status(&out.status);
+        let stdout_s = String::from_utf8_lossy(&out.stdout);
+        let stderr_s = String::from_utf8_lossy(&out.stderr);
+        if stdout_s.trim().is_empty() && stderr_s.trim().is_empty() {
+            bail!(
+                "duckdb csv query failed ({exit_info}, no output — likely killed by OS/OOM killer)"
+            );
+        }
+        bail!("duckdb csv query failed ({exit_info}):\n{stdout_s}\n{stderr_s}");
     }
 
     let mut rdr = csv::Reader::from_reader(out.stdout.as_slice());
