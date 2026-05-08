@@ -336,18 +336,23 @@ Output:
   optional: limit conversion to selected files via --input-file
 
 Defaults:
-  profile: balanced
+  profile: auto
   memory: auto-detected from system RAM unless --max-memory-mb is provided
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
 Profile / tuning:
   Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
-  clamped to a min/max). Workers is only capped by 'safe'.
+  clamped to a min/max). Workers is only capped by 'safe' and 'auto'.
 
-  profile    workers cap   memory fraction   memory range
+  profile    workers cap   memory fraction   memory range   notes
+  auto       —             35% balanced /    4–24 GiB /     small files: parallel balanced
+                           75% of RAM        up to 75% RAM  large files: serial, max memory
   safe       max 2         15% of usable     1 – 8 GiB
   balanced   (none)        35% of usable     4 – 24 GiB
   fast       (none)        55% of usable     8 – 32 GiB
+
+  Auto mode threshold: a file is 'large' when its estimated peak memory exceeds
+  the balanced per-worker budget (gz_size × 15). Threshold scales with system RAM.
 
   Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
   Set --max-memory-mb to override the profile memory calculation entirely.
@@ -577,8 +582,8 @@ struct SharedArgs {
     #[arg(help = "Dataset name (works, authors, ...) or 'all'")]
     dataset: String,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of worker threads")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of worker threads (0 = auto: cpus-2 for auto profile, 4 otherwise)")]
     workers: usize,
 
     #[arg(long)]
@@ -589,6 +594,7 @@ struct SharedArgs {
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Profile {
+    Auto,
     Safe,
     Balanced,
     Fast,
@@ -649,9 +655,9 @@ struct ConvertArgs {
     #[command(flatten)]
     shared: SharedArgs,
 
-    #[arg(long, value_enum, default_value = "balanced")]
+    #[arg(long, value_enum, default_value = "auto")]
     #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
     )]
     profile: Profile,
 
@@ -698,6 +704,12 @@ struct ConvertArgs {
     #[arg(long, value_enum, default_value = "dataset")]
     #[arg(help = "Disk check scope: dataset preflight or per-file")]
     disk_check_scope: DiskCheckScope,
+
+    #[arg(long)]
+    #[arg(
+        help = "Override auto large-file threshold in MB (auto profile only; files at or above this size use the serial large-file pass)"
+    )]
+    large_file_threshold_mb: Option<usize>,
 
     #[arg(long, default_value_t = false)]
     #[arg(help = "Refresh schema cache before conversion")]
@@ -873,8 +885,8 @@ struct IndexArgs {
     #[arg(help = "Optional output index file path")]
     index_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of workers (same semantics as convert)")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of workers (0 = auto: cpus-2, same semantics as convert)")]
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
@@ -956,12 +968,14 @@ struct RepairArgs {
     shared: SharedArgs,
 
     #[arg(long)]
-    #[arg(help = "Path to verify report JSON (RunReport format)")]
-    from_verify_report: PathBuf,
-
-    #[arg(long, value_enum, default_value = "balanced")]
     #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Path to verify_convert report JSON; if omitted, the latest verify_convert report under <root>/openalex-snapshot_metadata/reports/ is used automatically"
+    )]
+    from_verify_report: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value = "auto")]
+    #[arg(
+        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
     )]
     profile: Profile,
 
@@ -1109,8 +1123,8 @@ struct ValidateDownloadArgs {
     )]
     profile: Profile,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of worker threads for local integrity checks")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of worker threads for local integrity checks (0 = auto: cpus-2)")]
     workers: usize,
 
     #[arg(long, default_value_t = true)]
@@ -1144,8 +1158,8 @@ struct VerifyIndexArgs {
     #[arg(help = "Optional index file path (default: <parquet_dir>/<dataset>_id_idx.parquet)")]
     index_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of workers")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of workers (0 = auto: cpus-2)")]
     workers: usize,
 
     #[arg(long, value_enum, default_value = "balanced")]
@@ -1428,6 +1442,7 @@ struct ConvertConfig {
     seed: Option<u64>,
     refresh_cache: Option<bool>,
     skip_disk_check: Option<bool>,
+    large_file_threshold_mb: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1635,6 +1650,7 @@ struct FilePair {
     input_gz: PathBuf,
     output_parquet: PathBuf,
     rel: PathBuf,
+    gz_size_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2254,6 +2270,11 @@ fn apply_convert_config(
                 args.skip_disk_check = v;
             }
         }
+        if !cli_explicit(matches, "large_file_threshold_mb") {
+            if let Some(v) = c.large_file_threshold_mb {
+                args.large_file_threshold_mb = Some(v);
+            }
+        }
     }
 }
 
@@ -2690,7 +2711,7 @@ fn apply_repair_config(
         }
         if !cli_explicit(matches, "from_verify_report") {
             if let Some(v) = &c.from_verify_report {
-                args.from_verify_report = v.clone();
+                args.from_verify_report = Some(v.clone());
             }
         }
     }
@@ -3333,20 +3354,22 @@ defaults:
   # allowed values: all | <dataset-name>
   dataset: all
 
-  # Shared runtime defaults.
-  # allowed values: integer >= 1
-  workers: 4
+  # Shared runtime defaults — leave commented to use built-in auto mode.
   # allowed values: any valid executable path
   # duckdb_bin: /usr/local/bin/duckdb
-  # Performance/memory profile (safe | balanced | fast).
-  # Controls DuckDB memory budget per worker (80% of RAM × fraction, clamped):
-  #   safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
-  #   balanced — workers uncapped,    memory 35% of usable RAM (4–24 GiB)
-  #   fast     — workers uncapped,    memory 55% of usable RAM (8–32 GiB)
+  # Profile controls DuckDB memory budget and worker count.
+  # auto (default) — two-tier: small files run in parallel (balanced), large files
+  #   run serially with maximised memory. Threshold derived from system RAM.
+  # safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
+  # balanced — workers cpus-2,      memory 35% of usable RAM (4–24 GiB)
+  # fast     — workers cpus-2,      memory 55% of usable RAM (8–32 GiB)
   # Fallback when RAM is undetectable: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
-  # Override memory independently with max_memory_mb.
-  # allowed values: safe | balanced | fast
-  profile: balanced
+  # allowed values: auto | safe | balanced | fast
+  # profile: auto
+  # Workers: 0 (default) = auto-detect (cpus-2 for auto/balanced/fast, 1 for safe).
+  # Override only if you want to pin a specific value.
+  # allowed values: integer >= 0 (0 = auto)
+  # workers: 0
   # allowed values: integer >= 1
   # max_memory_mb: 8192
   # allowed values: true | false
@@ -3491,6 +3514,14 @@ convert:
   # Useful when converting a single small dataset where the global estimate is too conservative.
   # allowed values: true | false
   # skip_disk_check: false
+
+  # Auto-profile large-file threshold override (auto profile only).
+  # Files >= this size (gz, in MB) are routed to the serial large-file pass instead of the
+  # parallel balanced pass. Leave unset to use the auto formula (balanced_mem_mb / 7.5).
+  # Increase if small files are OOMing in the parallel pass; they will then be retried
+  # serially. You can also fix individual failures with repair_convert.
+  # allowed values: integer >= 1 (MB)
+  # large_file_threshold_mb: 950
 
 verify_convert:
   # ---------------------------------------------------------------------------
@@ -4345,6 +4376,234 @@ fn run_report(args: ReportArgs) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct LiveDatasetStatus {
+    dataset: String,
+    status: String, // "done" | "in-progress" | "pending" | "error"
+    scanned: u64,
+    todo: u64,
+    converted: u64,
+    ok: u64,
+    failed: u64,
+    skipped: u64,
+    last_log: String,
+}
+
+fn parse_u64_field(line: &str, field: &str) -> Option<u64> {
+    let key = format!("{}=", field);
+    let pos = line.find(key.as_str())?;
+    let rest = &line[pos + key.len()..];
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
+    let dataset = log_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let Ok(txt) = fs::read_to_string(log_path) else {
+        return LiveDatasetStatus {
+            dataset,
+            status: "pending".to_string(),
+            scanned: 0,
+            todo: 0,
+            converted: 0,
+            ok: 0,
+            failed: 0,
+            skipped: 0,
+            last_log: String::new(),
+        };
+    };
+
+    let last_log = txt.lines().last().unwrap_or("").to_string();
+    let mut scanned = 0u64;
+    let mut todo = 0u64;
+    let mut converted = 0u64;
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut done = false;
+    let mut errored = false;
+
+    for line in txt.lines() {
+        if let Some(v) = parse_u64_field(line, "source_files") {
+            scanned = v;
+        }
+        if let Some(v) = parse_u64_field(line, "todo_files") {
+            todo = v;
+        }
+        // count per-file completion lines emitted by convert/index/verify
+        if line.contains(" converted ") || line.contains(" indexed ") || line.contains(" verified ")
+        {
+            converted += 1;
+        }
+        // summary line written at end of a stage
+        if line.contains(" summary ") {
+            if let Some(v) = parse_u64_field(line, "ok") {
+                ok = v;
+            }
+            if let Some(v) = parse_u64_field(line, "failed") {
+                failed = v;
+            }
+            if let Some(v) = parse_u64_field(line, "scanned") {
+                scanned = v;
+            }
+            if failed > 0 {
+                errored = true;
+            }
+            done = true;
+        }
+        if line.contains("all files already converted")
+            || line.contains("all files already indexed")
+            || line.contains("all files already verified")
+        {
+            done = true;
+            skipped = scanned;
+        }
+    }
+
+    let status = if errored {
+        "error"
+    } else if done {
+        "done"
+    } else if scanned > 0 || converted > 0 {
+        "in-progress"
+    } else {
+        "pending"
+    }
+    .to_string();
+
+    LiveDatasetStatus {
+        dataset,
+        status,
+        scanned,
+        todo,
+        converted,
+        ok,
+        failed,
+        skipped,
+        last_log,
+    }
+}
+
+fn live_progress(parquet_dir: &Path, lock: &LockInfo) -> Vec<LiveDatasetStatus> {
+    let meta_root = metadata_root(parquet_dir);
+    let Ok(entries) = fs::read_dir(&meta_root) else {
+        return Vec::new();
+    };
+    let mut statuses: Vec<LiveDatasetStatus> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            !n.starts_with('.') && n != "reports" && n != "archived" && n != "download"
+        })
+        .map(|e| {
+            let log_dir = dataset_log_dir_for_command(
+                parquet_dir,
+                &e.file_name().to_string_lossy(),
+                &lock.command,
+            );
+            let log_path = log_dir.join(format!("{}.log", &lock.command));
+            if log_path.exists() {
+                live_dataset_status(&log_path)
+            } else {
+                LiveDatasetStatus {
+                    dataset: e.file_name().to_string_lossy().into_owned(),
+                    status: "pending".to_string(),
+                    scanned: 0,
+                    todo: 0,
+                    converted: 0,
+                    ok: 0,
+                    failed: 0,
+                    skipped: 0,
+                    last_log: String::new(),
+                }
+            }
+        })
+        .collect();
+    statuses.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+    statuses
+}
+
+fn print_live_progress(lock: &LockInfo, datasets: &[LiveDatasetStatus]) {
+    let runtime = (now_unix() - lock.started_at_unix).max(0) as f64;
+    let done = datasets.iter().filter(|d| d.status == "done").count();
+    let in_progress = datasets
+        .iter()
+        .filter(|d| d.status == "in-progress")
+        .count();
+    let errors = datasets.iter().filter(|d| d.status == "error").count();
+    let pending = datasets.iter().filter(|d| d.status == "pending").count();
+
+    // aggregate cross-dataset totals for a pipeline-level ETA
+    let total_converted: u64 = datasets.iter().map(|d| d.converted).sum();
+    let total_todo: u64 = datasets.iter().map(|d| d.todo).sum();
+    let eta_str = if total_todo > 0 && total_converted > 0 && runtime > 0.0 {
+        let rate = total_converted as f64 / runtime; // files/sec
+        let remaining = total_todo.saturating_sub(total_converted) as f64;
+        let eta_secs = remaining / rate;
+        format!(" eta={}", format_duration(eta_secs))
+    } else {
+        String::new()
+    };
+    let progress_str = if total_todo > 0 {
+        format!(" ({} of {})", total_converted, total_todo)
+    } else {
+        String::new()
+    };
+
+    println!(
+        "[progress] command={} pid={} started={} runtime={}{}{}",
+        lock.command,
+        lock.pid,
+        lock.started_at_unix,
+        format_duration(runtime),
+        progress_str,
+        eta_str,
+    );
+    println!(
+        "[progress] datasets: done={} in-progress={} pending={} error={}",
+        done, in_progress, pending, errors
+    );
+    for ds in datasets {
+        if ds.status == "pending" && ds.last_log.is_empty() {
+            continue; // omit datasets not yet started
+        }
+        let ds_progress = if ds.todo > 0 {
+            format!(" ({} of {})", ds.converted, ds.todo)
+        } else if ds.converted > 0 {
+            format!(" converted={}", ds.converted)
+        } else {
+            String::new()
+        };
+        let ds_eta = if ds.todo > 0 && ds.converted > 0 && runtime > 0.0 {
+            let rate = ds.converted as f64 / runtime;
+            let remaining = ds.todo.saturating_sub(ds.converted) as f64;
+            format!(" eta={}", format_duration(remaining / rate))
+        } else {
+            String::new()
+        };
+        print!(
+            "[progress] dataset={} status={}{}{}",
+            ds.dataset, ds.status, ds_progress, ds_eta
+        );
+        if ds.ok > 0 || ds.failed > 0 || ds.skipped > 0 {
+            print!(" ok={} failed={} skipped={}", ds.ok, ds.failed, ds.skipped);
+        }
+        println!();
+        if !ds.last_log.is_empty() && ds.status != "done" {
+            // strip timestamp prefix for readability
+            let msg = ds.last_log.splitn(3, ' ').nth(2).unwrap_or(&ds.last_log);
+            println!("          {}", msg);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProgressView {
     command: String,
     report_path: String,
@@ -4706,7 +4965,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             signed: false,
             check_extra: true,
             profile: Profile::Balanced,
-            workers: 4,
+            workers: 0,
             progress: true,
             explain: false,
             state_flush_every: 25,
@@ -4737,10 +4996,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                 snapshot_dir: PathBuf::new(),
                 parquet_dir: PathBuf::new(),
                 dataset: "all".to_string(),
-                workers: 4,
+                workers: 0,
                 duckdb_bin: None,
             },
-            profile: Profile::Balanced,
+            profile: Profile::Auto,
             max_memory_mb: None,
             row_group_rows: 100_000,
             batch_rows: 5_000,
@@ -4752,6 +5011,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             skip_disk_check: resolved.skip_disk_check,
             disk_check_scope: DiskCheckScope::Dataset,
             refresh_cache: false,
+            large_file_threshold_mb: None,
             explain: false,
             state_flush_every: 25,
         };
@@ -4788,7 +5048,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                     snapshot_dir: PathBuf::new(),
                     parquet_dir: PathBuf::new(),
                     dataset: "all".to_string(),
-                    workers: 4,
+                    workers: 0,
                     duckdb_bin: None,
                 },
                 profile: Profile::Balanced,
@@ -4834,11 +5094,11 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
                     snapshot_dir: PathBuf::new(),
                     parquet_dir: PathBuf::new(),
                     dataset: "all".to_string(),
-                    workers: 4,
+                    workers: 0,
                     duckdb_bin: None,
                 },
-                from_verify_report: report_path.clone(),
-                profile: Profile::Balanced,
+                from_verify_report: Some(report_path.clone()),
+                profile: Profile::Auto,
                 max_memory_mb: None,
                 progress: true,
                 explain: false,
@@ -4848,7 +5108,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             apply_repair_config(&mut ra, Some(cfg), None);
             fill_shared_dirs(&mut ra.shared);
             // Always repair from loop-selected verify report.
-            ra.from_verify_report = report_path;
+            ra.from_verify_report = Some(report_path);
             record_all_step(
                 &mut report,
                 &mut step_failed,
@@ -4885,7 +5145,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             root_dir: resolved.root_dir.clone(),
             dataset: "all".to_string(),
             index_file: None,
-            workers: 4,
+            workers: 0,
             profile: Profile::Balanced,
             max_memory_mb: None,
             duckdb_bin: None,
@@ -4916,7 +5176,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             root_dir: resolved.root_dir.clone(),
             dataset: "all".to_string(),
             index_file: None,
-            workers: 4,
+            workers: 0,
             profile: Profile::Balanced,
             max_memory_mb: None,
             duckdb_bin: None,
@@ -4962,35 +5222,43 @@ fn run_progress(mut args: ProgressArgs) -> Result<()> {
     if args.once {
         args.watch = false;
     }
-    if !args.watch {
-        let view = progress_snapshot(&args)?;
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&view)?);
-        } else {
-            print_progress_human(&view);
+
+    let show_once = |args: &ProgressArgs| match check_lock(&args.parquet_dir) {
+        Some(lock) => {
+            let statuses = live_progress(&args.parquet_dir, &lock);
+            if args.json {
+                let _ = serde_json::to_string_pretty(&statuses).map(|s| println!("{}", s));
+            } else {
+                print_live_progress(&lock, &statuses);
+            }
         }
+        None => match progress_snapshot(args) {
+            Ok(view) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&view).unwrap_or_default()
+                    );
+                } else {
+                    print_progress_human(&view);
+                }
+            }
+            Err(e) => eprintln!("[progress] no active run and no recent report: {e}"),
+        },
+    };
+
+    if !args.watch {
+        show_once(&args);
         return Ok(());
     }
 
     loop {
-        match progress_snapshot(&args) {
-            Ok(view) => {
-                if args.json {
-                    println!("{}", serde_json::to_string(&view)?);
-                } else {
-                    print!("\x1B[2J\x1B[H");
-                    print_progress_human(&view);
-                    stdout().flush()?;
-                }
-                if !args.watch {
-                    return Ok(());
-                }
-                match check_lock(&args.parquet_dir) {
-                    Some(_) => {} // pipeline running, keep watching
-                    None => return Ok(()),
-                }
-            }
-            Err(_) => return Ok(()),
+        print!("\x1B[2J\x1B[H");
+        show_once(&args);
+        stdout().flush()?;
+        if check_lock(&args.parquet_dir).is_none() {
+            println!("[progress] pipeline finished");
+            return Ok(());
         }
         thread::sleep(Duration::from_secs(args.interval_sec.max(1)));
     }
@@ -5315,16 +5583,57 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
 
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    // For auto profile, compute balanced tuning for the small-file parallel pass
+    // and a maximised-memory serial tuning for large files.
+    let is_auto = args.profile == Profile::Auto;
+    let total_mb = detect_total_memory_mb();
+    let (tuning, large_tuning) = if is_auto {
+        let balanced = resolve_tuning_with_total(
+            Profile::Balanced,
+            args.shared.workers,
+            args.max_memory_mb,
+            total_mb,
+        );
+        let safe_mem = auto_profile_memory_mb(Profile::Safe, total_mb);
+        let large_mem = auto_large_file_memory_mb(total_mb.unwrap_or(0), safe_mem);
+        let large = Tuning {
+            workers: 1,
+            memory_mb: Some(large_mem),
+        };
+        (balanced, Some(large))
+    } else {
+        (
+            resolve_tuning(
+                args.profile.clone(),
+                args.shared.workers,
+                args.max_memory_mb,
+            ),
+            None,
+        )
+    };
     if args.explain {
         explain_convert(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "convert")?;
+    let convert_start = Instant::now();
+    // Print resolved settings so they're visible at run start.
+    if is_auto {
+        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
+        eprintln!(
+            "[convert] profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+            large_mem,
+        );
+    } else {
+        eprintln!(
+            "[convert] profile={} workers={} memory_mb={}",
+            format!("{:?}", args.profile).to_lowercase(),
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+        );
+    }
     let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
@@ -5435,10 +5744,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         }
         let pairs_len = pairs.len();
 
-        let todo: Vec<FilePair> = pairs
+        let mut todo: Vec<FilePair> = pairs
             .into_iter()
             .filter(|p| !p.output_parquet.exists())
             .collect();
+        // Process largest files first in all passes to minimise tail-latency stragglers.
+        todo.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
 
         if todo.is_empty() {
             eprintln!("[convert] dataset={dataset} all files already converted");
@@ -5452,17 +5763,75 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             report.datasets.push(ds);
             continue;
         }
-        ds.items_scanned = todo.len() as u64;
 
+        // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
+        let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
+            let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
+            let large_mem_mb = lt.memory_mb.unwrap_or(4096);
+            // Only works uses maximum_object_size=1 GiB.  All other datasets have no
+            // such fixed overhead and safely run every file through the parallel pass.
+            // For works, use the large-pass memory as the threshold reference so that
+            // files a single large-pass worker can handle comfortably (large_mem/15)
+            // still go through the parallel pass; only files that stress even the
+            // serial pass are routed there.
+            let threshold: u64 = if dataset != "works" {
+                u64::MAX // all files → small (parallel) pass
+            } else {
+                match args.large_file_threshold_mb {
+                    Some(mb) => mb as u64 * 1024 * 1024,
+                    None => auto_threshold_bytes(large_mem_mb, 6.0),
+                }
+            };
+            let mut large: Vec<FilePair> = todo
+                .iter()
+                .filter(|p| p.gz_size_bytes >= threshold)
+                .cloned()
+                .collect();
+            large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
+            todo.retain(|p| p.gz_size_bytes < threshold); // already sorted largest-first from above
+            let threshold_display = if threshold == u64::MAX {
+                "all".to_string()
+            } else {
+                format!("{}MB", threshold / (1024 * 1024))
+            };
+            eprintln!(
+                "[convert] auto dataset={dataset} small={} large={} threshold={threshold_display} balanced_mem={}MB large_mem={}MB",
+                todo.len(),
+                large.len(),
+                balanced_mem_mb,
+                large_mem_mb,
+            );
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                &format!(
+                    "auto small={} large={} threshold={}",
+                    todo.len(),
+                    large.len(),
+                    threshold_display
+                ),
+            );
+            large
+        } else {
+            Vec::new()
+        };
+
+        ds.items_scanned = (todo.len() + large_todo.len()) as u64;
+
+        let schema_start = Instant::now();
         eprintln!(
             "[convert] dataset={dataset} todo_files={} (starting schema inference)",
-            todo.len()
+            todo.len() + large_todo.len()
         );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
             "convert",
-            &format!("todo_files={} schema_inference_start", todo.len()),
+            &format!(
+                "todo_files={} schema_inference_start",
+                todo.len() + large_todo.len()
+            ),
         );
         fs::create_dir_all(dataset_cache_dir(&args.shared.parquet_dir, dataset))?;
         let schema = match load_or_infer_source_schema(
@@ -5473,6 +5842,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -5509,7 +5879,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 continue;
             }
         };
-        eprintln!("[convert] dataset={dataset} schema inference complete");
+        eprintln!(
+            "[convert] dataset={dataset} schema inference complete elapsed={}",
+            format_duration(schema_start.elapsed().as_secs_f64())
+        );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
@@ -5641,19 +6014,111 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             let _ = write_run_reports(&args.shared.parquet_dir, &preview);
         }
 
-        pb.finish_with_message(format!(
-            "convert:{dataset} done in {:.1}s",
-            start.elapsed().as_secs_f64()
-        ));
-        eprintln!("[convert] dataset={dataset} conversion stage complete");
+        let small_elapsed = start.elapsed().as_secs_f64();
+        pb.finish_with_message(format!("convert:{dataset} done in {:.1}s", small_elapsed));
+        if !todo.is_empty() || large_todo.is_empty() {
+            eprintln!(
+                "[convert] dataset={dataset} small-pass done ok={} failed={} elapsed={}",
+                ds.items_scanned.saturating_sub(ds.failed),
+                ds.failed,
+                format_duration(small_elapsed),
+            );
+        }
+
+        // Auto profile: serial pass for large files with maximised memory.
+        if !large_todo.is_empty() {
+            let lt = large_tuning.as_ref().expect("large_tuning set for auto");
+            let large_start = Instant::now();
+            let failed_before_large = ds.failed;
+            eprintln!(
+                "[convert] auto dataset={dataset} large-file pass: {} files workers=1 memory_mb={:?}",
+                large_todo.len(),
+                lt.memory_mb,
+            );
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                &format!(
+                    "auto large_pass start count={} memory_mb={:?}",
+                    large_todo.len(),
+                    lt.memory_mb
+                ),
+            );
+            let pb_large = make_progress_bar(
+                args.progress,
+                large_todo.len() as u64,
+                &format!("convert:{dataset}(large)"),
+            );
+            for pair in &large_todo {
+                let _ = fs::remove_file(&pair.output_parquet); // remove partial output
+                match convert_one(
+                    &duckdb_bin,
+                    pair,
+                    &schema_arc,
+                    &compression,
+                    row_group_rows,
+                    lt.memory_mb,
+                    &extra_json_options,
+                ) {
+                    Ok(()) => {
+                        try_log_dataset(
+                            &args.shared.parquet_dir,
+                            dataset,
+                            "convert",
+                            &format!("large file converted {}", pair.rel.to_string_lossy()),
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        ds.failed += 1;
+                        report.failures.push(FailureEntry {
+                            dataset: dataset.clone(),
+                            phase: "convert_file".to_string(),
+                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                            error_message: msg,
+                            suggested_recovery: Some(format!(
+                                "openalex-snapshot convert --root-dir {} --dataset {} --profile safe --workers 1 --input-file {}",
+                                args.shared.root_dir.display(),
+                                dataset,
+                                pair.input_gz.display(),
+                            )),
+                        });
+                    }
+                }
+                pb_large.inc(1);
+            }
+            let large_elapsed = large_start.elapsed().as_secs_f64();
+            let large_failed = ds.failed - failed_before_large;
+            let large_ok = large_todo.len() as u64 - large_failed;
+            pb_large.finish_with_message(format!(
+                "convert:{dataset}(large) done in {}",
+                format_duration(large_elapsed)
+            ));
+            eprintln!(
+                "[convert] dataset={dataset} large-pass done ok={large_ok} failed={large_failed} elapsed={}",
+                format_duration(large_elapsed),
+            );
+            try_log_dataset(
+                &args.shared.parquet_dir,
+                dataset,
+                "convert",
+                &format!("auto large_pass complete elapsed_s={:.2}", large_elapsed),
+            );
+        }
+
+        let dataset_elapsed = dataset_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[convert] dataset={dataset} done elapsed={}",
+            format_duration(dataset_elapsed)
+        );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
             "convert",
-            &format!(
-                "conversion stage complete elapsed_s={:.2}",
-                dataset_start.elapsed().as_secs_f64()
-            ),
+            &format!("conversion stage complete elapsed_s={:.2}", dataset_elapsed),
         );
         ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
         report.datasets.push(ds);
@@ -5663,11 +6128,30 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     report_finalize(&mut report);
     let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
+    let total_elapsed = convert_start.elapsed().as_secs_f64();
+    let settings_str = if is_auto {
+        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
+        format!(
+            " profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+            large_mem,
+        )
+    } else {
+        format!(
+            " profile={} workers={} memory_mb={}",
+            format!("{:?}", args.profile).to_lowercase(),
+            tuning.workers,
+            tuning.memory_mb.unwrap_or(0),
+        )
+    };
     eprintln!(
-        "[convert] summary scanned={} ok={} failed={} reports={}",
+        "[convert] summary scanned={} ok={} failed={} elapsed={}{} reports={}",
         report.totals_items_scanned,
         report.totals_succeeded,
         report.totals_failed,
+        format_duration(total_elapsed),
+        settings_str,
         report_paths
             .iter()
             .map(|p| p.display().to_string())
@@ -6784,6 +7268,7 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -6830,6 +7315,7 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
                 args.sample_size,
                 args.refresh_cache,
                 tuning.memory_mb,
+                tuning.workers,
                 args.state_flush_every,
             ) {
                 Ok(v) => v,
@@ -6985,6 +7471,7 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         )?;
         let right = load_schema_by_policy(
@@ -6996,6 +7483,7 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         )?;
 
@@ -7042,20 +7530,21 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
 
 fn explain_repair(
     args: &RepairArgs,
+    verify_report_path: &Path,
     datasets: &[String],
     duckdb_bin: &Path,
     tuning: &Tuning,
 ) -> Result<()> {
-    let txt = fs::read_to_string(&args.from_verify_report).with_context(|| {
+    let txt = fs::read_to_string(verify_report_path).with_context(|| {
         format!(
             "failed to read verify report {}",
-            args.from_verify_report.display()
+            verify_report_path.display()
         )
     })?;
     let verify_report: RunReport = serde_json::from_str(&txt).with_context(|| {
         format!(
             "failed to parse verify report {}",
-            args.from_verify_report.display()
+            verify_report_path.display()
         )
     })?;
     let targets = collect_repair_targets(
@@ -7068,7 +7557,7 @@ fn explain_repair(
     println!("duckdb_bin: {}", duckdb_bin.display());
     println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
     println!("parquet_dir: {}", args.shared.parquet_dir.display());
-    println!("from_verify_report: {}", args.from_verify_report.display());
+    println!("from_verify_report: {}", verify_report_path.display());
     println!("datasets filter: {}", datasets.join(", "));
     println!("workers: {}", tuning.workers);
     println!("memory_mb: {:?}", tuning.memory_mb);
@@ -7076,6 +7565,27 @@ fn explain_repair(
     println!("selected_files: {}", targets.len());
     println!("post_verify: targeted file-level verify enabled");
     Ok(())
+}
+
+fn resolve_verify_report_path(args: &RepairArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.from_verify_report {
+        return Ok(p.clone());
+    }
+    let reports_dir = global_reports_dir(&args.shared.parquet_dir);
+    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "verify_convert") {
+        return Ok(p);
+    }
+    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "convert") {
+        eprintln!(
+            "[repair] no verify_convert report found; using convert report: {}",
+            p.display()
+        );
+        return Ok(p);
+    }
+    bail!(
+        "no verify_convert or convert report found under {}; run convert or verify_convert first, or pass --from-verify-report",
+        reports_dir.display()
+    )
 }
 
 fn run_repair(args: RepairArgs) -> Result<()> {
@@ -7088,13 +7598,14 @@ fn run_repair(args: RepairArgs) -> Result<()> {
         args.shared.workers,
         args.max_memory_mb,
     );
+    let verify_report_path = resolve_verify_report_path(&args)?;
 
     if args.explain {
-        explain_repair(&args, &datasets, &duckdb_bin, &tuning)?;
+        explain_repair(&args, &verify_report_path, &datasets, &duckdb_bin, &tuning)?;
         return Ok(());
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "repair")?;
-    // Do NOT archive here — repair reads an existing verify report at a user-specified path
+    // Do NOT archive here — repair reads an existing verify report
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "repair_convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "repair_convert");
 
@@ -7102,7 +7613,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
     report_args.insert("dataset".to_string(), args.shared.dataset.clone());
     report_args.insert(
         "from_verify_report".to_string(),
-        args.from_verify_report.to_string_lossy().to_string(),
+        verify_report_path.to_string_lossy().to_string(),
     );
     report_args.insert("workers".to_string(), tuning.workers.to_string());
     report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
@@ -7113,18 +7624,18 @@ fn run_repair(args: RepairArgs) -> Result<()> {
     let mut report = report_new("repair_convert", report_args);
     let flush_every = args.state_flush_every.max(1);
 
-    let verify_report: RunReport = match fs::read_to_string(&args.from_verify_report)
+    let verify_report: RunReport = match fs::read_to_string(&verify_report_path)
         .with_context(|| {
             format!(
                 "failed to read verify report {}",
-                args.from_verify_report.display()
+                verify_report_path.display()
             )
         })
         .and_then(|txt| {
             serde_json::from_str(&txt).with_context(|| {
                 format!(
                     "failed to parse verify report {}",
-                    args.from_verify_report.display()
+                    verify_report_path.display()
                 )
             })
         }) {
@@ -7134,7 +7645,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
                 dataset: args.shared.dataset.clone(),
                 phase: "repair_report_parse".to_string(),
                 rel_path: None,
-                source_path: Some(args.from_verify_report.to_string_lossy().to_string()),
+                source_path: Some(verify_report_path.to_string_lossy().to_string()),
                 output_path: None,
                 error_message: format!("{e:#}"),
                 suggested_recovery: Some("provide a valid verify report JSON".to_string()),
@@ -7226,6 +7737,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
             100,
             false,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -7303,6 +7815,9 @@ fn run_repair(args: RepairArgs) -> Result<()> {
                             input_gz: t.source_path.clone(),
                             output_parquet: t.output_path.clone(),
                             rel: t.rel.clone(),
+                            gz_size_bytes: fs::metadata(&t.source_path)
+                                .map(|m| m.len())
+                                .unwrap_or(0),
                         };
                         if let Err(e) = convert_one(
                             &duckdb_arc,
@@ -7457,7 +7972,7 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         signed: args.signed,
         check_extra: effective_delete,
         profile: Profile::Balanced,
-        workers: 4,
+        workers: 0,
         progress: false,
         explain: false,
         state_flush_every: args.state_flush_every,
@@ -8019,17 +8534,48 @@ fn resolve_tuning(profile: Profile, workers: usize, max_memory_mb: Option<usize>
     resolve_tuning_with_total(profile, workers, max_memory_mb, total_mb)
 }
 
+fn auto_worker_count() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cpus.saturating_sub(2).max(1)
+}
+
 fn resolve_tuning_with_total(
     profile: Profile,
     workers: usize,
     max_memory_mb: Option<usize>,
     total_mb: Option<usize>,
 ) -> Tuning {
+    // workers==0 means "auto": cpus-2 for Auto/Balanced/Fast, capped at 2 for Safe
+    let resolved_workers = if workers == 0 {
+        match profile {
+            Profile::Auto | Profile::Balanced | Profile::Fast => auto_worker_count(),
+            Profile::Safe => 1,
+        }
+    } else {
+        workers
+    };
     let mut out = Tuning {
-        workers: workers.max(1),
+        workers: resolved_workers.max(1),
         memory_mb: max_memory_mb,
     };
     match profile {
+        Profile::Auto | Profile::Balanced => {
+            if out.memory_mb.is_none() {
+                // Divide total balanced budget across workers so aggregate stays within 35% of RAM.
+                // 1280 MiB floor per worker gives ~8 workers on a 36 GB machine
+                // (8 × 1290 MB = 10 320 MB total budget), preventing the original swap
+                // pressure caused by giving each worker the full undivided budget.
+                // If that floor would need more workers than the budget allows, cap worker count.
+                const MIN_PER_WORKER_MB: usize = 1280;
+                let total = auto_profile_memory_mb(Profile::Balanced, total_mb);
+                let max_workers = (total / MIN_PER_WORKER_MB).max(1);
+                out.workers = out.workers.min(max_workers).max(1);
+                let per_worker = (total / out.workers).max(MIN_PER_WORKER_MB);
+                out.memory_mb = Some(per_worker);
+            }
+        }
         Profile::Safe => {
             out.workers = out.workers.clamp(1, 2);
             if out.memory_mb.is_none() {
@@ -8040,14 +8586,15 @@ fn resolve_tuning_with_total(
                 out.memory_mb = Some(mb);
             }
         }
-        Profile::Balanced => {
-            if out.memory_mb.is_none() {
-                out.memory_mb = Some(auto_profile_memory_mb(Profile::Balanced, total_mb));
-            }
-        }
         Profile::Fast => {
             if out.memory_mb.is_none() {
-                out.memory_mb = Some(auto_profile_memory_mb(Profile::Fast, total_mb));
+                // Same treatment as Balanced: divide total budget across workers.
+                const MIN_PER_WORKER_MB: usize = 1280;
+                let total = auto_profile_memory_mb(Profile::Fast, total_mb);
+                let max_workers = (total / MIN_PER_WORKER_MB).max(1);
+                out.workers = out.workers.min(max_workers).max(1);
+                let per_worker = (total / out.workers).max(MIN_PER_WORKER_MB);
+                out.memory_mb = Some(per_worker);
             }
         }
     }
@@ -8068,8 +8615,8 @@ fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
 fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     // Conservative defaults when RAM cannot be detected.
     let fallback = match profile {
+        Profile::Auto | Profile::Balanced => 6144,
         Profile::Safe => 2048,
-        Profile::Balanced => 6144,
         Profile::Fast => 12_288,
     };
     let t = match total_mb {
@@ -8080,17 +8627,28 @@ fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
     // Keep some headroom for OS and other processes.
     let usable = (t as f64 * 0.80).floor() as usize;
     let mb = match profile {
+        Profile::Auto | Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
         Profile::Safe => ((usable as f64) * 0.15).floor() as usize,
-        Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
         Profile::Fast => ((usable as f64) * 0.55).floor() as usize,
     };
 
     let (min_mb, max_mb) = match profile {
+        Profile::Auto | Profile::Balanced => (4096, 24_576),
         Profile::Safe => (1024, 8192),
-        Profile::Balanced => (4096, 24_576),
         Profile::Fast => (8192, 32_768),
     };
     mb.max(min_mb).min(max_mb)
+}
+
+fn auto_threshold_bytes(balanced_mem_mb: usize, expansion_factor: f64) -> u64 {
+    let overhead = 2.5_f64;
+    ((balanced_mem_mb as f64 * 1024.0 * 1024.0) / (expansion_factor * overhead)) as u64
+}
+
+fn auto_large_file_memory_mb(total_ram_mb: usize, safe_mem_mb: usize) -> usize {
+    (safe_mem_mb * 2)
+        .min(total_ram_mb * 75 / 100)
+        .max(safe_mem_mb)
 }
 
 fn detect_total_memory_mb() -> Option<usize> {
@@ -8164,10 +8722,12 @@ fn enumerate_pairs(
         out_rel.set_extension("parquet");
         let out_path = out_root.join(&out_rel);
 
+        let gz_size_bytes = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         pairs.push(FilePair {
             input_gz: p.to_path_buf(),
             output_parquet: out_path,
             rel,
+            gz_size_bytes,
         });
     }
 
@@ -8239,7 +8799,7 @@ fn collect_repair_targets(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for f in &verify_report.failures {
-        if f.phase != "verify_metrics" {
+        if f.phase != "verify_metrics" && f.phase != "convert_file" {
             continue;
         }
         if !allowed_datasets.contains(&f.dataset) {
@@ -8887,6 +9447,25 @@ fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
     metadata_root(parquet_dir).join("reports")
 }
 
+fn latest_report_for_command(parquet_dir: &Path, command: &str) -> Option<PathBuf> {
+    let dir = global_reports_dir(parquet_dir);
+    let prefix = format!("{}-", sanitize_command_name(command));
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().last()
+}
+
 fn cleanup_command_reports(parquet_dir: &Path, command: &str) -> Result<()> {
     let prefix = format!("{}-", sanitize_command_name(command));
     let dir = global_reports_dir(parquet_dir);
@@ -8922,7 +9501,8 @@ fn cleanup_command_dataset_logs(parquet_dir: &Path, log_command: &str) -> Result
         if matches!(name.as_ref(), "reports" | "archived" | "download") {
             continue;
         }
-        // Clean logs from step subdirectories
+        // Clean logs from step subdirectories only — schemata/ is a persistent cache
+        // and must never be removed by log cleanup.
         for step in &["convert", "conversion-verify", "index", "index-verify"] {
             let p = ent.path().join(step).join(format!("{log_command}.log"));
             if p.exists() {
@@ -9149,7 +9729,8 @@ fn archive_completed_run(parquet_dir: &Path, snapshot_dir: &Path) -> Result<()> 
         moved_any = true;
     }
 
-    // Move dataset logs
+    // Move dataset logs — schemata/ is intentionally excluded: it is a persistent
+    // cache that should survive across runs and must not be archived or removed.
     if meta_root.exists() {
         for entry in fs::read_dir(&meta_root)?.flatten() {
             let ds_dir = entry.path();
@@ -9600,6 +10181,7 @@ fn load_or_infer_source_schema(
     sample_size: usize,
     refresh: bool,
     memory_mb: Option<usize>,
+    workers: usize,
     state_flush_every: usize,
 ) -> Result<SchemaDoc> {
     migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
@@ -9645,23 +10227,41 @@ fn load_or_infer_source_schema(
         files.into_iter().step_by(step).take(sample_size).collect()
     };
 
+    let n_workers = workers.max(1);
     eprintln!(
-        "[schema] dataset={dataset} inferring schema from {} sampled source files",
+        "[schema] dataset={dataset} inferring schema from {} sampled source files (workers={n_workers})",
         sample.len()
     );
+    let extra = if dataset == "works" {
+        ", maximum_object_size=1000000000"
+    } else {
+        ""
+    };
+    // Run describe calls in parallel, collect (index, result) to preserve order for logging.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_workers)
+        .build()?;
+    let duckdb_arc = std::sync::Arc::new(duckdb_bin.to_path_buf());
+    let results: Vec<(usize, Result<BTreeMap<String, String>>)> = pool.install(|| {
+        sample
+            .par_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let cols = describe_json_file(&duckdb_arc, f, extra, memory_mb);
+                (i, cols)
+            })
+            .collect()
+    });
+
     let mut merged: HashMap<String, String> = HashMap::new();
     let flush_every = state_flush_every.max(1);
     let in_progress_csv =
         dataset_cache_dir(parquet_dir, dataset).join("unified_schema.in_progress.csv");
     let in_progress_json =
         dataset_cache_dir(parquet_dir, dataset).join("source_schema.in_progress.json");
-    for (i, f) in sample.iter().enumerate() {
-        let extra = if dataset == "works" {
-            ", maximum_object_size=1000000000"
-        } else {
-            ""
-        };
-        let cols = describe_json_file(duckdb_bin, f, extra, memory_mb)?;
+    let total = results.len();
+    for (i, cols_result) in results {
+        let cols = cols_result?;
         for (k, t) in cols {
             merged
                 .entry(k)
@@ -9672,7 +10272,7 @@ fn load_or_infer_source_schema(
                 })
                 .or_insert(t);
         }
-        if (i + 1) % flush_every == 0 || i + 1 == sample.len() {
+        if (i + 1) % flush_every == 0 || i + 1 == total {
             let checkpoint_doc = schema_doc_from_merged(dataset, &merged);
             write_unified_schema_csv(&in_progress_csv, &checkpoint_doc)?;
             write_json_atomic(
@@ -9682,7 +10282,7 @@ fn load_or_infer_source_schema(
             eprintln!(
                 "[schema] dataset={dataset} processed {}/{} schema sample files",
                 i + 1,
-                sample.len()
+                total
             );
         }
     }
@@ -9800,6 +10400,7 @@ fn load_schema_by_policy(
     sample_size: usize,
     refresh: bool,
     memory_mb: Option<usize>,
+    workers: usize,
     state_flush_every: usize,
 ) -> Result<SchemaDoc> {
     migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
@@ -9815,6 +10416,7 @@ fn load_schema_by_policy(
             sample_size,
             refresh,
             memory_mb,
+            workers,
             state_flush_every,
         ),
         SchemaFrom::Cache => {
@@ -9850,6 +10452,7 @@ fn load_schema_by_policy(
                     sample_size,
                     refresh,
                     memory_mb,
+                    workers,
                     state_flush_every,
                 );
             }
@@ -10611,12 +11214,14 @@ mod tests {
         assert_eq!(s1.memory_mb, Some(11_796));
 
         let b = resolve_tuning_with_total(Profile::Balanced, 8, None, Some(32_768));
-        assert_eq!(b.workers, 8);
-        assert_eq!(b.memory_mb, Some(9174));
+        // workers capped to 7 because total budget (9174) / MIN_PER_WORKER_MB (1280) = 7
+        assert_eq!(b.workers, 7);
+        assert_eq!(b.memory_mb, Some(9174 / 7)); // per-worker = total / capped_workers
 
         let f = resolve_tuning_with_total(Profile::Fast, 8, None, Some(32_768));
+        // workers capped to 8 because explicit workers=8, budget (14417)/1280=11 allows it
         assert_eq!(f.workers, 8);
-        assert_eq!(f.memory_mb, Some(14_417));
+        assert_eq!(f.memory_mb, Some(14_417 / 8)); // per-worker = total / capped_workers
 
         let ov = resolve_tuning_with_total(Profile::Safe, 3, Some(999), Some(32_768));
         assert_eq!(ov.memory_mb, Some(999));
