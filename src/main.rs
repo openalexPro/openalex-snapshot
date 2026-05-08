@@ -5765,9 +5765,17 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
         let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
             let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
-            let threshold = match args.large_file_threshold_mb {
-                Some(mb) => mb as u64 * 1024 * 1024,
-                None => auto_threshold_bytes(balanced_mem_mb, 6.0),
+            // Only works uses maximum_object_size=1 GiB which forces ~1.8 GiB DuckDB
+            // pre-allocation per process regardless of file size.  All other datasets
+            // have no such fixed overhead and can safely run all files in the parallel
+            // pass, so we skip the threshold split entirely for them.
+            let threshold: u64 = if dataset != "works" {
+                u64::MAX // all files → small (parallel) pass
+            } else {
+                match args.large_file_threshold_mb {
+                    Some(mb) => mb as u64 * 1024 * 1024,
+                    None => auto_threshold_bytes(balanced_mem_mb, 6.0),
+                }
             };
             let mut large: Vec<FilePair> = todo
                 .iter()
