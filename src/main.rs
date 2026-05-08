@@ -4345,6 +4345,193 @@ fn run_report(args: ReportArgs) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct LiveDatasetStatus {
+    dataset: String,
+    status: String, // "done" | "in-progress" | "pending" | "error"
+    scanned: u64,
+    todo: u64,
+    ok: u64,
+    failed: u64,
+    skipped: u64,
+    last_log: String,
+}
+
+fn parse_u64_field(line: &str, field: &str) -> Option<u64> {
+    let key = format!("{}=", field);
+    let pos = line.find(key.as_str())?;
+    let rest = &line[pos + key.len()..];
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn live_dataset_status(log_path: &Path) -> LiveDatasetStatus {
+    let dataset = log_path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let Ok(txt) = fs::read_to_string(log_path) else {
+        return LiveDatasetStatus {
+            dataset,
+            status: "pending".to_string(),
+            scanned: 0,
+            todo: 0,
+            ok: 0,
+            failed: 0,
+            skipped: 0,
+            last_log: String::new(),
+        };
+    };
+
+    let last_log = txt.lines().last().unwrap_or("").to_string();
+    let mut scanned = 0u64;
+    let mut todo = 0u64;
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut done = false;
+    let mut errored = false;
+
+    for line in txt.lines() {
+        if let Some(v) = parse_u64_field(line, "source_files") {
+            scanned = v;
+        }
+        if let Some(v) = parse_u64_field(line, "todo_files") {
+            todo = v;
+        }
+        // summary line written at end of a stage
+        if line.contains(" summary ") {
+            if let Some(v) = parse_u64_field(line, "ok") {
+                ok = v;
+            }
+            if let Some(v) = parse_u64_field(line, "failed") {
+                failed = v;
+            }
+            if let Some(v) = parse_u64_field(line, "scanned") {
+                scanned = v;
+            }
+            if failed > 0 {
+                errored = true;
+            }
+            done = true;
+        }
+        if line.contains("all files already converted")
+            || line.contains("all files already indexed")
+            || line.contains("all files already verified")
+        {
+            done = true;
+            skipped = scanned;
+        }
+    }
+
+    let status = if errored {
+        "error"
+    } else if done {
+        "done"
+    } else if scanned > 0 {
+        "in-progress"
+    } else {
+        "pending"
+    }
+    .to_string();
+
+    LiveDatasetStatus {
+        dataset,
+        status,
+        scanned,
+        todo,
+        ok,
+        failed,
+        skipped,
+        last_log,
+    }
+}
+
+fn live_progress(parquet_dir: &Path, lock: &LockInfo) -> Vec<LiveDatasetStatus> {
+    let meta_root = metadata_root(parquet_dir);
+    let Ok(entries) = fs::read_dir(&meta_root) else {
+        return Vec::new();
+    };
+    let mut statuses: Vec<LiveDatasetStatus> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            !n.starts_with('.') && n != "reports" && n != "archived" && n != "download"
+        })
+        .map(|e| {
+            let log_dir = dataset_log_dir_for_command(
+                parquet_dir,
+                &e.file_name().to_string_lossy(),
+                &lock.command,
+            );
+            let log_path = log_dir.join(format!("{}.log", &lock.command));
+            if log_path.exists() {
+                live_dataset_status(&log_path)
+            } else {
+                LiveDatasetStatus {
+                    dataset: e.file_name().to_string_lossy().into_owned(),
+                    status: "pending".to_string(),
+                    scanned: 0,
+                    todo: 0,
+                    ok: 0,
+                    failed: 0,
+                    skipped: 0,
+                    last_log: String::new(),
+                }
+            }
+        })
+        .collect();
+    statuses.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+    statuses
+}
+
+fn print_live_progress(lock: &LockInfo, datasets: &[LiveDatasetStatus]) {
+    let runtime = (now_unix() - lock.started_at_unix).max(0) as f64;
+    let done = datasets.iter().filter(|d| d.status == "done").count();
+    let in_progress = datasets
+        .iter()
+        .filter(|d| d.status == "in-progress")
+        .count();
+    let errors = datasets.iter().filter(|d| d.status == "error").count();
+    let pending = datasets.iter().filter(|d| d.status == "pending").count();
+    println!(
+        "[progress] command={} pid={} started={} runtime={}",
+        lock.command,
+        lock.pid,
+        lock.started_at_unix,
+        format_duration(runtime)
+    );
+    println!(
+        "[progress] datasets: done={} in-progress={} pending={} error={}",
+        done, in_progress, pending, errors
+    );
+    for ds in datasets {
+        if ds.status == "pending" && ds.last_log.is_empty() {
+            continue; // omit datasets not yet started
+        }
+        print!(
+            "[progress] dataset={} status={} scanned={}",
+            ds.dataset, ds.status, ds.scanned
+        );
+        if ds.todo > 0 {
+            print!(" todo={}", ds.todo);
+        }
+        if ds.ok > 0 || ds.failed > 0 || ds.skipped > 0 {
+            print!(" ok={} failed={} skipped={}", ds.ok, ds.failed, ds.skipped);
+        }
+        println!();
+        if !ds.last_log.is_empty() && ds.status != "done" {
+            // strip timestamp prefix for readability
+            let msg = ds.last_log.splitn(3, ' ').nth(2).unwrap_or(&ds.last_log);
+            println!("          {}", msg);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProgressView {
     command: String,
     report_path: String,
@@ -4962,35 +5149,43 @@ fn run_progress(mut args: ProgressArgs) -> Result<()> {
     if args.once {
         args.watch = false;
     }
-    if !args.watch {
-        let view = progress_snapshot(&args)?;
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&view)?);
-        } else {
-            print_progress_human(&view);
+
+    let show_once = |args: &ProgressArgs| match check_lock(&args.parquet_dir) {
+        Some(lock) => {
+            let statuses = live_progress(&args.parquet_dir, &lock);
+            if args.json {
+                let _ = serde_json::to_string_pretty(&statuses).map(|s| println!("{}", s));
+            } else {
+                print_live_progress(&lock, &statuses);
+            }
         }
+        None => match progress_snapshot(args) {
+            Ok(view) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&view).unwrap_or_default()
+                    );
+                } else {
+                    print_progress_human(&view);
+                }
+            }
+            Err(e) => eprintln!("[progress] no active run and no recent report: {e}"),
+        },
+    };
+
+    if !args.watch {
+        show_once(&args);
         return Ok(());
     }
 
     loop {
-        match progress_snapshot(&args) {
-            Ok(view) => {
-                if args.json {
-                    println!("{}", serde_json::to_string(&view)?);
-                } else {
-                    print!("\x1B[2J\x1B[H");
-                    print_progress_human(&view);
-                    stdout().flush()?;
-                }
-                if !args.watch {
-                    return Ok(());
-                }
-                match check_lock(&args.parquet_dir) {
-                    Some(_) => {} // pipeline running, keep watching
-                    None => return Ok(()),
-                }
-            }
-            Err(_) => return Ok(()),
+        print!("\x1B[2J\x1B[H");
+        show_once(&args);
+        stdout().flush()?;
+        if check_lock(&args.parquet_dir).is_none() {
+            println!("[progress] pipeline finished");
+            return Ok(());
         }
         thread::sleep(Duration::from_secs(args.interval_sec.max(1)));
     }
