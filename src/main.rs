@@ -582,8 +582,8 @@ struct SharedArgs {
     #[arg(help = "Dataset name (works, authors, ...) or 'all'")]
     dataset: String,
 
-    #[arg(long, default_value_t = 4)]
-    #[arg(help = "Number of worker threads")]
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of worker threads (0 = auto: cpus-2 for auto profile, 4 otherwise)")]
     workers: usize,
 
     #[arg(long)]
@@ -3349,13 +3349,15 @@ defaults:
   # auto (default) — two-tier: small files run in parallel (balanced), large files
   #   run serially with maximised memory. Threshold derived from system RAM.
   # safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
-  # balanced — workers uncapped,    memory 35% of usable RAM (4–24 GiB)
-  # fast     — workers uncapped,    memory 55% of usable RAM (8–32 GiB)
+  # balanced — workers cpus-2,      memory 35% of usable RAM (4–24 GiB)
+  # fast     — workers cpus-2,      memory 55% of usable RAM (8–32 GiB)
   # Fallback when RAM is undetectable: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
   # allowed values: auto | safe | balanced | fast
   # profile: auto
-  # allowed values: integer >= 1
-  # workers: 4
+  # Workers: 0 (default) = auto-detect (cpus-2 for auto/balanced/fast, 1 for safe).
+  # Override only if you want to pin a specific value.
+  # allowed values: integer >= 0 (0 = auto)
+  # workers: 0
   # allowed values: integer >= 1
   # max_memory_mb: 8192
   # allowed values: true | false
@@ -8425,14 +8427,30 @@ fn resolve_tuning(profile: Profile, workers: usize, max_memory_mb: Option<usize>
     resolve_tuning_with_total(profile, workers, max_memory_mb, total_mb)
 }
 
+fn auto_worker_count() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cpus.saturating_sub(2).max(1)
+}
+
 fn resolve_tuning_with_total(
     profile: Profile,
     workers: usize,
     max_memory_mb: Option<usize>,
     total_mb: Option<usize>,
 ) -> Tuning {
+    // workers==0 means "auto": cpus-2 for Auto/Balanced/Fast, capped at 2 for Safe
+    let resolved_workers = if workers == 0 {
+        match profile {
+            Profile::Auto | Profile::Balanced | Profile::Fast => auto_worker_count(),
+            Profile::Safe => 1,
+        }
+    } else {
+        workers
+    };
     let mut out = Tuning {
-        workers: workers.max(1),
+        workers: resolved_workers.max(1),
         memory_mb: max_memory_mb,
     };
     match profile {
