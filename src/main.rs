@@ -421,11 +421,24 @@ Cache contract:
   source_schema.json is optional derived metadata and is not authoritative
 ";
 
+/// Short version string shown by `-V` / `--version`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Long version shown by `--version` (not `-V`): adds git hash and build date.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BUILD_GIT_HASH"),
+    " ",
+    env!("BUILD_DATE"),
+    ")"
+);
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "openalex-snapshot")]
 #[command(about = "Standalone OpenAlex snapshot conversion and validation tool")]
 #[command(long_about = CLI_LONG_ABOUT)]
-#[command(version)]
+#[command(version = VERSION)]
+#[command(long_version = LONG_VERSION)]
 struct Cli {
     #[arg(long)]
     #[arg(
