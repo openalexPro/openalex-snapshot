@@ -5748,6 +5748,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             .into_iter()
             .filter(|p| !p.output_parquet.exists())
             .collect();
+        // Process largest files first in all passes to minimise tail-latency stragglers.
+        todo.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
 
         if todo.is_empty() {
             eprintln!("[convert] dataset={dataset} all files already converted");
@@ -5786,7 +5788,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
                 .cloned()
                 .collect();
             large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
-            todo.retain(|p| p.gz_size_bytes < threshold);
+            todo.retain(|p| p.gz_size_bytes < threshold); // already sorted largest-first from above
             let threshold_display = if threshold == u64::MAX {
                 "all".to_string()
             } else {
