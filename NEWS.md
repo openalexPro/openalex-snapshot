@@ -4,6 +4,28 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-08
+
+### Added
+
+- `Profile::Auto` (default): two-tier convert mode — small files run in parallel (balanced), large files run serially with maximised memory.
+- `large_file_threshold_mb` config/CLI option to override the auto large-file threshold.
+- Per-step timing in convert: schema inference elapsed, small-pass done (ok/failed/elapsed), large-pass done (ok/failed/elapsed).
+- `(N of M)` file count and ETA in live `progress --watch` output.
+- Parallel schema inference using a rayon thread pool (was serial).
+
+### Changed
+
+- Default workers: `cpus-2` via `available_parallelism()` (0 is the auto sentinel; explicit value overrides).
+- Per-worker memory = total balanced budget ÷ workers, preventing swap pressure from the old per-worker full-budget assignment.
+- Worker count capped so aggregate memory stays within the balanced budget (1280 MiB floor).
+- Non-works datasets skip the large-file threshold entirely (`threshold=all`) — every file goes through the parallel pass.
+- Works threshold now uses `large_mem_mb` as reference (~589 MB on 36 GB) instead of `balanced_mem_mb` (~86 MB).
+- Both passes sort files largest-first to minimise tail-latency stragglers.
+- `run_all` fixed: sub-command args were hardcoded to `workers=4` / `Profile::Balanced`; now inherit auto defaults.
+- `schemata/` cache excluded from archive and log cleanup so it persists across runs.
+- `repair_convert` falls back to convert report when no verify report exists; auto-resolves latest verify report.
+
 ## [0.2.0] - 2026-05-07
 
 ### Added
