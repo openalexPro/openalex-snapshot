@@ -6015,10 +6015,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         }
 
         let small_elapsed = start.elapsed().as_secs_f64();
-        pb.finish_with_message(format!(
-            "convert:{dataset} done in {:.1}s",
-            small_elapsed
-        ));
+        pb.finish_with_message(format!("convert:{dataset} done in {:.1}s", small_elapsed));
         if !todo.is_empty() || large_todo.is_empty() {
             eprintln!(
                 "[convert] dataset={dataset} small-pass done ok={} failed={} elapsed={}",
