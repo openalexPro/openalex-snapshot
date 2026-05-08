@@ -705,11 +705,17 @@ struct ConvertArgs {
     #[arg(help = "Disk check scope: dataset preflight or per-file")]
     disk_check_scope: DiskCheckScope,
 
+    #[arg(long, default_value = "0")]
+    #[arg(
+        help = "Split gz files larger than this before converting (e.g. 512mb, 1gib). 0 = auto (balanced_mem/15)"
+    )]
+    split_size: String,
+
     #[arg(long)]
     #[arg(
-        help = "Override auto large-file threshold in MB (auto profile only; files at or above this size use the serial large-file pass)"
+        help = "Directory for temporary split gz chunks (must be on the same filesystem as parquet output). Defaults to <parquet_dir>/.split_tmp"
     )]
-    large_file_threshold_mb: Option<usize>,
+    split_temp_dir: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     #[arg(help = "Refresh schema cache before conversion")]
@@ -1442,7 +1448,8 @@ struct ConvertConfig {
     seed: Option<u64>,
     refresh_cache: Option<bool>,
     skip_disk_check: Option<bool>,
-    large_file_threshold_mb: Option<usize>,
+    split_size: Option<String>,
+    split_temp_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2270,9 +2277,14 @@ fn apply_convert_config(
                 args.skip_disk_check = v;
             }
         }
-        if !cli_explicit(matches, "large_file_threshold_mb") {
-            if let Some(v) = c.large_file_threshold_mb {
-                args.large_file_threshold_mb = Some(v);
+        if !cli_explicit(matches, "split_size") {
+            if let Some(v) = &c.split_size {
+                args.split_size = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "split_temp_dir") {
+            if let Some(v) = &c.split_temp_dir {
+                args.split_temp_dir = Some(v.clone());
             }
         }
     }
@@ -3515,12 +3527,17 @@ convert:
   # allowed values: true | false
   # skip_disk_check: false
 
-  # Auto-profile large-file threshold override (auto profile only).
-  # Files >= this size (gz, in MB) are routed to the serial large-file pass instead of the
-  # parallel balanced pass. Leave unset to use the auto formula (per_worker_balanced_mem / 15).
-  # Lower this value if files are still OOMing in the parallel pass.
-  # allowed values: integer >= 1 (MB)
-  # large_file_threshold_mb: 80
+  # Split large gz files into smaller chunks before converting.
+  # 0 = auto (balanced_mem_mb / 15 uncompressed bytes, ~87 MB on a 36 GB machine).
+  # Set explicitly to override, e.g. 512mb, 1gib, 256mib.
+  # allowed values: 0 (auto) or size string e.g. 512mb, 1gib
+  # split_size: 0
+
+  # Directory for temporary split gz chunks.
+  # Must be on the same filesystem as the parquet output directory.
+  # Defaults to <parquet_dir>/.split_tmp (auto-created and cleaned up per file).
+  # allowed values: any valid path
+  # split_temp_dir: /Volumes/openalex/.split_tmp
 
 verify_convert:
   # ---------------------------------------------------------------------------
@@ -5010,7 +5027,8 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             skip_disk_check: resolved.skip_disk_check,
             disk_check_scope: DiskCheckScope::Dataset,
             refresh_cache: false,
-            large_file_threshold_mb: None,
+            split_size: "0".to_string(),
+            split_temp_dir: None,
             explain: false,
             state_flush_every: 25,
         };
@@ -5582,32 +5600,19 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
 
-    // For auto profile, compute balanced tuning for the small-file parallel pass
-    // and a maximised-memory serial tuning for large files.
-    let is_auto = args.profile == Profile::Auto;
     let total_mb = detect_total_memory_mb();
-    let (tuning, large_tuning) = if is_auto {
-        let balanced = resolve_tuning_with_total(
+    let tuning = if args.profile == Profile::Auto {
+        resolve_tuning_with_total(
             Profile::Balanced,
             args.shared.workers,
             args.max_memory_mb,
             total_mb,
-        );
-        let safe_mem = auto_profile_memory_mb(Profile::Safe, total_mb);
-        let large_mem = auto_large_file_memory_mb(total_mb.unwrap_or(0), safe_mem);
-        let large = Tuning {
-            workers: 1,
-            memory_mb: Some(large_mem),
-        };
-        (balanced, Some(large))
+        )
     } else {
-        (
-            resolve_tuning(
-                args.profile.clone(),
-                args.shared.workers,
-                args.max_memory_mb,
-            ),
-            None,
+        resolve_tuning(
+            args.profile.clone(),
+            args.shared.workers,
+            args.max_memory_mb,
         )
     };
     if args.explain {
@@ -5616,23 +5621,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "convert")?;
     let convert_start = Instant::now();
-    // Print resolved settings so they're visible at run start.
-    if is_auto {
-        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
-        eprintln!(
-            "[convert] profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
-            tuning.workers,
-            tuning.memory_mb.unwrap_or(0),
-            large_mem,
-        );
-    } else {
-        eprintln!(
-            "[convert] profile={} workers={} memory_mb={}",
-            format!("{:?}", args.profile).to_lowercase(),
-            tuning.workers,
-            tuning.memory_mb.unwrap_or(0),
-        );
-    }
+    eprintln!(
+        "[convert] profile={} workers={} memory_mb={}",
+        format!("{:?}", args.profile).to_lowercase(),
+        tuning.workers,
+        tuning.memory_mb.unwrap_or(0),
+    );
     let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
@@ -5745,7 +5739,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
         let mut todo: Vec<FilePair> = pairs
             .into_iter()
-            .filter(|p| !p.output_parquet.exists())
+            .filter(|p| !p.output_parquet.exists() && !split_parquets_exist(&p.output_parquet))
             .collect();
         // Process largest files first in all passes to minimise tail-latency stragglers.
         todo.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
@@ -5763,64 +5757,119 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             continue;
         }
 
-        // For auto profile: split into small (parallel/balanced) and large (serial/max-mem).
-        let large_todo: Vec<FilePair> = if let Some(ref lt) = large_tuning {
-            let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
-            let large_mem_mb = lt.memory_mb.unwrap_or(4096);
-            // Route large files to the serial pass for all datasets.
-            // Threshold = estimated gz size that would exhaust one balanced worker's
-            // memory budget.  Files at or above the threshold run serially with the
-            // full large-pass budget; smaller files run in parallel.
-            let threshold: u64 = match args.large_file_threshold_mb {
-                Some(mb) => mb as u64 * 1024 * 1024,
-                None => auto_threshold_bytes(balanced_mem_mb, 6.0),
-            };
-            let mut large: Vec<FilePair> = todo
-                .iter()
-                .filter(|p| p.gz_size_bytes >= threshold)
-                .cloned()
-                .collect();
-            large.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
-            todo.retain(|p| p.gz_size_bytes < threshold); // already sorted largest-first from above
-            let threshold_display = format!("{}MB", threshold / (1024 * 1024));
+        // Pre-split phase: expand large gz files into chunk FilePairs.
+        // chunk_source maps chunk rel → original source rel (for state accounting + cleanup).
+        // All chunks + small files are then processed by the single parallel balanced pass.
+        let split_target =
+            parse_size_str(&args.split_size).context("invalid --split-size value")?;
+        let balanced_mem_mb = tuning.memory_mb.unwrap_or(4096);
+        let split_target_bytes: usize = if split_target == 0 {
+            auto_threshold_bytes(balanced_mem_mb, 6.0) as usize
+        } else {
+            split_target
+        };
+        let split_tmp_root = args
+            .split_temp_dir
+            .clone()
+            .unwrap_or_else(|| args.shared.parquet_dir.join(".split_tmp"));
+
+        // Maps chunk_rel → source_rel (for cleanup and success accounting)
+        let mut chunk_source: HashMap<PathBuf, PathBuf> = HashMap::new();
+        // Track how many chunks each source has, for accounting
+        let mut source_chunk_counts: HashMap<PathBuf, u64> = HashMap::new();
+        let mut expanded: Vec<FilePair> = Vec::new();
+
+        for pair in todo {
+            if pair.gz_size_bytes as usize <= split_target_bytes {
+                expanded.push(pair);
+            } else {
+                let stem = pair
+                    .output_parquet
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let chunk_gz_dir = split_tmp_root
+                    .join(dataset)
+                    .join(pair.rel.parent().unwrap_or(Path::new("")));
+                let chunk_out_dir = pair
+                    .output_parquet
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
+                match split_gz_lines(&pair.input_gz, &chunk_gz_dir, &stem, split_target_bytes) {
+                    Ok(chunks) => {
+                        let n = chunks.len() as u64;
+                        source_chunk_counts.insert(pair.rel.clone(), n);
+                        for (i, chunk_path) in chunks.into_iter().enumerate() {
+                            let chunk_name = format!("{}_{:03}.parquet", stem, i + 1);
+                            let chunk_out = chunk_out_dir.join(&chunk_name);
+                            let chunk_rel = pair
+                                .rel
+                                .parent()
+                                .unwrap_or(Path::new(""))
+                                .join(format!("{}_{:03}.gz", stem, i + 1));
+                            chunk_source.insert(chunk_rel.clone(), pair.rel.clone());
+                            expanded.push(FilePair {
+                                input_gz: chunk_path,
+                                output_parquet: chunk_out,
+                                rel: chunk_rel,
+                                gz_size_bytes: 0, // chunks are small by construction
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        ds.failed += 1;
+                        report.failures.push(FailureEntry {
+                            dataset: dataset.clone(),
+                            phase: "split".to_string(),
+                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                            error_message: format!("split failed: {e:#}"),
+                            suggested_recovery: Some(
+                                "retry with a larger --split-size or fix disk space".to_string(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let split_count: usize = source_chunk_counts.values().map(|&n| n as usize).sum();
+        let unsplit_count = expanded.len() - split_count;
+        if !source_chunk_counts.is_empty() {
+            let target_mb = split_target_bytes / 1_000_000;
             eprintln!(
-                "[convert] auto dataset={dataset} small={} large={} threshold={threshold_display} balanced_mem={}MB large_mem={}MB",
-                todo.len(),
-                large.len(),
-                balanced_mem_mb,
-                large_mem_mb,
+                "[convert] dataset={dataset} split: {} source files → {} chunks (target={}MB, unsplit={})",
+                source_chunk_counts.len(), split_count, target_mb, unsplit_count,
             );
             try_log_dataset(
                 &args.shared.parquet_dir,
                 dataset,
                 "convert",
                 &format!(
-                    "auto small={} large={} threshold={}",
-                    todo.len(),
-                    large.len(),
-                    threshold_display
+                    "split sources={} chunks={} target_mb={}",
+                    source_chunk_counts.len(),
+                    split_count,
+                    target_mb
                 ),
             );
-            large
-        } else {
-            Vec::new()
-        };
+        }
+        let todo = expanded;
 
-        ds.items_scanned = (todo.len() + large_todo.len()) as u64;
+        ds.items_scanned = todo.len() as u64 + ds.failed; // include split failures
 
         let schema_start = Instant::now();
         eprintln!(
             "[convert] dataset={dataset} todo_files={} (starting schema inference)",
-            todo.len() + large_todo.len()
+            todo.len()
         );
         try_log_dataset(
             &args.shared.parquet_dir,
             dataset,
             "convert",
-            &format!(
-                "todo_files={} schema_inference_start",
-                todo.len() + large_todo.len()
-            ),
+            &format!("todo_files={} schema_inference_start", todo.len()),
         );
         fs::create_dir_all(dataset_cache_dir(&args.shared.parquet_dir, dataset))?;
         let schema = match load_or_infer_source_schema(
@@ -6003,99 +6052,19 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             let _ = write_run_reports(&args.shared.parquet_dir, &preview);
         }
 
-        let small_elapsed = start.elapsed().as_secs_f64();
-        pb.finish_with_message(format!("convert:{dataset} done in {:.1}s", small_elapsed));
-        if !todo.is_empty() || large_todo.is_empty() {
-            eprintln!(
-                "[convert] dataset={dataset} small-pass done ok={} failed={} elapsed={}",
-                ds.items_scanned.saturating_sub(ds.failed),
-                ds.failed,
-                format_duration(small_elapsed),
-            );
-        }
+        let elapsed = start.elapsed().as_secs_f64();
+        pb.finish_with_message(format!("convert:{dataset} done in {:.1}s", elapsed));
+        eprintln!(
+            "[convert] dataset={dataset} pass done ok={} failed={} elapsed={}",
+            ds.items_scanned.saturating_sub(ds.failed),
+            ds.failed,
+            format_duration(elapsed),
+        );
 
-        // Auto profile: serial pass for large files with maximised memory.
-        if !large_todo.is_empty() {
-            let lt = large_tuning.as_ref().expect("large_tuning set for auto");
-            let large_start = Instant::now();
-            let failed_before_large = ds.failed;
-            eprintln!(
-                "[convert] auto dataset={dataset} large-file pass: {} files workers=1 memory_mb={:?}",
-                large_todo.len(),
-                lt.memory_mb,
-            );
-            try_log_dataset(
-                &args.shared.parquet_dir,
-                dataset,
-                "convert",
-                &format!(
-                    "auto large_pass start count={} memory_mb={:?}",
-                    large_todo.len(),
-                    lt.memory_mb
-                ),
-            );
-            let pb_large = make_progress_bar(
-                args.progress,
-                large_todo.len() as u64,
-                &format!("convert:{dataset}(large)"),
-            );
-            for pair in &large_todo {
-                let _ = fs::remove_file(&pair.output_parquet); // remove partial output
-                match convert_one(
-                    &duckdb_bin,
-                    pair,
-                    &schema_arc,
-                    &compression,
-                    row_group_rows,
-                    lt.memory_mb,
-                    &extra_json_options,
-                ) {
-                    Ok(()) => {
-                        try_log_dataset(
-                            &args.shared.parquet_dir,
-                            dataset,
-                            "convert",
-                            &format!("large file converted {}", pair.rel.to_string_lossy()),
-                        );
-                    }
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        ds.failed += 1;
-                        report.failures.push(FailureEntry {
-                            dataset: dataset.clone(),
-                            phase: "convert_file".to_string(),
-                            rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                            source_path: Some(pair.input_gz.to_string_lossy().to_string()),
-                            output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
-                            error_message: msg,
-                            suggested_recovery: Some(format!(
-                                "openalex-snapshot convert --root-dir {} --dataset {} --profile safe --workers 1 --input-file {}",
-                                args.shared.root_dir.display(),
-                                dataset,
-                                pair.input_gz.display(),
-                            )),
-                        });
-                    }
-                }
-                pb_large.inc(1);
-            }
-            let large_elapsed = large_start.elapsed().as_secs_f64();
-            let large_failed = ds.failed - failed_before_large;
-            let large_ok = large_todo.len() as u64 - large_failed;
-            pb_large.finish_with_message(format!(
-                "convert:{dataset}(large) done in {}",
-                format_duration(large_elapsed)
-            ));
-            eprintln!(
-                "[convert] dataset={dataset} large-pass done ok={large_ok} failed={large_failed} elapsed={}",
-                format_duration(large_elapsed),
-            );
-            try_log_dataset(
-                &args.shared.parquet_dir,
-                dataset,
-                "convert",
-                &format!("auto large_pass complete elapsed_s={:.2}", large_elapsed),
-            );
+        // Clean up temp split chunks now that all conversions are done.
+        if !source_chunk_counts.is_empty() {
+            let ds_tmp = split_tmp_root.join(dataset);
+            let _ = fs::remove_dir_all(&ds_tmp);
         }
 
         let dataset_elapsed = dataset_start.elapsed().as_secs_f64();
@@ -6118,29 +6087,15 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     report_finalize(&mut report);
     let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
     let total_elapsed = convert_start.elapsed().as_secs_f64();
-    let settings_str = if is_auto {
-        let large_mem = large_tuning.as_ref().and_then(|t| t.memory_mb).unwrap_or(0);
-        format!(
-            " profile=auto small_workers={} small_memory_mb={} large_workers=1 large_memory_mb={}",
-            tuning.workers,
-            tuning.memory_mb.unwrap_or(0),
-            large_mem,
-        )
-    } else {
-        format!(
-            " profile={} workers={} memory_mb={}",
-            format!("{:?}", args.profile).to_lowercase(),
-            tuning.workers,
-            tuning.memory_mb.unwrap_or(0),
-        )
-    };
     eprintln!(
-        "[convert] summary scanned={} ok={} failed={} elapsed={}{} reports={}",
+        "[convert] summary scanned={} ok={} failed={} elapsed={} profile={} workers={} memory_mb={} reports={}",
         report.totals_items_scanned,
         report.totals_succeeded,
         report.totals_failed,
         format_duration(total_elapsed),
-        settings_str,
+        format!("{:?}", args.profile).to_lowercase(),
+        tuning.workers,
+        tuning.memory_mb.unwrap_or(0),
         report_paths
             .iter()
             .map(|p| p.display().to_string())
@@ -7066,12 +7021,41 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
                     }
                 }
 
-                let expected_rel: BTreeSet<PathBuf> = pairs
-                    .iter()
-                    .map(|p| p.rel.with_extension("parquet"))
-                    .collect();
-                let actual_rel: BTreeSet<PathBuf> =
-                    list_parquet_rel(&args.shared.parquet_dir.join(dataset))?;
+                // Build expected parquet set: for each source gz, if split chunks exist
+                // use all matching NNN chunks; otherwise expect the single parquet.
+                let ds_parquet_root = args.shared.parquet_dir.join(dataset);
+                let actual_rel: BTreeSet<PathBuf> = list_parquet_rel(&ds_parquet_root)?;
+                let mut expected_rel: BTreeSet<PathBuf> = BTreeSet::new();
+                for p in &pairs {
+                    let single = p.rel.with_extension("parquet");
+                    let stem = single
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let parent = single.parent().unwrap_or(Path::new(""));
+                    // Collect any split chunks that exist in the actual set.
+                    let chunks: Vec<PathBuf> = actual_rel
+                        .iter()
+                        .filter(|r| {
+                            r.parent().unwrap_or(Path::new("")) == parent
+                                && r.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| {
+                                        s.starts_with(&format!("{stem}_"))
+                                            && s.len() == stem.len() + 4
+                                            && s[stem.len() + 1..].parse::<u32>().is_ok()
+                                    })
+                                    .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !chunks.is_empty() {
+                        expected_rel.extend(chunks);
+                    } else {
+                        expected_rel.insert(single);
+                    }
+                }
                 if expected_rel != actual_rel {
                     let extra = actual_rel.difference(&expected_rel).count();
                     let miss = expected_rel.difference(&actual_rel).count();
@@ -8634,10 +8618,34 @@ fn auto_threshold_bytes(balanced_mem_mb: usize, expansion_factor: f64) -> u64 {
     ((balanced_mem_mb as f64 * 1024.0 * 1024.0) / (expansion_factor * overhead)) as u64
 }
 
-fn auto_large_file_memory_mb(total_ram_mb: usize, safe_mem_mb: usize) -> usize {
-    (safe_mem_mb * 2)
-        .min(total_ram_mb * 75 / 100)
-        .max(safe_mem_mb)
+/// Parse a human-readable size string to bytes.
+/// "0" → 0 (sentinel for auto). Supports kb/mb/gb (SI) and kib/mib/gib (binary), case-insensitive.
+fn parse_size_str(s: &str) -> Result<usize> {
+    let s = s.trim().to_lowercase();
+    if s == "0" {
+        return Ok(0);
+    }
+    let (num_s, mult): (&str, usize) = if s.ends_with("gib") {
+        (&s[..s.len() - 3], 1024 * 1024 * 1024)
+    } else if s.ends_with("mib") {
+        (&s[..s.len() - 3], 1024 * 1024)
+    } else if s.ends_with("kib") {
+        (&s[..s.len() - 3], 1024)
+    } else if s.ends_with("gb") {
+        (&s[..s.len() - 2], 1_000_000_000)
+    } else if s.ends_with("mb") {
+        (&s[..s.len() - 2], 1_000_000)
+    } else if s.ends_with("kb") {
+        (&s[..s.len() - 2], 1_000)
+    } else if s.ends_with('b') {
+        (&s[..s.len() - 1], 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    let n: usize = num_s.trim().parse().with_context(|| {
+        format!("invalid size '{s}': expected number with optional suffix (kb/mb/gb/kib/mib/gib)")
+    })?;
+    Ok(n * mult)
 }
 
 fn detect_total_memory_mb() -> Option<usize> {
@@ -8712,6 +8720,10 @@ fn enumerate_pairs(
         let out_path = out_root.join(&out_rel);
 
         let gz_size_bytes = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        // A source gz is done if either the single parquet or split chunks exist.
+        // The caller's `!p.output_parquet.exists()` check handles the single-file case;
+        // here we set gz_size_bytes=0 on split-done files so the caller can detect them
+        // via split_parquets_exist, but we still emit the pair so skipped count is accurate.
         pairs.push(FilePair {
             input_gz: p.to_path_buf(),
             output_parquet: out_path,
@@ -10461,6 +10473,95 @@ fn load_schema_by_policy(
     }
 }
 
+/// Split a gzipped line-delimited JSON file into smaller gz chunks.
+/// Each chunk targets at most `target_uncompressed_bytes` of uncompressed data.
+/// Chunks are written to `chunk_dir/{stem}_001.gz`, `{stem}_002.gz`, …
+/// Returns the list of chunk paths.
+fn split_gz_lines(
+    input: &Path,
+    chunk_dir: &Path,
+    stem: &str,
+    target_uncompressed_bytes: usize,
+) -> Result<Vec<PathBuf>> {
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::{BufRead, BufReader, BufWriter};
+
+    fs::create_dir_all(chunk_dir)
+        .with_context(|| format!("failed to create split temp dir {}", chunk_dir.display()))?;
+
+    let file =
+        fs::File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+    let gz_reader = BufReader::new(GzDecoder::new(BufReader::new(file)));
+
+    let mut chunk_paths: Vec<PathBuf> = Vec::new();
+    let mut chunk_idx: usize = 1;
+    let mut bytes_in_chunk: usize = 0;
+    let mut current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.gz"));
+    let mut writer: BufWriter<GzEncoder<fs::File>> = {
+        let f = fs::File::create(&current_path)
+            .with_context(|| format!("failed to create chunk {}", current_path.display()))?;
+        BufWriter::new(GzEncoder::new(f, Compression::default()))
+    };
+
+    for line in gz_reader.lines() {
+        let line = line.with_context(|| format!("read error in {}", input.display()))?;
+        if line.is_empty() {
+            continue;
+        }
+        // Roll over to next chunk when current chunk is full.
+        if bytes_in_chunk >= target_uncompressed_bytes && bytes_in_chunk > 0 {
+            writer.flush()?;
+            drop(writer);
+            chunk_paths.push(current_path);
+            chunk_idx += 1;
+            bytes_in_chunk = 0;
+            current_path = chunk_dir.join(format!("{stem}_{chunk_idx:03}.gz"));
+            let f = fs::File::create(&current_path)
+                .with_context(|| format!("failed to create chunk {}", current_path.display()))?;
+            writer = BufWriter::new(GzEncoder::new(f, Compression::default()));
+        }
+        let b = line.as_bytes();
+        use std::io::Write;
+        writer.write_all(b)?;
+        writer.write_all(b"\n")?;
+        bytes_in_chunk += b.len() + 1;
+    }
+    writer.flush()?;
+    drop(writer);
+    chunk_paths.push(current_path);
+    Ok(chunk_paths)
+}
+
+/// Returns true if split parquet chunks exist for the given base output path.
+/// e.g. if `part_0000_001.parquet` exists alongside where `part_0000.parquet` would be.
+fn split_parquets_exist(out_path: &Path) -> bool {
+    let stem = out_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let dir = out_path.parent().unwrap_or(Path::new("."));
+    dir.join(format!("{stem}_001.parquet")).exists()
+}
+
+// Returns all split chunk parquets for a source in sorted order, or empty if none.
+fn list_split_parquets(out_path: &Path) -> Vec<PathBuf> {
+    let stem = out_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let dir = out_path.parent().unwrap_or(Path::new("."));
+    let mut chunks: Vec<PathBuf> = (1u32..)
+        .map(|i| dir.join(format!("{stem}_{i:03}.parquet")))
+        .take_while(|p| p.exists())
+        .collect();
+    chunks.sort();
+    chunks
+}
+
 fn convert_one(
     duckdb_bin: &Path,
     pair: &FilePair,
@@ -10680,7 +10781,24 @@ fn verify_file_metrics(
 ) -> Result<()> {
     let rel = p.rel.to_string_lossy().replace('\\', "/");
     let (src_sz, src_mt) = file_meta_signature(&p.input_gz)?;
-    let (pq_sz, pq_mt) = file_meta_signature(&p.output_parquet)?;
+
+    // Detect split parquets (1 source gz → N parquet chunks).
+    let split_chunks = list_split_parquets(&p.output_parquet);
+    let is_split = !split_chunks.is_empty();
+
+    // Aggregate size/mtime across all chunks as the cache key.
+    let (pq_sz, pq_mt) = if is_split {
+        let mut total_sz: u64 = 0;
+        let mut max_mt: i64 = 0;
+        for chunk in &split_chunks {
+            let (sz, mt) = file_meta_signature(chunk)?;
+            total_sz += sz;
+            max_mt = max_mt.max(mt);
+        }
+        (total_sz, max_mt)
+    } else {
+        file_meta_signature(&p.output_parquet)?
+    };
     let need_hash = matches!(
         level,
         VerifyMetadataLevel::IdHash | VerifyMetadataLevel::Both
@@ -10728,6 +10846,38 @@ fn verify_file_metrics(
             .map_err(|_| anyhow!("parquet metrics cache lock poisoned"))?;
         guard.get(&rel).cloned()
     };
+    let pq_display = if is_split {
+        format!(
+            "{} (+{} chunks)",
+            p.output_parquet.display(),
+            split_chunks.len()
+        )
+    } else {
+        p.output_parquet.display().to_string()
+    };
+    let query_parquet_metrics = |need_hash: bool| -> Result<(u64, String)> {
+        if is_split {
+            if need_hash {
+                duckdb_metrics_parquet_list(duckdb_bin, &split_chunks, memory_mb)
+            } else {
+                duckdb_count_parquet_list(duckdb_bin, &split_chunks, memory_mb)
+                    .map(|n| (n, String::new()))
+            }
+        } else if need_hash {
+            duckdb_metrics_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+        } else {
+            duckdb_count_parquet(duckdb_bin, &p.output_parquet, memory_mb)
+                .map(|n| (n, String::new()))
+        }
+        .with_context(|| {
+            format!(
+                "parquet metrics failed for {}. \
+If this parquet is corrupt/truncated, delete it and reconvert matching source file: {}",
+                pq_display,
+                p.rel.display()
+            )
+        })
+    };
     let (pq_n, pq_h) = if let Some(c) = pq_cached {
         if c.parquet_size == pq_sz
             && c.parquet_mtime_unix == pq_mt
@@ -10735,20 +10885,7 @@ fn verify_file_metrics(
         {
             (c.row_count, c.id_hash)
         } else {
-            let (n, h) = if need_hash {
-                duckdb_metrics_parquet(duckdb_bin, &p.output_parquet, memory_mb)
-            } else {
-                duckdb_count_parquet(duckdb_bin, &p.output_parquet, memory_mb)
-                    .map(|n| (n, String::new()))
-            }
-            .with_context(|| {
-                format!(
-                    "parquet metrics failed for {}. \
-If this parquet is corrupt/truncated, delete it and reconvert matching source file: {}",
-                    p.output_parquet.display(),
-                    p.rel.display()
-                )
-            })?;
+            let (n, h) = query_parquet_metrics(need_hash)?;
             let row = ParquetMetricRow {
                 rel_path: rel.clone(),
                 parquet_size: pq_sz,
@@ -10763,20 +10900,7 @@ If this parquet is corrupt/truncated, delete it and reconvert matching source fi
             (n, h)
         }
     } else {
-        let (n, h) = if need_hash {
-            duckdb_metrics_parquet(duckdb_bin, &p.output_parquet, memory_mb)
-        } else {
-            duckdb_count_parquet(duckdb_bin, &p.output_parquet, memory_mb)
-                .map(|n| (n, String::new()))
-        }
-        .with_context(|| {
-            format!(
-                "parquet metrics failed for {}. \
-If this parquet is corrupt/truncated, delete it and reconvert matching source file: {}",
-                p.output_parquet.display(),
-                p.rel.display()
-            )
-        })?;
+        let (n, h) = query_parquet_metrics(need_hash)?;
         let row = ParquetMetricRow {
             rel_path: rel.clone(),
             parquet_size: pq_sz,
@@ -10874,6 +10998,51 @@ fn duckdb_count_parquet(duckdb_bin: &Path, path: &Path, memory_mb: Option<usize>
     );
     let row = query_one_row(duckdb_bin, &sql)?;
     parse_u64(row.get("n"))
+}
+
+fn sql_path_list(paths: &[PathBuf]) -> String {
+    let quoted: Vec<String> = paths
+        .iter()
+        .map(|p| sql_quote(&p.to_string_lossy()))
+        .collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+fn duckdb_count_parquet_list(
+    duckdb_bin: &Path,
+    paths: &[PathBuf],
+    memory_mb: Option<usize>,
+) -> Result<u64> {
+    let sql = with_session_settings(
+        &format!(
+            "SELECT COUNT(*) AS n FROM read_parquet({})",
+            sql_path_list(paths)
+        ),
+        memory_mb,
+        Some(1),
+    );
+    let row = query_one_row(duckdb_bin, &sql)?;
+    parse_u64(row.get("n"))
+}
+
+fn duckdb_metrics_parquet_list(
+    duckdb_bin: &Path,
+    paths: &[PathBuf],
+    memory_mb: Option<usize>,
+) -> Result<(u64, String)> {
+    let sql = with_session_settings(
+        &format!(
+            "SELECT COUNT(*) AS n, COALESCE(CAST(bit_xor(hash(CAST(id AS VARCHAR))) AS VARCHAR), '0') AS h FROM read_parquet({})",
+            sql_path_list(paths)
+        ),
+        memory_mb,
+        Some(1),
+    );
+    let row = query_one_row(duckdb_bin, &sql)?;
+    Ok((
+        parse_u64(row.get("n"))?,
+        row.get("h").cloned().unwrap_or_else(|| "0".to_string()),
+    ))
 }
 
 fn parse_u64(v: Option<&String>) -> Result<u64> {
