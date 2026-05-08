@@ -7,6 +7,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::stdout;
@@ -10634,7 +10635,6 @@ fn convert_one(
         sql.push_str(&format!("SET memory_limit='{}MB';", mb));
     }
     sql.push_str("SET preserve_insertion_order = false;");
-    sql.push_str("LOAD json;");
     sql.push_str(&format!(
         "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true)) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
         in_q,
@@ -10649,7 +10649,6 @@ fn convert_one(
             sql.push_str(&format!("SET memory_limit='{}MB';", mb));
         }
         sql.push_str("SET preserve_insertion_order = false;");
-        sql.push_str("LOAD json;");
         sql.push_str(&format!(
             "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true{}) ) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
             in_q,
@@ -10998,7 +10997,7 @@ fn duckdb_metrics_json(
     memory_mb: Option<usize>,
 ) -> Result<(u64, String)> {
     let sql = with_session_settings(&format!(
-        "LOAD json; SELECT COUNT(*) AS n, COALESCE(CAST(bit_xor(hash(CAST(id AS VARCHAR))) AS VARCHAR), '0') AS h FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
+        "SELECT COUNT(*) AS n, COALESCE(CAST(bit_xor(hash(CAST(id AS VARCHAR))) AS VARCHAR), '0') AS h FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
         sql_quote(&path.to_string_lossy())
     ), memory_mb, Some(1));
     let row = query_one_row(duckdb_bin, &sql)?;
@@ -11011,7 +11010,7 @@ fn duckdb_metrics_json(
 fn duckdb_count_json(duckdb_bin: &Path, path: &Path, memory_mb: Option<usize>) -> Result<u64> {
     let sql = with_session_settings(
         &format!(
-            "LOAD json; SELECT COUNT(*) AS n FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
+            "SELECT COUNT(*) AS n FROM read_json_auto({}, union_by_name=true, ignore_errors=true)",
             sql_quote(&path.to_string_lossy())
         ),
         memory_mb,
@@ -11108,7 +11107,7 @@ fn describe_json_file(
     memory_mb: Option<usize>,
 ) -> Result<BTreeMap<String, String>> {
     let sql = with_session_settings(&format!(
-        "LOAD json; SELECT * FROM (DESCRIBE SELECT * FROM read_json_auto({}, union_by_name=true, ignore_errors=true{}))",
+        "SELECT * FROM (DESCRIBE SELECT * FROM read_json_auto({}, union_by_name=true, ignore_errors=true{}))",
         sql_quote(&file.to_string_lossy()),
         extra_options
     ), memory_mb, Some(1));
@@ -11289,38 +11288,96 @@ fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
-fn run_duckdb_sql(duckdb_bin: &Path, sql: &str) -> Result<()> {
-    let out = Command::new(duckdb_bin)
-        .arg("-c")
-        .arg(sql)
-        .output()
-        .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
+// ---------------------------------------------------------------------------
+// In-process DuckDB: one Connection per rayon/OS thread via thread_local.
+// ---------------------------------------------------------------------------
 
-    if !out.status.success() {
-        let exit_info = format_exit_status(&out.status);
-        let stdout_s = String::from_utf8_lossy(&out.stdout);
-        let stderr_s = String::from_utf8_lossy(&out.stderr);
-        if stdout_s.trim().is_empty() && stderr_s.trim().is_empty() {
-            bail!("duckdb sql failed ({exit_info}, no output — likely killed by OS/OOM killer)");
+thread_local! {
+    static DUCKDB_CONN: RefCell<Option<duckdb::Connection>> = const { RefCell::new(None) };
+}
+
+fn with_conn<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&duckdb::Connection) -> Result<R>,
+{
+    DUCKDB_CONN.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            let conn = duckdb::Connection::open_in_memory()
+                .context("failed to open in-memory DuckDB connection")?;
+            // In bundled mode, extensions are compiled in; enable autoload so
+            // read_json / read_parquet functions resolve without explicit LOAD.
+            conn.execute_batch(
+                "SET autoinstall_known_extensions=false; SET autoload_known_extensions=true;",
+            )
+            .ok();
+            *opt = Some(conn);
         }
-        bail!("duckdb sql failed ({exit_info}):\n{stdout_s}\n{stderr_s}");
-    }
-    Ok(())
+        f(opt.as_ref().unwrap())
+    })
 }
 
-#[cfg(unix)]
-fn format_exit_status(status: &std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(sig) = status.signal() {
-        format!("killed by signal {sig}")
-    } else {
-        format!("exit code {}", status.code().unwrap_or(-1))
+/// Split "SET a=1; SET b=2; QUERY" into (set_prefix_str, query_str).
+fn split_set_prefix(sql: &str) -> (&str, &str) {
+    let mut cursor = sql;
+    loop {
+        let trimmed = cursor.trim_start();
+        if trimmed.is_empty() {
+            let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
+            return (&sql[..off], "");
+        }
+        if trimmed.to_uppercase().starts_with("SET ") {
+            match trimmed.find(';') {
+                Some(i) => cursor = &trimmed[i + 1..],
+                None => {
+                    let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
+                    return (&sql[..off], "");
+                }
+            }
+        } else {
+            let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
+            return (&sql[..off], trimmed);
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn format_exit_status(status: &std::process::ExitStatus) -> String {
-    format!("exit code {}", status.code().unwrap_or(-1))
+fn arrow_col_to_string(col: &dyn duckdb::arrow::array::Array, idx: usize) -> String {
+    use duckdb::arrow::array::*;
+    use duckdb::arrow::datatypes::DataType;
+    if col.is_null(idx) {
+        return String::new();
+    }
+    macro_rules! cast_to_string {
+        ($array_type:ty) => {
+            col.as_any()
+                .downcast_ref::<$array_type>()
+                .map(|a| a.value(idx).to_string())
+                .unwrap_or_default()
+        };
+    }
+    match col.data_type() {
+        DataType::Utf8 => cast_to_string!(StringArray),
+        DataType::LargeUtf8 => cast_to_string!(LargeStringArray),
+        DataType::Int8 => cast_to_string!(Int8Array),
+        DataType::Int16 => cast_to_string!(Int16Array),
+        DataType::Int32 => cast_to_string!(Int32Array),
+        DataType::Int64 => cast_to_string!(Int64Array),
+        DataType::UInt8 => cast_to_string!(UInt8Array),
+        DataType::UInt16 => cast_to_string!(UInt16Array),
+        DataType::UInt32 => cast_to_string!(UInt32Array),
+        DataType::UInt64 => cast_to_string!(UInt64Array),
+        DataType::Float32 => cast_to_string!(Float32Array),
+        DataType::Float64 => cast_to_string!(Float64Array),
+        DataType::Boolean => cast_to_string!(BooleanArray),
+        _ => String::new(),
+    }
+}
+
+fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
+    with_conn(|conn| {
+        conn.execute_batch(sql)
+            .with_context(|| format!("duckdb execute failed:\n{}", &sql[..sql.len().min(500)]))
+    })
 }
 
 fn with_session_settings(sql: &str, memory_mb: Option<usize>, threads: Option<usize>) -> String {
@@ -11335,45 +11392,38 @@ fn with_session_settings(sql: &str, memory_mb: Option<usize>, threads: Option<us
     out
 }
 
-fn run_duckdb_csv(duckdb_bin: &Path, sql: &str) -> Result<Vec<HashMap<String, String>>> {
-    let out = Command::new(duckdb_bin)
-        .arg("-csv")
-        .arg("-c")
-        .arg(sql)
-        .output()
-        .with_context(|| format!("failed to run duckdb: {}", duckdb_bin.display()))?;
-
-    if !out.status.success() {
-        let exit_info = format_exit_status(&out.status);
-        let stdout_s = String::from_utf8_lossy(&out.stdout);
-        let stderr_s = String::from_utf8_lossy(&out.stderr);
-        if stdout_s.trim().is_empty() && stderr_s.trim().is_empty() {
-            bail!(
-                "duckdb csv query failed ({exit_info}, no output — likely killed by OS/OOM killer)"
-            );
+fn run_duckdb_csv(_duckdb_bin: &Path, sql: &str) -> Result<Vec<HashMap<String, String>>> {
+    with_conn(|conn| {
+        let (set_part, query_part) = split_set_prefix(sql);
+        if !set_part.is_empty() {
+            conn.execute_batch(set_part).context("duckdb SET failed")?;
         }
-        bail!("duckdb csv query failed ({exit_info}):\n{stdout_s}\n{stderr_s}");
-    }
-
-    let mut rdr = csv::Reader::from_reader(out.stdout.as_slice());
-    let headers = rdr
-        .headers()
-        .context("cannot read csv header")?
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    let mut rows = Vec::new();
-    for rec in rdr.records() {
-        let rec = rec?;
-        let mut row = HashMap::new();
-        for (i, h) in headers.iter().enumerate() {
-            let v = rec.get(i).unwrap_or_default().to_string();
-            row.insert(h.clone(), v);
+        let query_part = query_part.trim();
+        if query_part.is_empty() {
+            return Ok(Vec::new());
         }
-        rows.push(row);
-    }
-    Ok(rows)
+        let mut stmt = conn
+            .prepare(query_part)
+            .with_context(|| format!("duckdb prepare failed:\n{query_part}"))?;
+        // query_arrow executes the statement, populating the schema before iteration
+        let mut arrow = stmt
+            .query_arrow([])
+            .with_context(|| format!("duckdb query failed:\n{query_part}"))?;
+        let schema = arrow.get_schema();
+        let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let mut rows = Vec::new();
+        for batch in &mut arrow {
+            for row_i in 0..batch.num_rows() {
+                let mut map = HashMap::new();
+                for (col_i, name) in col_names.iter().enumerate() {
+                    let s = arrow_col_to_string(batch.column(col_i).as_ref(), row_i);
+                    map.insert(name.clone(), s);
+                }
+                rows.push(map);
+            }
+        }
+        Ok(rows)
+    })
 }
 
 fn query_one_row(duckdb_bin: &Path, sql: &str) -> Result<HashMap<String, String>> {

@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 indicatif = "0.17"
 flate2 = "1"
 rand = "0.8"
