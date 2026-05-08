@@ -7280,12 +7280,21 @@ fn resolve_verify_report_path(args: &RepairArgs) -> Result<PathBuf> {
     if let Some(p) = &args.from_verify_report {
         return Ok(p.clone());
     }
-    latest_verify_convert_report(&args.shared.parquet_dir).ok_or_else(|| {
-        anyhow!(
-            "no verify_convert report found under {}; run verify_convert first or pass --from-verify-report",
-            global_reports_dir(&args.shared.parquet_dir).display()
-        )
-    })
+    let reports_dir = global_reports_dir(&args.shared.parquet_dir);
+    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "verify_convert") {
+        return Ok(p);
+    }
+    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "convert") {
+        eprintln!(
+            "[repair] no verify_convert report found; using convert report: {}",
+            p.display()
+        );
+        return Ok(p);
+    }
+    bail!(
+        "no verify_convert or convert report found under {}; run convert or verify_convert first, or pass --from-verify-report",
+        reports_dir.display()
+    )
 }
 
 fn run_repair(args: RepairArgs) -> Result<()> {
@@ -8450,7 +8459,7 @@ fn collect_repair_targets(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for f in &verify_report.failures {
-        if f.phase != "verify_metrics" {
+        if f.phase != "verify_metrics" && f.phase != "convert_file" {
             continue;
         }
         if !allowed_datasets.contains(&f.dataset) {
@@ -9098,9 +9107,9 @@ fn global_reports_dir(parquet_dir: &Path) -> PathBuf {
     metadata_root(parquet_dir).join("reports")
 }
 
-fn latest_verify_convert_report(parquet_dir: &Path) -> Option<PathBuf> {
+fn latest_report_for_command(parquet_dir: &Path, command: &str) -> Option<PathBuf> {
     let dir = global_reports_dir(parquet_dir);
-    let prefix = format!("{}-", sanitize_command_name("verify_convert"));
+    let prefix = format!("{}-", sanitize_command_name(command));
     let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
         .ok()?
         .filter_map(|e| e.ok())
