@@ -5800,6 +5800,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -7204,6 +7205,7 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -7250,6 +7252,7 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
                 args.sample_size,
                 args.refresh_cache,
                 tuning.memory_mb,
+                tuning.workers,
                 args.state_flush_every,
             ) {
                 Ok(v) => v,
@@ -7405,6 +7408,7 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         )?;
         let right = load_schema_by_policy(
@@ -7416,6 +7420,7 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
             args.sample_size,
             args.refresh_cache,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         )?;
 
@@ -7669,6 +7674,7 @@ fn run_repair(args: RepairArgs) -> Result<()> {
             100,
             false,
             tuning.memory_mb,
+            tuning.workers,
             args.state_flush_every,
         ) {
             Ok(s) => s,
@@ -10094,6 +10100,7 @@ fn load_or_infer_source_schema(
     sample_size: usize,
     refresh: bool,
     memory_mb: Option<usize>,
+    workers: usize,
     state_flush_every: usize,
 ) -> Result<SchemaDoc> {
     migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
@@ -10139,23 +10146,41 @@ fn load_or_infer_source_schema(
         files.into_iter().step_by(step).take(sample_size).collect()
     };
 
+    let n_workers = workers.max(1);
     eprintln!(
-        "[schema] dataset={dataset} inferring schema from {} sampled source files",
+        "[schema] dataset={dataset} inferring schema from {} sampled source files (workers={n_workers})",
         sample.len()
     );
+    let extra = if dataset == "works" {
+        ", maximum_object_size=1000000000"
+    } else {
+        ""
+    };
+    // Run describe calls in parallel, collect (index, result) to preserve order for logging.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_workers)
+        .build()?;
+    let duckdb_arc = std::sync::Arc::new(duckdb_bin.to_path_buf());
+    let results: Vec<(usize, Result<BTreeMap<String, String>>)> = pool.install(|| {
+        sample
+            .par_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let cols = describe_json_file(&duckdb_arc, f, extra, memory_mb);
+                (i, cols)
+            })
+            .collect()
+    });
+
     let mut merged: HashMap<String, String> = HashMap::new();
     let flush_every = state_flush_every.max(1);
     let in_progress_csv =
         dataset_cache_dir(parquet_dir, dataset).join("unified_schema.in_progress.csv");
     let in_progress_json =
         dataset_cache_dir(parquet_dir, dataset).join("source_schema.in_progress.json");
-    for (i, f) in sample.iter().enumerate() {
-        let extra = if dataset == "works" {
-            ", maximum_object_size=1000000000"
-        } else {
-            ""
-        };
-        let cols = describe_json_file(duckdb_bin, f, extra, memory_mb)?;
+    let total = results.len();
+    for (i, cols_result) in results {
+        let cols = cols_result?;
         for (k, t) in cols {
             merged
                 .entry(k)
@@ -10166,7 +10191,7 @@ fn load_or_infer_source_schema(
                 })
                 .or_insert(t);
         }
-        if (i + 1) % flush_every == 0 || i + 1 == sample.len() {
+        if (i + 1) % flush_every == 0 || i + 1 == total {
             let checkpoint_doc = schema_doc_from_merged(dataset, &merged);
             write_unified_schema_csv(&in_progress_csv, &checkpoint_doc)?;
             write_json_atomic(
@@ -10176,7 +10201,7 @@ fn load_or_infer_source_schema(
             eprintln!(
                 "[schema] dataset={dataset} processed {}/{} schema sample files",
                 i + 1,
-                sample.len()
+                total
             );
         }
     }
@@ -10294,6 +10319,7 @@ fn load_schema_by_policy(
     sample_size: usize,
     refresh: bool,
     memory_mb: Option<usize>,
+    workers: usize,
     state_flush_every: usize,
 ) -> Result<SchemaDoc> {
     migrate_legacy_schema_cache_if_needed(parquet_dir, dataset)?;
@@ -10309,6 +10335,7 @@ fn load_schema_by_policy(
             sample_size,
             refresh,
             memory_mb,
+            workers,
             state_flush_every,
         ),
         SchemaFrom::Cache => {
@@ -10344,6 +10371,7 @@ fn load_schema_by_policy(
                     sample_size,
                     refresh,
                     memory_mb,
+                    workers,
                     state_flush_every,
                 );
             }
