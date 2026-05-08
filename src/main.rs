@@ -8686,16 +8686,21 @@ fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
 
     // Keep some headroom for OS and other processes.
     let usable = (t as f64 * 0.80).floor() as usize;
+    // With in-process DuckDB the global memory_limit is shared across all worker connections
+    // (set once via set_duckdb_memory_limit = per_worker × workers). The fractions here
+    // represent the TOTAL budget for the whole DuckDB instance, not a per-subprocess budget.
+    // Old subprocess model used 0.35 for Balanced, which was per-process; in-process needs a
+    // higher total to avoid OOM when multiple workers concurrently process large files.
     let mb = match profile {
-        Profile::Auto | Profile::Balanced => ((usable as f64) * 0.35).floor() as usize,
+        Profile::Auto | Profile::Balanced => ((usable as f64) * 0.65).floor() as usize,
         Profile::Safe => ((usable as f64) * 0.15).floor() as usize,
-        Profile::Fast => ((usable as f64) * 0.55).floor() as usize,
+        Profile::Fast => ((usable as f64) * 0.80).floor() as usize,
     };
 
     let (min_mb, max_mb) = match profile {
-        Profile::Auto | Profile::Balanced => (4096, 24_576),
+        Profile::Auto | Profile::Balanced => (4096, 32_768),
         Profile::Safe => (1024, 8192),
-        Profile::Fast => (8192, 32_768),
+        Profile::Fast => (8192, 49_152),
     };
     mb.max(min_mb).min(max_mb)
 }
@@ -11547,14 +11552,14 @@ mod tests {
         assert_eq!(s1.memory_mb, Some(11_796));
 
         let b = resolve_tuning_with_total(Profile::Balanced, 8, None, Some(32_768));
-        // workers capped to 7 because total budget (9174) / MIN_PER_WORKER_MB (1280) = 7
-        assert_eq!(b.workers, 7);
-        assert_eq!(b.memory_mb, Some(9174 / 7)); // per-worker = total / capped_workers
+        // Balanced: usable=26214, total=26214*0.65=17039, max_workers=17039/1280=13, workers=min(8,13)=8
+        assert_eq!(b.workers, 8);
+        assert_eq!(b.memory_mb, Some(17039 / 8));
 
         let f = resolve_tuning_with_total(Profile::Fast, 8, None, Some(32_768));
-        // workers capped to 8 because explicit workers=8, budget (14417)/1280=11 allows it
+        // Fast: usable=26214, total=26214*0.80=20971, max_workers=20971/1280=16, workers=min(8,16)=8
         assert_eq!(f.workers, 8);
-        assert_eq!(f.memory_mb, Some(14_417 / 8)); // per-worker = total / capped_workers
+        assert_eq!(f.memory_mb, Some(20_971 / 8));
 
         let ov = resolve_tuning_with_total(Profile::Safe, 3, Some(999), Some(32_768));
         assert_eq!(ov.memory_mb, Some(999));
