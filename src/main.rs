@@ -3728,6 +3728,9 @@ report:
   latest: false
   # allowed values: true | false
   full: false
+  # Show only aggregate totals; suppress per-dataset breakdown (default: false = show per-dataset)
+  # allowed values: true | false
+  # summary: false
 
 prune_reports:
   # ---------------------------------------------------------------------------
