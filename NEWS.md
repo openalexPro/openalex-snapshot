@@ -4,7 +4,7 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-05-10
+## [0.4.0] - 2026-05-10
 
 ### Added
 
