@@ -251,9 +251,15 @@ Defaults:
 const SKILLS_LONG_ABOUT: &str = "\
 Bootstrap AI skills scaffolding for this project.
 
+Generated skills:
+  - cli-operations/SKILL.md    command patterns and decision rules
+  - pipeline-runbook/SKILL.md  end-to-end flow and orchestration
+  - debug-and-recovery/SKILL.md  failure triage and OOM recovery
+  - development/SKILL.md       build, test, deploy, architecture notes
+  - release-and-docs/SKILL.md  release checklist and docs hygiene
+
 Behavior:
   - creates <root_dir>/skills
-  - writes command-focused starter skill files
   - default safe mode: create missing files only
   - use --overwrite to rewrite generated files
 ";
@@ -262,7 +268,7 @@ const CHECK_LONG_ABOUT: &str = "\
 Run environment and capacity preflight checks.
 
 Checks:
-  - required binaries (duckdb, aws)
+  - required binaries (aws for download; duckdb is bundled — no external binary needed)
   - root/snapshot/parquet/metadata path writability
   - download disk estimate from remote manifest (+10%)
   - convert disk estimate from source inventory (precise)
@@ -9943,7 +9949,7 @@ fn skills_templates(root_dir: &Path) -> Vec<(PathBuf, String)> {
             base.join("README.md"),
             r#"# Project Skills
 
-These skills help AI coding agents operate `openalex-snapshot` safely and consistently.
+These skills help AI coding agents operate and develop `openalex-snapshot` safely and consistently.
 
 ## Program Summary
 
@@ -9956,9 +9962,9 @@ These skills help AI coding agents operate `openalex-snapshot` safely and consis
 5. `schema` / `verify_schema`
 6. reporting and progress (`report`, `prune-reports`, `progress`)
 
-Core requirements:
-- `duckdb` for conversion/verify/schema/index paths
-- `aws` for download/verify_download paths
+Runtime requirements:
+- `aws` CLI for download/verify_download paths only
+- No external `duckdb` binary needed — DuckDB is statically linked in the binary
 
 Argument precedence to apply in all commands:
 1. explicit CLI flags
@@ -9966,15 +9972,20 @@ Argument precedence to apply in all commands:
 3. config defaults section values
 4. built-in defaults
 
+Note: `--config` is a **global** flag and must precede the subcommand:
+  `openalex-snapshot --config ./openalex-snapshot.yaml report`
+
 ## How to use these skills
 
-- Start with `cli-operations/SKILL.md`.
+- Start with `cli-operations/SKILL.md` for day-to-day operation.
 - Use `pipeline-runbook/SKILL.md` for end-to-end execution.
 - Use `debug-and-recovery/SKILL.md` when any command fails.
-- Use `release-and-docs/SKILL.md` when changing behavior.
+- Use `development/SKILL.md` when modifying source code.
+- Use `release-and-docs/SKILL.md` when releasing or updating docs.
 
 Canonical references:
 - `ARCHITECTURE_AND_DECISIONS.md`
+- `CLAUDE.md`
 - `NEWS.md`
 - CLI help and man pages
 "#
@@ -9993,30 +10004,56 @@ Run subcommands with correct root-dir model and predictable outputs.
 - resource settings (`profile`, `workers`, `max-memory-mb`) when needed
 
 ## Command Pattern
-- Always prefer `--root-dir`.
-- Use `--explain` before long runs.
+- Always prefer `--root-dir` or a `--config` file.
+- `--config` is a global flag — place it before the subcommand:
+  `openalex-snapshot --config ./openalex-snapshot.yaml <subcommand>`
+- Use `--explain` before long runs to preview what will happen.
 - Use `report` and `progress` for run-state visibility.
 
 ## Common command snippets
-- Preflight: `openalex-snapshot check --root-dir <root> --dataset all`
-- Convert one dataset: `openalex-snapshot convert --root-dir <root> --dataset works --profile safe --workers 1`
-- Verify one dataset: `openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both`
-- Extract by IDs: `openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.parquet>`
-- Repair from report: `openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>`
+
+```bash
+# Preflight check
+openalex-snapshot check --root-dir <root> --dataset all
+
+# Convert one dataset (auto profile — balanced, uses ~65% RAM)
+openalex-snapshot convert --root-dir <root> --dataset works
+
+# Convert with constrained memory
+openalex-snapshot convert --root-dir <root> --dataset works --profile safe --workers 1
+
+# Verify one dataset
+openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both
+
+# Show latest reports with per-dataset breakdown
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+
+# Show aggregate totals only
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
+
+# Extract by IDs
+openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.parquet>
+
+# Repair from verify report
+openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>
+```
 
 ## Failure Handling
-- On non-zero exit, inspect latest report (`report --latest --full`).
+- On non-zero exit, inspect latest report: `report --latest --full`.
+- Datasets with failures are marked `!` in the default report view.
 - Use `repair_convert` for verify-driven reconversion.
 
 ## Decision rules
-- If memory is constrained, use `--profile safe --workers 1`.
-- If debugging a single problematic file, use repeated `--input-file` on `convert`.
-- Prefer `verify_convert --scope file` for quick checks, `--scope dataset|snapshot` for full checks.
+- Default profile is `auto` (= `balanced`): 65% of RAM, 4–32 GiB global DuckDB budget.
+- For memory-constrained machines: `--profile safe --workers 1` (15% RAM, 1–8 GiB).
+- For maximum throughput: `--profile fast` (80% RAM, 8–48 GiB).
+- To isolate a single problematic file: repeated `--input-file` on `convert`.
+- Prefer `verify_convert --scope file` for quick spot checks; `--scope dataset|snapshot` for full checks.
 - Run `index` before `extract`; extraction requires `<dataset>_id_idx.parquet`.
 
 ## Done Criteria
-- command exits successfully,
-- expected report written to `openalex-snapshot_metadata/reports/`.
+- Command exits 0.
+- Expected report written to `openalex-snapshot_metadata/reports/`.
 "#
             .to_string(),
         ),
@@ -10027,7 +10064,7 @@ Run subcommands with correct root-dir model and predictable outputs.
 ## Purpose
 Execute the recommended end-to-end flow safely.
 
-## Flow
+## Full flow
 1. `check`
 2. `download`
 3. `verify_download`
@@ -10038,22 +10075,27 @@ Execute the recommended end-to-end flow safely.
 8. `verify_index`
 9. `extract`
 
+## Auto orchestration (recommended)
+```bash
+openalex-snapshot all --config <path> --retry 2
+```
+Runs all enabled stages in order with a bounded verify/repair loop.
+Edit `all:` section in the config to disable stages you don't need (e.g. `enable_download: false`).
+
+## Local snapshot already present (skip download)
+```bash
+openalex-snapshot convert --root-dir <root> --dataset all
+openalex-snapshot verify_convert --root-dir <root> --scope snapshot
+openalex-snapshot index --root-dir <root> --dataset all
+openalex-snapshot verify_index --root-dir <root>
+```
+
 ## Decision Rules
-- Keep `profile=safe` for constrained memory hosts.
-- Use `--dataset` scope for focused reruns.
-- Keep reports for traceability.
-
-## Fast operational variants
-- Local snapshot already present:
-  1. `check`
-  2. `convert`
-  3. `verify_convert`
-  4. `index`
-  5. `verify_index`
-  6. `extract`
-
-- Auto orchestration:
-  - `openalex-snapshot all --config <path> --retry <N>`
+- Default profile (`auto`) is appropriate for most machines — it uses ~65% of RAM.
+- Use `--profile safe` for machines with <8 GiB available.
+- Use `--dataset <name>` to rerun a single dataset without touching others.
+- Check `report --latest` after each stage to confirm success before proceeding.
+- Keep reports: they drive `repair_convert` and provide audit trails.
 "#
             .to_string(),
         ),
@@ -10065,24 +10107,103 @@ Execute the recommended end-to-end flow safely.
 Triage failures using metadata and reports.
 
 ## Steps
-1. `report --latest --full`
-2. `progress --once`
-3. verify failure phase and paths
-4. run targeted command with `--explain`
-5. rerun or `repair_convert` as indicated
+1. `openalex-snapshot --config <cfg> report --latest` — scan per-dataset table for `!` rows
+2. `openalex-snapshot --config <cfg> report --latest --full` — full JSON for root cause
+3. `progress --once` — check if a run is still live
+4. Run targeted command with `--explain` to preview what it would do
+5. Rerun failed dataset or use `repair_convert` as indicated
 
 ## Common Traps
-- wrong root-dir
-- missing duckdb/aws binaries
-- low disk space
-- stale assumptions from old command names
+- Wrong `root-dir` (snapshot/parquet/metadata dirs won't be found)
+- Missing `aws` binary (only needed for download steps)
+- Low disk space (`check --root-dir <root>` reports estimates)
+- Using `--config` after the subcommand instead of before it
 
 ## Failure phase hints
-- `check_dependency`: missing tool binary (`duckdb`/`aws`)
+- `check_dependency`: missing `aws` binary (duckdb is bundled — not an external dep)
 - `check_download_disk` / `check_convert_disk`: insufficient free space
-- `verify_metrics`: file-level parity mismatch; candidate for `repair_convert`
-- `download_sync`: S3 sync/auth/endpoint failure
+- `verify_metrics`: file-level parity mismatch — run `repair_convert`
+- `download_sync`: S3 sync / auth / endpoint failure
 - `validate_gzip_integrity`: corrupted `.json.gz` file
+
+## OOM during convert
+- Run `check --root-dir <root>` to see memory estimates.
+- Try `--profile safe --workers 1` to minimise peak memory.
+- Use `--max-memory-mb <N>` to set an explicit DuckDB budget.
+- If a specific file is always failing, isolate it with `--input-file`.
+"#
+            .to_string(),
+        ),
+        (
+            base.join("development").join("SKILL.md"),
+            r#"# Development Skill
+
+## Purpose
+Build, test, and deploy `openalex-snapshot` source changes safely.
+
+## Repository layout
+- All logic lives in `src/main.rs` (single file, ~10 000+ lines).
+- Tests live in `tests/cli_smoke.rs`.
+- Skills templates are embedded in `skills_templates()` near the end of `src/main.rs`.
+- Config templates are embedded as `config_template_*()` functions in `src/main.rs`.
+
+## Build / test loop
+```bash
+cargo build --release                     # production binary
+cargo test --all-targets --locked         # run all 26 tests
+cargo clippy --all-targets -- -D warnings # lint (must be clean)
+cargo fmt --all                           # format (CI enforces)
+```
+
+Tests require the `duckdb` CLI binary in PATH for parquet-reading verification steps;
+they skip gracefully when it is absent. The main binary does NOT need it — DuckDB is
+statically linked via `duckdb = { version = "1", features = ["bundled", "json", "parquet"] }`.
+
+## Deploy pattern
+```bash
+cargo build --release
+cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
+```
+
+## DuckDB in-process architecture
+- A global `Connection` lives in `OnceLock<Mutex<Connection>>` (see `master_conn()`).
+- Each rayon worker thread calls `master.try_clone()` once and stores it in `thread_local!`.
+- The global DuckDB memory limit (`SET memory_limit`) is shared across ALL connections on
+  the same database — it must be set once before the parallel pass as `per_worker × workers`.
+  Setting it inside a per-file query resets the global cap and starves other workers.
+- Profile memory fractions (of 80% usable RAM):
+  - `auto` / `balanced`: 65%, clamped 4–32 GiB
+  - `safe`: 15%, clamped 1–8 GiB (workers capped at 2)
+  - `fast`: 80%, clamped 8–48 GiB
+
+## Worktree and PR conventions
+- All changes go through a PR from a `claude/<name>` worktree branch.
+- Never commit directly to `main` except for trivial fixes.
+- Do NOT delete `claude/*` branches after merging — kept for AI audit trail.
+- Tag releases on `main` after merge; pushing a `v*` tag triggers the release workflow.
+
+## Required updates on any behavior change
+1. `NEWS.md` — add entry under `[Unreleased]`
+2. `docs/commands/<name>.md` — update affected command doc
+3. `ARCHITECTURE_AND_DECISIONS.md` — update if invariants changed
+4. `CLAUDE.md` — update if architecture or build model changed
+5. Help text in `src/main.rs` (`*_LONG_ABOUT` constants, `#[arg(help = ...)]`)
+6. Config template embedded in `src/main.rs` (if new options added)
+7. Skills templates in `skills_templates()` in `src/main.rs` (if operational behavior changed)
+
+## Adding a subcommand
+1. Add `*_LONG_ABOUT` constant and register in top-level `CLI_LONG_ABOUT`.
+2. Add `*Args` struct with `#[command]` derive.
+3. Add config section struct and `apply_*_config()` wiring.
+4. Add report persistence if command has operational outcomes.
+5. Add tests in `tests/cli_smoke.rs`.
+6. Update `NEWS.md`, `docs/commands/<name>.md`, `AI_SKILLS_USAGE.md`.
+
+## Done Criteria
+- `cargo test --all-targets --locked` passes (all 26 tests green).
+- `cargo clippy --all-targets -- -D warnings` is clean.
+- Binary deployed and smoke-tested against real data.
+- `NEWS.md` and affected docs updated in the same commit.
 "#
             .to_string(),
         ),
@@ -10091,23 +10212,35 @@ Triage failures using metadata and reports.
             r#"# Release and Docs Hygiene Skill
 
 ## Purpose
-Keep docs and release notes in sync with behavior changes.
+Keep docs, help text, and release notes in sync with behavior changes.
 
-## Required Updates on Feature Change
-- `NEWS.md`
-- command docs/man pages
-- config template examples
-- architecture/decisions doc for changed invariants
+## Required updates on any feature change
+- `NEWS.md` — add entry under `[Unreleased]`
+- `docs/commands/<name>.md` — update command-specific docs
+- `CLAUDE.md` — update if architecture or build model changed
+- `ARCHITECTURE_AND_DECISIONS.md` — update if invariants changed
+- Help text in `src/main.rs` (`*_LONG_ABOUT`, `#[arg(help = ...)]`, profile tables)
+- Config template in `src/main.rs` (if new options added)
+- Skills templates in `skills_templates()` in `src/main.rs` (if operational behavior changed)
+- `AI_SKILLS_USAGE.md` — if skill structure changes
 
-## Acceptance
-- new command/options appear in help, README, docs, and man pages
-- tests cover parsing + behavior + edge cases
+## Acceptance criteria
+- New flags/commands appear in: `--help`, `README.md`, `docs/`, and `NEWS.md`
+- Profile/memory tables in docs and help text match the actual constants in `auto_profile_memory_mb()`
+- Tests cover CLI parsing + behavior + edge cases
+- `openalex-snapshot --version` reflects the correct `Cargo.toml` version
 
-## Minimum release checks
-- `cargo test -q`
-- `cargo build --release`
-- `openalex-snapshot --help`
-- `openalex-snapshot --version`
+## Release checklist
+```bash
+# 1. Bump version in Cargo.toml
+# 2. Move [Unreleased] entries to [X.Y.Z] - YYYY-MM-DD in NEWS.md
+cargo test --all-targets --locked
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+openalex-snapshot --help
+openalex-snapshot --version
+# 3. Commit, merge PR to main, push v* tag to trigger release workflow
+```
 "#
             .to_string(),
         ),

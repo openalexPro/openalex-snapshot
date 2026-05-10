@@ -4,20 +4,32 @@ This project supports a repo-local `skills/` folder to help AI coding agents exe
 
 ## Goal
 
-Provide operational skills that are specific to `openalex-snapshot` behavior, not generic AI prompting advice.
+Provide operational and development skills specific to `openalex-snapshot` behavior, not generic AI prompting advice.
 
-Core operational flow:
+## Core operational flow
+
 1. `download` / `verify_download`
 2. `convert` / `verify_convert` / `repair_convert`
 3. `index` / `verify_index`
 4. `extract`
 5. `schema` / `verify_schema`
 
-Configuration precedence to follow in all skills:
+## Runtime requirements
+
+- `aws` CLI — required for `download` / `verify_download` only
+- No external `duckdb` binary needed — DuckDB is statically linked in the binary
+
+## Configuration precedence (follow in all skills)
+
 1. explicit CLI flags
 2. config subcommand section values
 3. config `defaults` section values
 4. built-in defaults
+
+Note: `--config` is a **global** flag and must precede the subcommand:
+```bash
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+```
 
 ## Bootstrapping
 
@@ -37,6 +49,7 @@ Safe defaults:
 - `skills/cli-operations/SKILL.md`
 - `skills/pipeline-runbook/SKILL.md`
 - `skills/debug-and-recovery/SKILL.md`
+- `skills/development/SKILL.md`
 - `skills/release-and-docs/SKILL.md`
 - `skills/_templates/skill-template.md`
 
@@ -55,6 +68,7 @@ Each skill should include:
 
 Skills should reference these docs as source-of-truth:
 - `ARCHITECTURE_AND_DECISIONS.md`
+- `CLAUDE.md`
 - `NEWS.md`
 - command docs/man pages
 - `docs/commands/extract.md` for ID routing and output behavior
@@ -62,6 +76,7 @@ Skills should reference these docs as source-of-truth:
 ## Maintenance
 
 When command behavior changes:
-- update affected skills,
-- update architecture/decision doc if invariants changed,
+- update affected skills templates in `skills_templates()` in `src/main.rs`,
+- update `AI_SKILLS_USAGE.md` if the skill structure changes,
+- update `ARCHITECTURE_AND_DECISIONS.md` if invariants changed,
 - record in `NEWS.md`.
