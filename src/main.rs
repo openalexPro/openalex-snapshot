@@ -1234,6 +1234,10 @@ struct ReportArgs {
     latest: bool,
 
     #[arg(long, default_value_t = false)]
+    #[arg(help = "Show only aggregate totals; suppress per-dataset breakdown")]
+    summary: bool,
+
+    #[arg(long, default_value_t = false)]
     #[arg(help = "Print full pretty JSON after each summary line")]
     full: bool,
 }
@@ -1603,6 +1607,7 @@ struct ReportConfig {
     source: Option<ReportSource>,
     command: Option<String>,
     latest: Option<bool>,
+    summary: Option<bool>,
     full: Option<bool>,
 }
 
@@ -3061,6 +3066,11 @@ fn apply_report_config(
                 args.latest = v;
             }
         }
+        if !cli_explicit(matches, "summary") {
+            if let Some(v) = c.summary {
+                args.summary = v;
+            }
+        }
         if !cli_explicit(matches, "full") {
             if let Some(v) = c.full {
                 args.full = v;
@@ -4366,41 +4376,78 @@ fn run_report(args: ReportArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  path",
-        "source", "command", "status", "failed", "succeeded", "skipped", "started_local", "runtime"
-    );
-    println!("{}", "-".repeat(140));
-    for rec in &records {
-        let status = if rec.report.totals_failed == 0 {
-            "ok"
-        } else {
-            "failed"
-        };
-        let started_local = Local
-            .timestamp_opt(rec.report.started_at_unix, 0)
-            .single()
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| rec.report.started_at_unix.to_string());
-        let runtime = rec
-            .report
-            .duration_seconds
-            .map(format_duration)
-            .unwrap_or_else(|| "-".to_string());
+    if args.summary {
+        // Aggregate-only view (one line per report file).
         println!(
-            "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
-            rec.source_kind,
-            rec.report.command,
-            status,
-            rec.report.totals_failed,
-            rec.report.totals_succeeded,
-            rec.report.totals_skipped,
-            started_local,
-            runtime,
-            rec.path.display(),
+            "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  path",
+            "source", "command", "status", "failed", "succeeded", "skipped", "started_local", "runtime"
         );
-        if args.full {
-            println!("{}", serde_json::to_string_pretty(&rec.report)?);
+        println!("{}", "-".repeat(140));
+        for rec in &records {
+            let status = if rec.report.totals_failed == 0 { "ok" } else { "FAILED" };
+            let started_local = Local
+                .timestamp_opt(rec.report.started_at_unix, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| rec.report.started_at_unix.to_string());
+            let runtime = rec.report.duration_seconds.map(format_duration).unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
+                rec.source_kind, rec.report.command, status,
+                rec.report.totals_failed, rec.report.totals_succeeded, rec.report.totals_skipped,
+                started_local, runtime, rec.path.display(),
+            );
+            if args.full {
+                println!("{}", serde_json::to_string_pretty(&rec.report)?);
+            }
+        }
+    } else {
+        // Default: per-dataset breakdown grouped under each report header.
+        for rec in &records {
+            let status = if rec.report.totals_failed == 0 { "ok" } else { "FAILED" };
+            let started_local = Local
+                .timestamp_opt(rec.report.started_at_unix, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| rec.report.started_at_unix.to_string());
+            let runtime = rec.report.duration_seconds.map(format_duration).unwrap_or_else(|| "-".to_string());
+            println!(
+                "=== {} [{}  {}  {}]  {}",
+                rec.report.command, started_local, runtime, status,
+                rec.path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            if !rec.report.datasets.is_empty() {
+                println!(
+                    "  {:<22} {:>8} {:>8} {:>8} {:>8}",
+                    "dataset", "scanned", "ok", "failed", "skipped"
+                );
+                println!("  {}", "-".repeat(54));
+                for ds in &rec.report.datasets {
+                    let ds_status = if ds.failed > 0 { "  !" } else { "" };
+                    println!(
+                        "  {:<22} {:>8} {:>8} {:>8} {:>8}{}",
+                        ds.dataset, ds.items_scanned, ds.succeeded, ds.failed, ds.skipped, ds_status
+                    );
+                }
+            } else if !rec.report.step_runs.is_empty() {
+                // all-command style: show step results instead of datasets
+                for step in &rec.report.step_runs {
+                    let st = if step.status == "ok" { "ok" } else { &step.status };
+                    println!("  {:<22} {}", step.step, st);
+                }
+            } else {
+                println!(
+                    "  totals: scanned={} ok={} failed={} skipped={}",
+                    rec.report.totals_items_scanned,
+                    rec.report.totals_succeeded,
+                    rec.report.totals_failed,
+                    rec.report.totals_skipped,
+                );
+            }
+            if args.full {
+                println!("{}", serde_json::to_string_pretty(&rec.report)?);
+            }
+            println!();
         }
     }
     println!("[report] listed {} report file(s)", records.len());
