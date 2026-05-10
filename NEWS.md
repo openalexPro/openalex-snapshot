@@ -4,23 +4,37 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-10
+
+### Added
+
+- `report` default output now shows a **per-dataset breakdown** (scanned / ok / failed / skipped) under each report header, with `!` marking any dataset with failures.
+- `report --summary` flag to suppress per-dataset rows and show only aggregate totals (previous default behavior).
+
+### Changed
+
+- DuckDB is now **in-process** via the `duckdb` Rust crate (statically linked; no external `duckdb` binary required at runtime). Replaced all subprocess invocations (`std::process::Command`) with an in-process connection shared across rayon worker threads via `OnceLock<Mutex<Connection>>` + per-thread `try_clone()`.
+- Global DuckDB memory limit (`SET memory_limit`) is now set once before the parallel pass as `per_worker_mb × workers`, so all worker connections share a single correct budget. Previously the limit was set per-query inside each worker, which caused all workers to share an unintentionally small cap.
+- Profile memory fractions updated for the in-process model (old values were calibrated for per-subprocess isolation):
+  - `balanced` / `auto`: **65%** of usable RAM, 4–32 GiB (was 35%, 4–24 GiB)
+  - `fast`: **80%** of usable RAM, 8–48 GiB (was 55%, 8–32 GiB)
+  - `safe`: 15% of usable RAM, 1–8 GiB (unchanged)
+- `Profile::Auto` is now an alias for `Profile::Balanced` (single parallel pass). The two-tier serial large-file pass has been removed; in-process DuckDB with a generous memory budget handles large files via streaming.
+
 ## [0.3.0] - 2026-05-08
 
 ### Added
 
-- `Profile::Auto` (default): two-tier convert mode — small files run in parallel (balanced), large files run serially with maximised memory.
-- `large_file_threshold_mb` config/CLI option to override the auto large-file threshold.
-- Per-step timing in convert: schema inference elapsed, small-pass done (ok/failed/elapsed), large-pass done (ok/failed/elapsed).
+- `Profile::Auto` (default): parallel convert mode with pre-split support for very large gz files (`--split-size`).
+- `--split-size <SIZE>` config/CLI option: decompress and chunk gz files larger than the threshold before converting. `0` (default) disables splitting; in-process DuckDB handles large files via streaming.
+- Per-step timing in convert: schema inference elapsed, pass done (ok/failed/elapsed).
 - `(N of M)` file count and ETA in live `progress --watch` output.
 - Parallel schema inference using a rayon thread pool (was serial).
 
 ### Changed
 
 - Default workers: `cpus-2` via `available_parallelism()` (0 is the auto sentinel; explicit value overrides).
-- Per-worker memory = total balanced budget ÷ workers, preventing swap pressure from the old per-worker full-budget assignment.
-- Worker count capped so aggregate memory stays within the balanced budget (1280 MiB floor).
-- Non-works datasets skip the large-file threshold entirely (`threshold=all`) — every file goes through the parallel pass.
-- Works threshold now uses `large_mem_mb` as reference (~589 MB on 36 GB) instead of `balanced_mem_mb` (~86 MB).
+- Global memory budget divided across workers, preventing swap pressure from the old per-worker full-budget assignment.
 - Both passes sort files largest-first to minimise tail-latency stragglers.
 - `run_all` fixed: sub-command args were hardcoded to `workers=4` / `Profile::Balanced`; now inherit auto defaults.
 - `schemata/` cache excluded from archive and log cleanup so it persists across runs.

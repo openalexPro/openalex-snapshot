@@ -10,5 +10,7 @@ openalex-snapshot convert \
 ```
 
 Notes:
-- keep workers low (`1`) for hard memory constraints
-- use repeated `--input-file` to isolate problematic files
+- `safe` profile allocates 15% of usable RAM (1–8 GiB global), caps workers at 2
+- `--workers 1` ensures the full budget goes to one file at a time
+- `--max-memory-mb` overrides the profile calculation if you need a precise cap
+- Use repeated `--input-file` to isolate and retry specific problematic files

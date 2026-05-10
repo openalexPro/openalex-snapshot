@@ -342,18 +342,15 @@ Defaults:
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
 Profile / tuning:
-  Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
-  clamped to a min/max). Workers is only capped by 'safe' and 'auto'.
+  Profile controls the global DuckDB memory budget (shared across all in-process
+  worker connections, 80% of RAM × fraction, clamped to a min/max range).
+  Workers is only capped by 'safe'.
 
-  profile    workers cap   memory fraction   memory range   notes
-  auto       —             35% balanced /    4–24 GiB /     small files: parallel balanced
-                           75% of RAM        up to 75% RAM  large files: serial, max memory
-  safe       max 2         15% of usable     1 – 8 GiB
-  balanced   (none)        35% of usable     4 – 24 GiB
-  fast       (none)        55% of usable     8 – 32 GiB
-
-  Auto mode threshold: a file is 'large' when its estimated peak memory exceeds
-  the balanced per-worker budget (gz_size × 15). Threshold scales with system RAM.
+  profile    workers cap   memory fraction   memory range
+  auto       (none)        65% of usable     4 – 32 GiB   (alias for balanced)
+  safe       max 2         15% of usable     1 –  8 GiB
+  balanced   (none)        65% of usable     4 – 32 GiB
+  fast       (none)        80% of usable     8 – 48 GiB
 
   Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
   Set --max-memory-mb to override the profile memory calculation entirely.
@@ -671,7 +668,7 @@ struct ConvertArgs {
 
     #[arg(long, value_enum, default_value = "auto")]
     #[arg(
-        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Performance/memory profile: auto/balanced (65% of RAM, 4–32 GiB global budget), safe (workers≤2, 15% of RAM, 1–8 GiB), fast (80% of RAM, 8–48 GiB)"
     )]
     profile: Profile,
 
@@ -995,7 +992,7 @@ struct RepairArgs {
 
     #[arg(long, value_enum, default_value = "auto")]
     #[arg(
-        help = "Performance/memory profile: auto (two-tier: balanced parallel + safe serial for large files), safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
+        help = "Performance/memory profile: auto/balanced (65% of RAM, 4–32 GiB global budget), safe (workers≤2, 15% of RAM, 1–8 GiB), fast (80% of RAM, 8–48 GiB)"
     )]
     profile: Profile,
 
