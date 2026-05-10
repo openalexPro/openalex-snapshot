@@ -4386,22 +4386,43 @@ fn run_report(args: ReportArgs) -> Result<()> {
         // Aggregate-only view (one line per report file).
         println!(
             "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  path",
-            "source", "command", "status", "failed", "succeeded", "skipped", "started_local", "runtime"
+            "source",
+            "command",
+            "status",
+            "failed",
+            "succeeded",
+            "skipped",
+            "started_local",
+            "runtime"
         );
         println!("{}", "-".repeat(140));
         for rec in &records {
-            let status = if rec.report.totals_failed == 0 { "ok" } else { "FAILED" };
+            let status = if rec.report.totals_failed == 0 {
+                "ok"
+            } else {
+                "FAILED"
+            };
             let started_local = Local
                 .timestamp_opt(rec.report.started_at_unix, 0)
                 .single()
                 .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| rec.report.started_at_unix.to_string());
-            let runtime = rec.report.duration_seconds.map(format_duration).unwrap_or_else(|| "-".to_string());
+            let runtime = rec
+                .report
+                .duration_seconds
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string());
             println!(
                 "{:<15} {:<18} {:<8} {:>8} {:>10} {:>8} {:<19} {:>8}  {}",
-                rec.source_kind, rec.report.command, status,
-                rec.report.totals_failed, rec.report.totals_succeeded, rec.report.totals_skipped,
-                started_local, runtime, rec.path.display(),
+                rec.source_kind,
+                rec.report.command,
+                status,
+                rec.report.totals_failed,
+                rec.report.totals_succeeded,
+                rec.report.totals_skipped,
+                started_local,
+                runtime,
+                rec.path.display(),
             );
             if args.full {
                 println!("{}", serde_json::to_string_pretty(&rec.report)?);
@@ -4410,16 +4431,27 @@ fn run_report(args: ReportArgs) -> Result<()> {
     } else {
         // Default: per-dataset breakdown grouped under each report header.
         for rec in &records {
-            let status = if rec.report.totals_failed == 0 { "ok" } else { "FAILED" };
+            let status = if rec.report.totals_failed == 0 {
+                "ok"
+            } else {
+                "FAILED"
+            };
             let started_local = Local
                 .timestamp_opt(rec.report.started_at_unix, 0)
                 .single()
                 .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| rec.report.started_at_unix.to_string());
-            let runtime = rec.report.duration_seconds.map(format_duration).unwrap_or_else(|| "-".to_string());
+            let runtime = rec
+                .report
+                .duration_seconds
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string());
             println!(
                 "=== {} [{}  {}  {}]  {}",
-                rec.report.command, started_local, runtime, status,
+                rec.report.command,
+                started_local,
+                runtime,
+                status,
                 rec.path.file_name().unwrap_or_default().to_string_lossy()
             );
             if !rec.report.datasets.is_empty() {
@@ -4432,13 +4464,22 @@ fn run_report(args: ReportArgs) -> Result<()> {
                     let ds_status = if ds.failed > 0 { "  !" } else { "" };
                     println!(
                         "  {:<22} {:>8} {:>8} {:>8} {:>8}{}",
-                        ds.dataset, ds.items_scanned, ds.succeeded, ds.failed, ds.skipped, ds_status
+                        ds.dataset,
+                        ds.items_scanned,
+                        ds.succeeded,
+                        ds.failed,
+                        ds.skipped,
+                        ds_status
                     );
                 }
             } else if !rec.report.step_runs.is_empty() {
                 // all-command style: show step results instead of datasets
                 for step in &rec.report.step_runs {
-                    let st = if step.status == "ok" { "ok" } else { &step.status };
+                    let st = if step.status == "ok" {
+                        "ok"
+                    } else {
+                        &step.status
+                    };
                     println!("  {:<22} {}", step.step, st);
                 }
             } else {
