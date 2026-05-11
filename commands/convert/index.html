@@ -531,6 +531,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#large-file-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large-file handling
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1079,6 +1090,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#large-file-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large-file handling
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1102,19 +1124,19 @@
 <pre><code class="language-bash">openalex-snapshot convert \
   --root-dir /data \
   --dataset works \
-  --profile safe \
-  --workers 1
+  --profile balanced \
+  --workers 4
 </code></pre>
 <h2 id="key-behavior">Key behavior</h2>
 <ul>
-<li>1 input <code>.gz</code> maps to 1 output <code>.parquet</code></li>
-<li>resume-safe output skipping</li>
-<li>verification is separate via <code>verify_convert</code></li>
-<li>supports selected-file conversion via repeated <code>--input-file</code></li>
+<li>1 input <code>.gz</code> maps to 1 output <code>.parquet</code> (unless <code>--split-size</code> is set; see below)</li>
+<li>Resume-safe output skipping</li>
+<li>Verification is separate via <code>verify_convert</code></li>
+<li>Supports selected-file conversion via repeated <code>--input-file</code></li>
 </ul>
 <h2 id="profile-tuning">Profile / tuning</h2>
-<p><code>--profile</code> controls the DuckDB memory budget per worker (derived from 80% of usable RAM,
-clamped to a range). Only <code>safe</code> also caps the worker count.</p>
+<p><code>--profile</code> controls the <strong>global</strong> DuckDB memory budget shared across all in-process worker
+connections (derived from 80% of usable RAM × fraction, clamped to a min/max range).</p>
 <table>
 <thead>
 <tr>
@@ -1126,28 +1148,42 @@ clamped to a range). Only <code>safe</code> also caps the worker count.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>safe</code></td>
-<td>max 2</td>
-<td>15% of usable RAM</td>
-<td>1 – 8 GiB</td>
+<td><code>auto</code></td>
+<td>(none)</td>
+<td>65% of usable RAM</td>
+<td>4 – 32 GiB</td>
 </tr>
 <tr>
 <td><code>balanced</code></td>
 <td>(none)</td>
-<td>35% of usable RAM</td>
-<td>4 – 24 GiB</td>
+<td>65% of usable RAM</td>
+<td>4 – 32 GiB</td>
+</tr>
+<tr>
+<td><code>safe</code></td>
+<td>max 2</td>
+<td>15% of usable RAM</td>
+<td>1 –  8 GiB</td>
 </tr>
 <tr>
 <td><code>fast</code></td>
 <td>(none)</td>
-<td>55% of usable RAM</td>
-<td>8 – 32 GiB</td>
+<td>80% of usable RAM</td>
+<td>8 – 48 GiB</td>
 </tr>
 </tbody>
 </table>
-<p>Fallback when RAM cannot be detected: <code>safe</code>=2 GiB, <code>balanced</code>=6 GiB, <code>fast</code>=12 GiB.</p>
+<p><code>auto</code> is the default and behaves identically to <code>balanced</code>.</p>
+<p>Fallback when RAM cannot be detected: <code>safe</code>=2 GiB, <code>balanced</code>/<code>auto</code>=6 GiB, <code>fast</code>=12 GiB.</p>
 <p>Use <code>--max-memory-mb</code> to override the profile memory calculation entirely.
 Workers set via <code>--workers</code> or config are respected unless <code>safe</code> clamps them.</p>
+<h2 id="large-file-handling">Large-file handling</h2>
+<p>By default (<code>--split-size 0</code>) large files are processed directly by in-process DuckDB, which
+streams and spills to disk as needed within the global memory budget.</p>
+<p>Set <code>--split-size &lt;SIZE&gt;</code> (e.g. <code>256mb</code>, <code>512mb</code>) to pre-split gz files larger than that
+threshold into chunks before conversion. Each chunk produces a numbered parquet file
+(e.g. <code>part_0000_001.parquet</code>, <code>part_0000_002.parquet</code>). Use this only if you observe OOM
+despite a generous profile, or when running on a machine with very limited RAM.</p>
 
 
 

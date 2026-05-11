@@ -734,6 +734,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#default-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default output
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#notes" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1047,6 +1058,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#default-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default output
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#notes" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1077,21 +1099,38 @@
 <h1 id="command-report">Command: report</h1>
 <p>Show run reports written under <code>openalex-snapshot_metadata</code>.</p>
 <h2 id="usage">Usage</h2>
-<pre><code class="language-bash"># show current run reports
-openalex-snapshot report --root-dir /data --latest
+<pre><code class="language-bash"># show latest reports with per-dataset breakdown (default)
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+
+# show only aggregate totals (suppress per-dataset rows)
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
 
 # show full JSON details
-openalex-snapshot report --root-dir /data --latest --full
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest --full
 
 # list available archived run timestamps
 openalex-snapshot report --root-dir /data --list
 
 # show a specific archived run
 openalex-snapshot report --root-dir /data --archived 1715000000 --latest
+
+# filter by command
+openalex-snapshot report --root-dir /data --command verify_convert --latest
 </code></pre>
+<h2 id="default-output">Default output</h2>
+<p>Each report is shown as a header line followed by a per-dataset table:</p>
+<pre><code>=== convert [2026-05-09 00:28:53  40m18s  ok]  convert-1778260662.json
+  dataset                scanned       ok   failed  skipped
+  ------------------------------------------------------
+  authors                    546      546        0        0
+  works                     2127     2127        0        0  !
+</code></pre>
+<p>Datasets with failures are marked with <code>!</code>.</p>
 <h2 id="notes">Notes</h2>
 <ul>
-<li>default view shows <code>openalex-snapshot_metadata/reports/</code> (current run)</li>
+<li><code>--config</code> is a <strong>global</strong> flag and must precede the subcommand:
+  <code>openalex-snapshot --config ./openalex-snapshot.yaml report</code></li>
+<li><code>--summary</code> prints only aggregate totals (old behavior); suppresses per-dataset rows</li>
 <li><code>--list</code> shows timestamps available under <code>openalex-snapshot_metadata/archived/</code></li>
 <li><code>--archived &lt;timestamp&gt;</code> reads <code>openalex-snapshot_metadata/archived/&lt;timestamp&gt;/reports/</code></li>
 <li><code>--command &lt;name&gt;</code> filters by command (e.g. <code>verify_convert</code>, <code>repair_convert</code>)</li>

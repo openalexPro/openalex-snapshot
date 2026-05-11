@@ -994,8 +994,10 @@
   --max-memory-mb 4096
 </code></pre>
 <p>Notes:
-- keep workers low (<code>1</code>) for hard memory constraints
-- use repeated <code>--input-file</code> to isolate problematic files</p>
+- <code>safe</code> profile allocates 15% of usable RAM (1–8 GiB global), caps workers at 2
+- <code>--workers 1</code> ensures the full budget goes to one file at a time
+- <code>--max-memory-mb</code> overrides the profile calculation if you need a precise cap
+- Use repeated <code>--input-file</code> to isolate and retry specific problematic files</p>
 
 
 
