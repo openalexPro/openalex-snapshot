@@ -4,6 +4,15 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-11
+
+### Fixed
+
+- `extract`: the INNER JOIN between the index (which stores full-URL IDs like `https://openalex.org/W1234`) and the req_ids CSV (which was written with normalized short IDs like `W1234`) always returned empty results — `extract` had never returned matching records for standard short-form OpenAlex IDs. Fixed by adding `canonical_openalex_id()` which expands short IDs to full URLs before writing the req_ids CSV.
+- `extract`: now acquires a lock file so runs are visible to `progress --watch`.
+- Removed stale `ensure_duckdb()` calls from `convert`, `extract`, `verify`, `schema`, `verify_schema`, and `repair` (DuckDB is statically linked; there is no external binary to check). Deleted the now-dead wrapper function.
+- `check`: correctly reports DuckDB as bundled/statically linked instead of looking for an external binary.
+
 ## [0.4.0] - 2026-05-10
 
 ### Added
