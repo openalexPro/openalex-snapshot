@@ -6095,6 +6095,15 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
         }
 
+        // Enable spill-to-disk so DuckDB can handle files larger than memory_limit.
+        // Without a temp_directory an in-memory connection cannot spill and will OOM.
+        // Place the spill dir next to the parquet output (same filesystem) so spill
+        // writes are fast and we can clean up easily.
+        {
+            let spill_dir = metadata_root(&args.shared.parquet_dir).join("duckdb_tmp");
+            set_duckdb_temp_directory(&spill_dir);
+        }
+
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(tuning.workers)
             .build()
@@ -7908,6 +7917,10 @@ fn run_repair(args: RepairArgs) -> Result<()> {
         );
         if let Some(mb) = tuning.memory_mb {
             set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
+        }
+        {
+            let spill_dir = metadata_root(&args.shared.parquet_dir).join("duckdb_tmp");
+            set_duckdb_temp_directory(&spill_dir);
         }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(tuning.workers)
@@ -11637,6 +11650,25 @@ fn arrow_col_to_string(col: &dyn duckdb::arrow::array::Array, idx: usize) -> Str
 fn set_duckdb_memory_limit(total_mb: usize) {
     let master = master_conn().lock().expect("master conn lock poisoned");
     let _ = master.execute_batch(&format!("SET memory_limit='{total_mb}MB';"));
+}
+
+/// Set the DuckDB spill-to-disk directory on the master connection.
+/// Without this, an in-memory DuckDB connection has no temp_directory and will OOM
+/// instead of spilling when it hits the memory_limit.  Must be called before the
+/// parallel convert pass so all cloned connections inherit the setting.
+fn set_duckdb_temp_directory(dir: &Path) {
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!(
+            "[duckdb] warning: could not create temp_directory {}: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let master = master_conn().lock().expect("master conn lock poisoned");
+    let path_str = dir.to_string_lossy();
+    if let Err(e) = master.execute_batch(&format!("SET temp_directory='{path_str}';")) {
+        eprintln!("[duckdb] warning: could not set temp_directory={path_str}: {e}");
+    }
 }
 
 fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
