@@ -1181,3 +1181,103 @@ verify_index:
         .any(|n| n.starts_with("all-") && n.ends_with(".json"));
     assert!(has_all);
 }
+
+#[test]
+fn extract_returns_matching_records() {
+    if !has_duckdb() {
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+
+    // --- build a minimal snapshot with two works ---
+    let ds = root.join("snapshot/data/works/part_000");
+    fs::create_dir_all(&ds).unwrap();
+    write_gz_ndjson(
+        &ds.join("part1.gz"),
+        &[
+            r#"{"id":"https://openalex.org/W1000000001","title":"Alpha"}"#,
+            r#"{"id":"https://openalex.org/W1000000002","title":"Beta"}"#,
+        ],
+    );
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+
+    // --- convert ---
+    assert!(Command::new(&exe)
+        .args([
+            "convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "works",
+            "--workers",
+            "1"
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    // --- index ---
+    assert!(Command::new(&exe)
+        .args([
+            "index",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "works"
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    // --- write IDs CSV using short form (no URL prefix) to exercise canonical expansion ---
+    let ids_csv = root.join("extract_ids.csv");
+    fs::write(&ids_csv, "id\nW1000000001\n").unwrap();
+
+    // --- extract ---
+    let output_base = root.join("extracted");
+    let status = Command::new(&exe)
+        .args([
+            "extract",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--ids",
+            ids_csv.to_str().unwrap(),
+            "--output",
+            output_base.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "extract command failed");
+
+    // --- output parquet should exist ---
+    let out_parquet = root.join("extracted_works.parquet");
+    assert!(out_parquet.exists(), "extracted_works.parquet not created");
+
+    // --- verify content via duckdb CLI: exactly 1 row, correct id ---
+    let sql = format!(
+        "SELECT COUNT(*) AS n FROM read_parquet('{}');",
+        out_parquet.to_string_lossy().replace('\'', "''")
+    );
+    let out = Command::new("duckdb")
+        .args(["-csv", "-c", &sql])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    // header + one data row
+    assert!(
+        s.contains('1'),
+        "expected 1 row in extracted parquet, got: {s}"
+    );
+
+    // --- report written to metadata/reports/ ---
+    let reports = root.join("openalex-snapshot_metadata/reports");
+    let has_extract_report = fs::read_dir(&reports)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("extract-"));
+    assert!(has_extract_report, "no extract report written");
+}
