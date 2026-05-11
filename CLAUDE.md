@@ -13,7 +13,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-Tests in `tests/cli_smoke.rs` require `duckdb` to be available in `PATH` and will skip gracefully if it is not.
+Tests in `tests/cli_smoke.rs` use the `duckdb` CLI binary for parquet verification steps and will skip gracefully if it is not in `PATH`. The main binary does **not** require an external `duckdb` binary — DuckDB is statically linked via the `duckdb` crate (`features = ["bundled", "json", "parquet"]`).
 
 ## Architecture
 
@@ -38,7 +38,7 @@ The entire application is a single binary implemented in `src/main.rs` (~10,400 
 
 **Extract routing** — IDs are routed by OpenAlex entity prefix (`W`=works, `A`=authors, etc.) and taxonomy namespace prefixes, resolving to the correct dataset index.
 
-**DuckDB** — all parquet reads and writes go through a `duckdb` subprocess. The binary itself does not link DuckDB; it shells out via `std::process::Command`.
+**DuckDB** — all parquet reads and writes use the `duckdb` Rust crate in-process (statically linked; no external binary required). A global `Connection` is held in an `OnceLock<Mutex<Connection>>`; each rayon worker thread clones it via `try_clone()` and stores the clone in `thread_local!` storage. The global memory limit (`SET memory_limit`) is set once before the parallel pass as `per_worker_mb × workers` so all connections share a single budget.
 
 ## Invariants (from ARCHITECTURE_AND_DECISIONS.md)
 
