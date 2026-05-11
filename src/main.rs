@@ -1694,6 +1694,8 @@ struct RepairTarget {
 struct ExtractInput {
     raw: String,
     normalized: String,
+    /// Full-URL form matching what the index stores, e.g. "https://openalex.org/W1234"
+    canonical: String,
     dataset: Option<String>,
 }
 
@@ -3986,33 +3988,13 @@ fn run_check(args: CheckArgs) -> Result<()> {
     let mut warns = 0usize;
     let mut fails = 0usize;
 
-    let duck = duckdb_bin(&args.shared);
-    match ensure_duckdb_bin(&duck) {
-        Ok(()) => findings.push(CheckFinding {
-            name: "duckdb".to_string(),
-            status: "ok".to_string(),
-            details: format!("available at {}", duck.display()),
-            recommendation: None,
-        }),
-        Err(e) => {
-            fails += 1;
-            findings.push(CheckFinding {
-                name: "duckdb".to_string(),
-                status: "fail".to_string(),
-                details: format!("{e:#}"),
-                recommendation: Some("install duckdb or use --duckdb-bin".to_string()),
-            });
-            report.failures.push(FailureEntry {
-                dataset: args.shared.dataset.clone(),
-                phase: "check_dependency".to_string(),
-                rel_path: None,
-                source_path: None,
-                output_path: Some(duck.to_string_lossy().to_string()),
-                error_message: format!("{e:#}"),
-                suggested_recovery: Some("install duckdb or use --duckdb-bin".to_string()),
-            });
-        }
-    }
+    // DuckDB is statically linked via the bundled crate — no external binary required.
+    findings.push(CheckFinding {
+        name: "duckdb".to_string(),
+        status: "ok".to_string(),
+        details: "bundled (statically linked — no external binary required)".to_string(),
+        recommendation: None,
+    });
     match ensure_aws_cli(&args.aws_bin) {
         Ok(()) => findings.push(CheckFinding {
             name: "aws".to_string(),
@@ -5705,7 +5687,6 @@ fn run_prune_reports(args: PruneReportsArgs) -> Result<()> {
 }
 
 fn run_convert(args: ConvertArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     fs::create_dir_all(&args.shared.parquet_dir)?;
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
@@ -6604,7 +6585,6 @@ fn run_index(args: IndexArgs) -> Result<()> {
 }
 
 fn run_extract(args: ExtractArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     let bin = duckdb_bin(&args.shared);
     let parquet_dir = args.shared.parquet_dir.clone();
     let tuning = resolve_tuning(
@@ -6619,6 +6599,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
 
     let _ = cleanup_command_reports(&parquet_dir, "extract");
     let _ = cleanup_command_dataset_logs(&parquet_dir, "extract");
+    let _lock = acquire_lock(&parquet_dir, "extract")?;
 
     let inputs = read_extract_ids(&args.ids)?;
     let allowed_dataset = if args.shared.dataset == "all" {
@@ -6648,7 +6629,8 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
                 continue;
             }
         }
-        dataset_ids.entry(ds).or_default().insert(inp.normalized);
+        // Use canonical (full-URL) form so it matches what the index stores.
+        dataset_ids.entry(ds).or_default().insert(inp.canonical);
     }
 
     let mut report_args = BTreeMap::new();
@@ -6938,10 +6920,12 @@ fn read_extract_ids(path: &Path) -> Result<Vec<ExtractInput>> {
             continue;
         }
         let normalized = normalize_openalex_id(&raw);
+        let canonical = canonical_openalex_id(&raw);
         let dataset = extract_dataset_from_id(&normalized);
         out.push(ExtractInput {
             raw,
             normalized,
+            canonical,
             dataset,
         });
     }
@@ -6957,6 +6941,17 @@ fn normalize_openalex_id(id: &str) -> String {
         return rest.trim_matches('/').to_string();
     }
     t.trim_matches('/').to_string()
+}
+
+/// Return the canonical full-URL form of an OpenAlex ID, matching what the index stores.
+/// Short IDs (e.g. "W1234") are expanded to "https://openalex.org/W1234".
+fn canonical_openalex_id(raw: &str) -> String {
+    let t = raw.trim().trim_matches('"').trim_matches('\'');
+    if t.starts_with("https://openalex.org/") || t.starts_with("http://openalex.org/") {
+        t.to_string()
+    } else {
+        format!("https://openalex.org/{}", t.trim_matches('/'))
+    }
 }
 
 fn extract_dataset_from_id(id: &str) -> Option<String> {
@@ -7009,7 +7004,6 @@ fn extract_output_path(base: &Path, dataset: &str) -> PathBuf {
 }
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
     let tuning = resolve_tuning(
@@ -7371,7 +7365,6 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
 }
 
 fn run_schema(args: SchemaArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
     let tuning = resolve_tuning(
@@ -7592,7 +7585,6 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
 }
 
 fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
     let tuning = resolve_tuning(
@@ -7740,7 +7732,6 @@ fn resolve_verify_report_path(args: &RepairArgs) -> Result<PathBuf> {
 }
 
 fn run_repair(args: RepairArgs) -> Result<()> {
-    ensure_duckdb(&args.shared)?;
     let duckdb_bin = duckdb_bin(&args.shared);
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let allowed: BTreeSet<String> = datasets.iter().cloned().collect();
@@ -8649,11 +8640,6 @@ fn explain_extract(args: &ExtractArgs, duckdb_bin: &Path, tuning: &Tuning) {
     println!("output base: {}", args.output.display());
     println!("workers: {}", tuning.workers);
     println!("memory_mb: {:?}", tuning.memory_mb);
-}
-
-fn ensure_duckdb(shared: &SharedArgs) -> Result<()> {
-    let bin = duckdb_bin(shared);
-    ensure_duckdb_bin(&bin)
 }
 
 fn ensure_duckdb_bin(bin: &Path) -> Result<()> {
