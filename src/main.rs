@@ -11656,19 +11656,27 @@ fn set_duckdb_memory_limit(total_mb: usize) {
 /// Without this, an in-memory DuckDB connection has no temp_directory and will OOM
 /// instead of spilling when it hits the memory_limit.  Must be called before the
 /// parallel convert pass so all cloned connections inherit the setting.
+///
+/// DuckDB only allows `SET temp_directory` once per process (switching after first use
+/// is rejected with "Cannot switch temporary directory after the current one has been
+/// used"). The OnceLock ensures this is applied exactly once regardless of how many
+/// datasets are converted in a single run.
 fn set_duckdb_temp_directory(dir: &Path) {
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!(
-            "[duckdb] warning: could not create temp_directory {}: {e}",
-            dir.display()
-        );
-        return;
-    }
-    let master = master_conn().lock().expect("master conn lock poisoned");
-    let path_str = dir.to_string_lossy();
-    if let Err(e) = master.execute_batch(&format!("SET temp_directory='{path_str}';")) {
-        eprintln!("[duckdb] warning: could not set temp_directory={path_str}: {e}");
-    }
+    static TEMP_DIR_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    TEMP_DIR_INIT.get_or_init(|| {
+        if let Err(e) = fs::create_dir_all(dir) {
+            eprintln!(
+                "[duckdb] warning: could not create temp_directory {}: {e}",
+                dir.display()
+            );
+            return;
+        }
+        let master = master_conn().lock().expect("master conn lock poisoned");
+        let path_str = dir.to_string_lossy();
+        if let Err(e) = master.execute_batch(&format!("SET temp_directory='{path_str}';")) {
+            eprintln!("[duckdb] warning: could not set temp_directory={path_str}: {e}");
+        }
+    });
 }
 
 fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
