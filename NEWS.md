@@ -8,6 +8,8 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 - **Stratified profiles** for `convert` and `repair_convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.profiles.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
 - New global flag `--profiles-config <path>` (auto-discovers `./openalex-snapshot.profiles.yaml`).  Built-in profile names always work without this file.
+- New `config --create-profiles` flag scaffolds a starter `profiles.yaml` auto-derived from the host's detected RAM.  The emitted profile is named `stratified-<RAM_GB>`, with workers + per-worker memory linearly scaled from the 36 GB baseline and capped so total memory never exceeds 55 % of system RAM (parallel) or 40 % (single-worker catch-all).
+- New `config --list-profiles` flag prints all built-in + user profiles with their strata as a table.
 - `convert` and `repair_convert` log per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.
 
 ### Changed
@@ -15,6 +17,13 @@ All notable changes to `openalex-snapshot` are documented in this file.
 - **Default profile for `convert` and `repair_convert` is now `safe`** (was `auto`).  Safe runs single-worker with generous per-worker memory (45 % of usable RAM, clamped 8–24 GiB on workers=1) and reliably handles the largest works files via DuckDB spill-to-disk.
 - `--workers N` on a stratified profile collapses the plan into a single flat pass with the largest stratum's memory.  Predictable: explicit flags always override.
 - `ConvertArgs::profile` and `RepairArgs::profile` are now `String` (was the `Profile` enum).  Profile names are resolved at runtime against the registry; unknown names produce a clear error listing the available profiles.
+
+### Removed
+
+- The `Profile` enum (`Auto` / `Balanced` / `Fast`) is gone.  `safe` remains as a named built-in profile (`ProfileKind::Safe`); the other names are no longer accepted.  Existing configs containing `profile: auto|balanced|fast` will fail `config --verify` and produce a clear "unknown profile" error at runtime — replace with `safe` or `stratified-36`.
+- The `--profile` flag has been removed from all non-Convert/Repair subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`).  These commands now use a fixed light tuning (workers = min(detected_cpus, 4), memory = 8 GiB) with `--workers` / `--max-memory-mb` overrides — they don't benefit from profile tuning the way `convert` does.
+- The `config --create fast` template mode is removed (the `fast` profile no longer exists).  Only `complete` and `safe` template modes remain.
+- Helper functions `resolve_tuning`, `resolve_tuning_with_total`, `auto_profile_memory_mb` are removed.  Two legacy unit tests covering them are gone.
 
 ### Fixed
 
