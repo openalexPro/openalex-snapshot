@@ -40,14 +40,14 @@ The entire application is a single binary implemented in `src/main.rs` (~10,400 
 
 **DuckDB** — all parquet reads and writes use the `duckdb` Rust crate in-process (statically linked; no external binary required). A global `Connection` is held in an `OnceLock<Mutex<Connection>>`; each rayon worker thread clones it via `try_clone()` and stores the clone in `thread_local!` storage. Spill-to-disk is enabled via `SET temp_directory` (OnceLock-guarded so it's only applied once per process). The global memory limit (`SET memory_limit`) is set fresh per stratum — see "Profile / stratified plan" below.
 
-**Profile / stratified plan** — `convert` and `repair_convert` resolve `--profile <name>` against a `ProfileRegistry` (built-ins `safe`, `stratified-36`, plus optional user profiles from `profiles.yaml`). `build_convert_plan(...)` produces a `ConvertPlan { strata: Vec<StratumPlan>, flat }` where each `StratumPlan` carries its own worker count, per-worker memory cap, and the subset of files in that gz-size bucket. `run_convert` / `run_repair` iterate the strata, configuring DuckDB memory + rayon pool fresh per stratum. `--workers N` collapses a stratified plan into a single flat pass for compatibility. Non-Convert subcommands still use the legacy `Profile` enum + `resolve_tuning` (to be removed in a follow-up).
+**Profile / stratified plan** — `convert` and `repair_convert` resolve `--profile <name>` against a `ProfileRegistry` (built-ins `safe`, `stratified-36`, plus optional user profiles from `profiles.yaml`). `build_convert_plan(...)` produces a `ConvertPlan { strata: Vec<StratumPlan>, flat }` where each `StratumPlan` carries its own worker count, per-worker memory cap, and the subset of files in that gz-size bucket. `run_convert` / `run_repair` iterate the strata, configuring DuckDB memory + rayon pool fresh per stratum. `--workers N` collapses a stratified plan into a single flat pass for compatibility. All other subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`) have no `--profile` flag — they use `light_tuning_with_override(workers, max_memory_mb)` which returns workers = min(detected_cpus, 4) and memory = 8 GiB by default.
 
 ## Invariants (from ARCHITECTURE_AND_DECISIONS.md)
 
 - `all` requires an explicit `--config` path; it will not run without one.
 - `index --dataset all` skips existing shard files and ignores `--index-file`.
 - `check` without `--strict` is warn-only (exits 0 even with warnings).
-- Config templates: `complete` | `safe` | `fast` — these are the only valid modes.
+- Config templates: `complete` | `safe` — these are the only valid modes.
 
 ## When Adding a Subcommand
 

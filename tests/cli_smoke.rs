@@ -973,15 +973,13 @@ fn config_create_mode_contracts() {
     assert!(sf.contains("profile: safe"));
     assert!(sf.contains("workers: 1"));
 
+    // `fast` template was removed in v0.5.0 — the old enum it referenced
+    // (`Profile::Fast`) no longer exists.  Asserting clap rejects it now.
     let fast = Command::new(&exe)
         .args(["config", "--create", "fast", "--stdout"])
         .output()
         .unwrap();
-    assert!(fast.status.success());
-    let f = String::from_utf8_lossy(&fast.stdout);
-    assert!(f.contains("# openalex-snapshot.yaml (fast)"));
-    assert!(f.contains("profile: fast"));
-    assert!(f.contains("workers: 8"));
+    assert!(!fast.status.success());
 }
 
 #[test]

@@ -50,6 +50,28 @@ For hosts with different RAM than 36 GB, write a custom `profiles.yaml` (see bel
 
 A sibling YAML file `openalex-snapshot.profiles.yaml` (in the working directory, or via the `--profiles-config <path>` global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.
 
+**Fastest path** — scaffold a profile auto-derived from your host's RAM:
+
+```bash
+openalex-snapshot config --create-profiles
+# writes ./openalex-snapshot.profiles.yaml with a `stratified-<RAM_GB>` profile,
+# plus commented examples for half- and double-RAM tiers.
+```
+
+To preview what would be written without creating the file:
+
+```bash
+openalex-snapshot config --create-profiles --stdout
+```
+
+To inspect what profiles are visible (built-ins + anything loaded from your `profiles.yaml`):
+
+```bash
+openalex-snapshot config --list-profiles
+```
+
+The generated file's schema:
+
 ```yaml
 # openalex-snapshot.profiles.yaml
 profiles:

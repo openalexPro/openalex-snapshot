@@ -113,7 +113,8 @@ Examples:
   openalex-snapshot progress --root-dir /data
   openalex-snapshot config --create complete
   openalex-snapshot config --create safe
-  openalex-snapshot config --create fast
+  openalex-snapshot config --create-profiles      # scaffold profiles.yaml from detected RAM
+  openalex-snapshot config --list-profiles        # show all available profiles
   openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
 ";
 
@@ -203,7 +204,7 @@ const CONFIG_LONG_ABOUT: &str = "\
 Manage openalex-snapshot YAML configuration.
 
 Modes:
-  --create <complete|safe|fast>  Generate annotated config template
+  --create <complete|safe>  Generate annotated config template
   --verify  Validate an existing config file strictly
 
 Defaults:
@@ -554,10 +555,20 @@ struct AllArgs {
 #[command(long_about = CONFIG_LONG_ABOUT)]
 struct ConfigArgs {
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "complete")]
-    #[arg(
-        help = "Create config template: complete, safe, or fast (default when omitted: complete)"
-    )]
+    #[arg(help = "Create config template: complete or safe (default when omitted: complete)")]
     create: Option<ConfigTemplateMode>,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(
+        help = "Create a profiles YAML auto-derived from the host's detected RAM (writes to --profiles-config path, or ./openalex-snapshot.profiles.yaml). The resulting file defines a single `stratified-<RAM_GB>` profile that you can edit and reference via --profile."
+    )]
+    create_profiles: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(
+        help = "List all known profiles (built-ins + any loaded from --profiles-config) with their strata."
+    )]
+    list_profiles: bool,
 
     #[arg(long, default_value_t = false)]
     #[arg(help = "Verify config file syntax and schema")]
@@ -584,7 +595,6 @@ struct ConfigArgs {
 enum ConfigTemplateMode {
     Complete,
     Safe,
-    Fast,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -2053,7 +2063,7 @@ fn main() -> Result<()> {
         Cli::from_arg_matches(&matches).map_err(|e| anyhow!("failed to parse CLI args: {e}"))?;
     let sub_matches = matches.subcommand().map(|(_, m)| m);
     if let Commands::Config(args) = cli.command.clone() {
-        return run_config(args);
+        return run_config(args, cli.profiles_config.as_deref());
     }
     let cfg = load_optional_config(cli.config.as_deref())?;
     match cli.command {
@@ -3451,7 +3461,6 @@ fn config_template(mode: ConfigTemplateMode) -> String {
     match mode {
         ConfigTemplateMode::Complete => config_template_complete(),
         ConfigTemplateMode::Safe => config_template_safe(),
-        ConfigTemplateMode::Fast => config_template_fast(),
     }
 }
 
@@ -3471,26 +3480,6 @@ defaults:
 
   # Optional explicit cap for constrained systems.
   # max_memory_mb: 4096
-"#
-    .to_string()
-}
-
-fn config_template_fast() -> String {
-    r#"# openalex-snapshot.yaml (fast)
-# Minimal high-throughput preset.
-# Only profile-relevant overrides are set here.
-# Everything else falls back to built-in defaults (or CLI).
-
-defaults:
-  # Keep root explicit so path model remains obvious.
-  root_dir: .
-
-  # Fast profile: favors throughput, may increase resource usage.
-  profile: fast
-  workers: 8
-
-  # Optional explicit cap for high-memory hosts.
-  # max_memory_mb: 16384
 "#
     .to_string()
 }
@@ -3969,34 +3958,49 @@ check:
     .to_string()
 }
 
-fn run_config(args: ConfigArgs) -> Result<()> {
-    let modes = (args.create.is_some() as u8) + (args.verify as u8);
+fn run_config(args: ConfigArgs, profiles_config: Option<&Path>) -> Result<()> {
+    let modes = (args.create.is_some() as u8)
+        + (args.verify as u8)
+        + (args.create_profiles as u8)
+        + (args.list_profiles as u8);
     if modes != 1 {
-        bail!("config requires exactly one mode: use --create <complete|safe|fast> or --verify");
+        bail!(
+            "config requires exactly one mode: use --create <complete|safe>, --verify, --create-profiles, or --list-profiles"
+        );
     }
     if args.explain {
+        let mode = if args.create.is_some() {
+            "create"
+        } else if args.verify {
+            "verify"
+        } else if args.create_profiles {
+            "create_profiles"
+        } else {
+            "list_profiles"
+        };
         let create_mode = args
             .create
             .as_ref()
             .map(|m| match m {
                 ConfigTemplateMode::Complete => "complete",
                 ConfigTemplateMode::Safe => "safe",
-                ConfigTemplateMode::Fast => "fast",
             })
             .unwrap_or("-");
         println!(
             "--explain: config mode={} create_template={} path={} stdout={} overwrite={}",
-            if args.create.is_some() {
-                "create"
-            } else {
-                "verify"
-            },
+            mode,
             create_mode,
             args.config.display(),
             args.stdout,
             args.overwrite
         );
         return Ok(());
+    }
+    if args.list_profiles {
+        return run_config_list_profiles(profiles_config);
+    }
+    if args.create_profiles {
+        return run_config_create_profiles(profiles_config, args.stdout, args.overwrite);
     }
     if let Some(mode) = args.create {
         let tpl = config_template(mode);
@@ -4043,6 +4047,203 @@ fn run_config(args: ConfigArgs) -> Result<()> {
         sections.join(", ")
     );
     Ok(())
+}
+
+/// Print all known profiles (built-ins + any from --profiles-config) as a table.
+fn run_config_list_profiles(profiles_config: Option<&Path>) -> Result<()> {
+    let registry = ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
+    let total_mb = detect_total_memory_mb();
+    println!("Available profiles:");
+    println!();
+    let mut names: Vec<&str> = registry.names();
+    names.sort();
+    for name in names {
+        let def = registry.get(name).expect("name from registry");
+        let kind = match def.kind {
+            ProfileKind::Safe => "safe",
+            ProfileKind::Stratified => "stratified",
+        };
+        print!("  {name}  ({kind}");
+        if let Some(min) = def.min_ram_gb {
+            print!(", min_ram_gb={min}");
+        }
+        println!(")");
+        if let Some(desc) = &def.description {
+            println!("    {desc}");
+        }
+        if let Some(strata) = &def.strata {
+            println!("    strata:");
+            println!("      max_file_mb  workers  per_worker_mb");
+            for s in strata {
+                let mfm = s
+                    .max_file_mb
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "<catch-all>".to_string());
+                println!(
+                    "      {:<11}  {:>7}  {:>13}",
+                    mfm, s.workers, s.per_worker_mb
+                );
+            }
+        }
+        if def.kind == ProfileKind::Safe {
+            println!("    resolves to: workers=1, per_worker_mb={} (single-worker safe boost on workers=1)",
+                auto_profile_single_worker_safe_memory_mb(total_mb));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Scaffold a profiles YAML auto-derived from the host's detected RAM.
+/// Writes to `--profiles-config <path>` (or `./openalex-snapshot.profiles.yaml`).
+fn run_config_create_profiles(
+    profiles_config: Option<&Path>,
+    stdout: bool,
+    overwrite: bool,
+) -> Result<()> {
+    let total_mb = detect_total_memory_mb();
+    let ram_gb = total_mb.map(|mb| (mb + 512) / 1024).unwrap_or(0);
+    let profile_name = if ram_gb > 0 {
+        format!("stratified-{ram_gb}")
+    } else {
+        "stratified-host".to_string()
+    };
+    let derived = derive_stratified_profile_for_ram(total_mb);
+    let yaml = render_stratified_profiles_yaml(&profile_name, ram_gb, &derived);
+
+    if stdout {
+        print!("{yaml}");
+        return Ok(());
+    }
+
+    let dest = profiles_config
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("openalex-snapshot.profiles.yaml"));
+    if dest.exists() && !overwrite {
+        bail!(
+            "profiles config already exists: {} (use --overwrite)",
+            dest.display()
+        );
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&dest, yaml).with_context(|| format!("failed to write {}", dest.display()))?;
+    println!(
+        "[config] created {} (profile: {})",
+        dest.display(),
+        profile_name
+    );
+    Ok(())
+}
+
+/// Render a `profiles.yaml` template containing one auto-derived profile plus
+/// commented examples for half-RAM and double-RAM tiers so users have reference
+/// points to copy and tune.
+fn render_stratified_profiles_yaml(name: &str, ram_gb: usize, def: &ProfileDef) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "# openalex-snapshot.profiles.yaml");
+    let _ = writeln!(
+        s,
+        "# Generated by `openalex-snapshot config --create-profiles`. Detected RAM: {} GB.",
+        if ram_gb > 0 {
+            ram_gb.to_string()
+        } else {
+            "<unknown>".to_string()
+        }
+    );
+    let _ = writeln!(s, "#");
+    let _ = writeln!(
+        s,
+        "# File-size cutoffs (max_file_mb) reflect the works dataset's data shape and rarely need tuning."
+    );
+    let _ = writeln!(
+        s,
+        "# workers + per_worker_mb were auto-derived from your RAM; edit if you observe swap/OOM."
+    );
+    let _ = writeln!(
+        s,
+        "# Share this file across machines with similar RAM by copying it next to openalex-snapshot.yaml."
+    );
+    let _ = writeln!(s, "#");
+    let _ = writeln!(
+        s,
+        "# Reference the profile by name from `convert` / `repair_convert`:"
+    );
+    let _ = writeln!(s, "#   openalex-snapshot convert --profile {name} ...");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "profiles:");
+    let _ = writeln!(s, "  {name}:");
+    if let Some(desc) = &def.description {
+        let _ = writeln!(s, "    description: {:?}", desc);
+    }
+    if let Some(min) = def.min_ram_gb {
+        let _ = writeln!(s, "    min_ram_gb: {min}");
+    }
+    let _ = writeln!(s, "    kind: stratified");
+    let _ = writeln!(s, "    strata:");
+    if let Some(strata) = &def.strata {
+        for st in strata {
+            match st.max_file_mb {
+                Some(mb) => {
+                    let _ = writeln!(s, "      - max_file_mb: {mb}");
+                    let _ = writeln!(s, "        workers: {}", st.workers);
+                    let _ = writeln!(s, "        per_worker_mb: {}", st.per_worker_mb);
+                }
+                None => {
+                    let _ = writeln!(s, "      - workers: {}        # max_file_mb omitted = catch-all (no upper bound)", st.workers);
+                    let _ = writeln!(s, "        per_worker_mb: {}", st.per_worker_mb);
+                }
+            }
+        }
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "# --- Examples for other RAM tiers (commented out — copy + edit if useful) ---"
+    );
+    let half = ram_gb.max(2) / 2;
+    let dbl = ram_gb.saturating_mul(2).max(4);
+    let example = |target_gb: usize| -> String {
+        let target_mb = target_gb.saturating_mul(1024);
+        let other = derive_stratified_profile_for_ram(Some(target_mb));
+        let mut out = String::new();
+        let _ = writeln!(out, "#   stratified-{target_gb}:");
+        let _ = writeln!(out, "#     description: \"Tuned for ~{target_gb} GB RAM\"");
+        let _ = writeln!(
+            out,
+            "#     min_ram_gb: {}",
+            target_gb.saturating_mul(85) / 100
+        );
+        let _ = writeln!(out, "#     kind: stratified");
+        let _ = writeln!(out, "#     strata:");
+        if let Some(strata) = &other.strata {
+            for st in strata {
+                match st.max_file_mb {
+                    Some(mb) => {
+                        let _ = writeln!(out, "#       - max_file_mb: {mb}");
+                        let _ = writeln!(out, "#         workers: {}", st.workers);
+                        let _ = writeln!(out, "#         per_worker_mb: {}", st.per_worker_mb);
+                    }
+                    None => {
+                        let _ = writeln!(out, "#       - workers: {}", st.workers);
+                        let _ = writeln!(out, "#         per_worker_mb: {}", st.per_worker_mb);
+                    }
+                }
+            }
+        }
+        out
+    };
+    if half >= 2 && half != ram_gb {
+        s.push_str(&example(half));
+    }
+    if dbl != ram_gb {
+        s.push_str(&example(dbl));
+    }
+    s
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10479,6 +10680,12 @@ openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.pa
 
 # Repair from verify report
 openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>
+
+# Scaffold a custom profiles.yaml auto-derived from this host's RAM
+openalex-snapshot config --create-profiles
+
+# Show all known profiles (built-ins + user-defined)
+openalex-snapshot config --list-profiles
 ```
 
 ## Failure Handling
@@ -12189,6 +12396,206 @@ fn render_table(schema: &SchemaDoc) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Stratified profile machinery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_registry_loads_builtins_and_user_overrides() {
+        let reg = ProfileRegistry::builtins_only();
+        // built-ins always present
+        assert!(reg.get("safe").is_some());
+        assert!(reg.get("stratified-36").is_some());
+        assert!(reg.get("nonexistent").is_none());
+
+        // user YAML overrides a built-in + adds a custom name
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("profiles.yaml");
+        std::fs::write(
+            &path,
+            r#"
+profiles:
+  stratified-36:
+    description: "user override of built-in"
+    kind: stratified
+    strata:
+      - max_file_mb: 100
+        workers: 8
+        per_worker_mb: 2048
+      - workers: 1
+        per_worker_mb: 4096
+  stratified-64:
+    description: "custom for big hosts"
+    kind: stratified
+    strata:
+      - max_file_mb: 500
+        workers: 6
+        per_worker_mb: 8192
+      - workers: 2
+        per_worker_mb: 24576
+"#,
+        )
+        .unwrap();
+        let reg = ProfileRegistry::load(Some(&path)).expect("load ok");
+        // user override wins
+        let s36 = reg.get("stratified-36").unwrap();
+        assert_eq!(
+            s36.description.as_deref(),
+            Some("user override of built-in")
+        );
+        assert_eq!(s36.strata.as_ref().unwrap().len(), 2);
+        // user-only profile available
+        assert!(reg.get("stratified-64").is_some());
+        // built-in not overridden still present
+        assert!(reg.get("safe").is_some());
+
+        // invalid profile (no catch-all) is rejected with a clear error
+        let bad = td.path().join("bad.yaml");
+        std::fs::write(
+            &bad,
+            r#"
+profiles:
+  bad:
+    kind: stratified
+    strata:
+      - max_file_mb: 100
+        workers: 1
+        per_worker_mb: 2048
+"#,
+        )
+        .unwrap();
+        let err = ProfileRegistry::load(Some(&bad)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("catch-all"), "got: {msg}");
+    }
+
+    fn fp(rel: &str, gz_bytes: u64) -> FilePair {
+        FilePair {
+            input_gz: PathBuf::from(rel),
+            output_parquet: PathBuf::from(format!("{rel}.parquet")),
+            rel: PathBuf::from(rel),
+            gz_size_bytes: gz_bytes,
+        }
+    }
+
+    #[test]
+    fn build_convert_plan_strata_partitioning_by_size_and_largest_first_order() {
+        let reg = ProfileRegistry::builtins_only();
+        // files spanning all 4 strata of stratified-36
+        let todo = vec![
+            fp("a/small.gz", 350 * 1024 * 1024),  // <400 stratum
+            fp("a/med.gz", 500 * 1024 * 1024),    // 400-600 stratum
+            fp("a/large.gz", 700 * 1024 * 1024),  // 600-800 stratum
+            fp("a/huge.gz", 1024 * 1024 * 1024),  // 800+ catch-all
+            fp("a/small2.gz", 100 * 1024 * 1024), // <400 stratum
+        ];
+        let plan = build_convert_plan("stratified-36", None, None, Some(36 * 1024), todo, &reg)
+            .expect("plan");
+        assert!(!plan.flat);
+        assert_eq!(plan.strata.len(), 4);
+        // largest-files-first: catch-all stratum (1 worker / 13000 MB) comes first
+        assert_eq!(plan.strata[0].workers, 1);
+        assert_eq!(plan.strata[0].memory_mb, 13_000);
+        assert_eq!(plan.strata[0].files.len(), 1);
+        assert!(plan.strata[0].files[0].rel.ends_with("huge.gz"));
+        // then 2-worker
+        assert_eq!(plan.strata[1].workers, 2);
+        assert_eq!(plan.strata[1].files.len(), 1);
+        assert!(plan.strata[1].files[0].rel.ends_with("large.gz"));
+        // then 3-worker
+        assert_eq!(plan.strata[2].workers, 3);
+        assert_eq!(plan.strata[2].files.len(), 1);
+        assert!(plan.strata[2].files[0].rel.ends_with("med.gz"));
+        // then 4-worker, with both small files
+        assert_eq!(plan.strata[3].workers, 4);
+        assert_eq!(plan.strata[3].files.len(), 2);
+    }
+
+    #[test]
+    fn cli_workers_override_with_stratified_collapses_to_flat_plan() {
+        let reg = ProfileRegistry::builtins_only();
+        let todo = vec![
+            fp("a/small.gz", 350 * 1024 * 1024),
+            fp("a/large.gz", 900 * 1024 * 1024),
+            fp("a/med.gz", 500 * 1024 * 1024),
+        ];
+        // --workers 2 collapses stratified plan into 1 flat stratum
+        let plan = build_convert_plan("stratified-36", Some(2), None, Some(36 * 1024), todo, &reg)
+            .expect("plan");
+        assert!(plan.flat);
+        assert_eq!(plan.strata.len(), 1);
+        assert_eq!(plan.strata[0].workers, 2);
+        assert_eq!(plan.strata[0].files.len(), 3);
+        // files sorted largest-first
+        let sizes: Vec<u64> = plan.strata[0]
+            .files
+            .iter()
+            .map(|f| f.gz_size_bytes)
+            .collect();
+        assert!(sizes[0] >= sizes[1] && sizes[1] >= sizes[2]);
+        // memory_mb defaults to the LARGEST stratum's per_worker (13000 for stratified-36)
+        assert_eq!(plan.strata[0].memory_mb, 13_000);
+    }
+
+    #[test]
+    fn derive_stratified_profile_scales_with_ram() {
+        // Baseline: 36 GB matches the empirical schedule exactly
+        let p36 = derive_stratified_profile_for_ram(Some(36 * 1024));
+        let s36 = p36.strata.unwrap();
+        assert_eq!(s36.len(), 4);
+        assert_eq!(s36[0].workers, 4);
+        assert_eq!(s36[0].per_worker_mb, 4_800);
+        assert_eq!(s36[3].workers, 1);
+        assert_eq!(s36[3].per_worker_mb, 13_000);
+
+        // 16 GB: workers and memory scaled down, system-RAM safety caps applied
+        let p16 = derive_stratified_profile_for_ram(Some(16 * 1024));
+        let s16 = p16.strata.unwrap();
+        // workers can't exceed CPU cap; on 16 GB they're 2/1/1/1
+        assert!(s16[0].workers >= 1 && s16[0].workers <= 4);
+        // total stratum allocation should never exceed ~55 % of system RAM
+        for s in &s16 {
+            let cap_mb = if s.workers == 1 {
+                (16 * 1024) * 40 / 100
+            } else {
+                (16 * 1024) * 55 / 100
+            };
+            assert!(
+                s.workers * s.per_worker_mb <= cap_mb,
+                "16GB stratum overcommit: workers={} per_worker_mb={} > cap {}",
+                s.workers,
+                s.per_worker_mb,
+                cap_mb
+            );
+            // floor honoured
+            assert!(s.per_worker_mb >= STRATIFIED_MIN_PER_WORKER_MB);
+        }
+
+        // 128 GB: workers cap at STRATIFIED_MAX_WORKERS (or CPU count whichever is smaller)
+        let p128 = derive_stratified_profile_for_ram(Some(128 * 1024));
+        let s128 = p128.strata.unwrap();
+        for s in &s128 {
+            assert!(s.workers <= STRATIFIED_MAX_WORKERS);
+            // 55 % cap still honoured
+            let cap_mb = if s.workers == 1 {
+                (128 * 1024) * 40 / 100
+            } else {
+                (128 * 1024) * 55 / 100
+            };
+            assert!(
+                s.workers * s.per_worker_mb <= cap_mb,
+                "128GB stratum overcommit"
+            );
+        }
+
+        // No RAM info: single conservative stratum
+        let p_unk = derive_stratified_profile_for_ram(None);
+        let s_unk = p_unk.strata.unwrap();
+        assert_eq!(s_unk.len(), 1);
+        assert_eq!(s_unk[0].workers, 1);
+        assert!(s_unk[0].max_file_mb.is_none());
+    }
 
     #[test]
     fn test_widen_numeric() {
