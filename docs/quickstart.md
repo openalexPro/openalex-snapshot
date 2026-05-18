@@ -19,10 +19,16 @@ cargo build --release
 ## Convert snapshot to parquet
 
 ```bash
+# default profile (safe) — works on any host
+./target/release/openalex-snapshot convert \
+  --root-dir /Volumes/openalex \
+  --dataset works
+
+# faster on 32+ GB hosts (stratifies the file list by size)
 ./target/release/openalex-snapshot convert \
   --root-dir /Volumes/openalex \
   --dataset works \
-  --profile balanced
+  --profile stratified-36
 ```
 
 ## Verify output

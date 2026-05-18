@@ -10736,11 +10736,11 @@ Run subcommands with correct root-dir model and predictable outputs.
 # Preflight check
 openalex-snapshot check --root-dir <root> --dataset all
 
-# Convert one dataset (auto profile — balanced, uses ~65% RAM)
+# Convert one dataset — default `safe` profile (single-worker, max memory) works on any host
 openalex-snapshot convert --root-dir <root> --dataset works
 
-# Convert with constrained memory
-openalex-snapshot convert --root-dir <root> --dataset works --profile safe --workers 1
+# Faster on 32+ GB hosts: empirically tuned stratified profile partitions files by gz size
+openalex-snapshot convert --root-dir <root> --dataset works --profile stratified-36
 
 # Verify one dataset
 openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both
@@ -10764,9 +10764,9 @@ openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.
 - Use `repair_convert` for verify-driven reconversion.
 
 ## Decision rules
-- Default profile is `auto` (= `balanced`): 65% of RAM, 4–32 GiB global DuckDB budget.
-- For memory-constrained machines: `--profile safe --workers 1` (15% RAM, 1–8 GiB).
-- For maximum throughput: `--profile fast` (80% RAM, 8–48 GiB).
+- Default profile is `safe` for `convert` / `repair_convert`: single worker, generous per-worker memory (~45% of usable RAM, clamped 8–24 GiB on single-worker mode).  Works on any host; the most reliable choice for the worst-case files.
+- On a 32+ GB host, use `--profile stratified-36` for a faster run: it partitions the file list by gz size (4-/3-/2-/1-worker buckets) and runs one rayon pass per bucket.
+- Custom RAM tiers (e.g. 16 GB, 64 GB) need a user-supplied `openalex-snapshot.profiles.yaml` — see [`docs/commands/convert.md`](../../docs/commands/convert.md#custom-profiles-via-profilesyaml).
 - To isolate a single problematic file: repeated `--input-file` on `convert`.
 - Prefer `verify_convert --scope file` for quick spot checks; `--scope dataset|snapshot` for full checks.
 - Run `index` before `extract`; extraction requires `<dataset>_id_idx.parquet`.
@@ -10811,8 +10811,9 @@ openalex-snapshot verify_index --root-dir <root>
 ```
 
 ## Decision Rules
-- Default profile (`auto`) is appropriate for most machines — it uses ~65% of RAM.
-- Use `--profile safe` for machines with <8 GiB available.
+- Default profile is `safe`: single worker, generous memory, works on any host.  Use this for unattended runs and unfamiliar hardware.
+- On a 32+ GB host where speed matters, set `profile: stratified-36` under `defaults:` in the config (or pass `--profile stratified-36` to `convert`).  It partitions files by gz size and parallelises each bucket.
+- For other RAM tiers, supply a user-defined profile in `openalex-snapshot.profiles.yaml` (sibling to the main config or via `--profiles-config`).
 - Use `--dataset <name>` to rerun a single dataset without touching others.
 - Check `report --latest` after each stage to confirm success before proceeding.
 - Keep reports: they drive `repair_convert` and provide audit trails.
@@ -10847,10 +10848,11 @@ Triage failures using metadata and reports.
 - `validate_gzip_integrity`: corrupted `.json.gz` file
 
 ## OOM during convert
+- `safe` is the default profile and should handle the largest works files via DuckDB spill-to-disk.  If you're explicitly running another profile, retry with `--profile safe`.
 - Run `check --root-dir <root>` to see memory estimates.
-- Try `--profile safe --workers 1` to minimise peak memory.
-- Use `--max-memory-mb <N>` to set an explicit DuckDB budget.
-- If a specific file is always failing, isolate it with `--input-file`.
+- Use `--max-memory-mb <N>` to force a smaller DuckDB cap so spill kicks in earlier.
+- Use `--split-size 256mb` to pre-chunk very large gz files before conversion.
+- If a specific file is always failing, isolate it with `--input-file <rel-path>` and retry.
 "#
             .to_string(),
         ),
@@ -10870,7 +10872,7 @@ Build, test, and deploy `openalex-snapshot` source changes safely.
 ## Build / test loop
 ```bash
 cargo build --release                     # production binary
-cargo test --all-targets --locked         # run all 26 tests
+cargo test --all-targets --locked         # run all 27 tests
 cargo clippy --all-targets -- -D warnings # lint (must be clean)
 cargo fmt --all                           # format (CI enforces)
 ```
@@ -10889,12 +10891,27 @@ cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
 - A global `Connection` lives in `OnceLock<Mutex<Connection>>` (see `master_conn()`).
 - Each rayon worker thread calls `master.try_clone()` once and stores it in `thread_local!`.
 - The global DuckDB memory limit (`SET memory_limit`) is shared across ALL connections on
-  the same database — it must be set once before the parallel pass as `per_worker × workers`.
-  Setting it inside a per-file query resets the global cap and starves other workers.
-- Profile memory fractions (of 80% usable RAM):
-  - `auto` / `balanced`: 65%, clamped 4–32 GiB
-  - `safe`: 15%, clamped 1–8 GiB (workers capped at 2)
-  - `fast`: 80%, clamped 8–48 GiB
+  the same database.  It's set **per stratum** to `stratum.memory_mb × stratum.workers` at
+  the start of each rayon pass; changes are safe between passes.
+- Spill-to-disk is enabled by `SET temp_directory='<root>/openalex-snapshot_metadata/duckdb_tmp/'`
+  on the master connection (OnceLock-guarded so the assignment runs exactly once per process).
+  Without this, an in-memory connection has no temp dir and OOMs when memory_limit is hit.
+
+## Profiles and the stratified plan
+- `convert` and `repair_convert` resolve `--profile <name>` against a `ProfileRegistry`
+  populated from `builtin_profiles()` plus an optional user `openalex-snapshot.profiles.yaml`.
+- Built-in profiles:
+  - `safe` (default) — single pass, workers clamped 1..=2, generous per-worker memory
+    (`auto_profile_single_worker_safe_memory_mb` returns 45% of usable RAM clamped 8–24 GiB
+    on workers=1).
+  - `stratified-36` — 4 strata tuned for ~36 GB hosts (4×4800 / 3×6400 / 2×9600 / 1×13000).
+- `build_convert_plan(profile, workers_override, max_mem_mb_override, total_ram_mb, todo, &registry)`
+  produces a `ConvertPlan { strata: Vec<StratumPlan>, flat: bool }`.
+  - Safe → one flat stratum.
+  - Stratified → file list partitioned by `gz_size_bytes`; one StratumPlan per non-empty
+    bucket; largest-files-first execution order.
+  - `--workers N` collapses stratified into one flat pass (largest stratum's memory).
+- `run_convert` / `run_repair` iterate `plan.strata`, reconfiguring DuckDB + rayon per stratum.
 
 ## Worktree and PR conventions
 - All changes go through a PR from a `claude/<name>` worktree branch.
@@ -10920,7 +10937,7 @@ cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
 6. Update `NEWS.md`, `docs/commands/<name>.md`, `AI_SKILLS_USAGE.md`.
 
 ## Done Criteria
-- `cargo test --all-targets --locked` passes (all 26 tests green).
+- `cargo test --all-targets --locked` passes (all 27 tests green).
 - `cargo clippy --all-targets -- -D warnings` is clean.
 - Binary deployed and smoke-tested against real data.
 - `NEWS.md` and affected docs updated in the same commit.
@@ -10946,7 +10963,8 @@ Keep docs, help text, and release notes in sync with behavior changes.
 
 ## Acceptance criteria
 - New flags/commands appear in: `--help`, `README.md`, `docs/`, and `NEWS.md`
-- Profile/memory tables in docs and help text match the actual constants in `auto_profile_memory_mb()`
+- Profile/memory tables in docs and help text match `builtin_profiles()` (in particular
+  `stratified_baseline_36gb_strata()`) and `auto_profile_single_worker_safe_memory_mb`
 - Tests cover CLI parsing + behavior + edge cases
 - `openalex-snapshot --version` reflects the correct `Cargo.toml` version
 

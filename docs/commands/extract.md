@@ -19,8 +19,7 @@ Unknown/unmapped IDs are skipped and reported.
 openalex-snapshot extract \
   --root-dir /Volumes/openalex \
   --ids /Volumes/openalex/ids.csv \
-  --output /Volumes/openalex/extract.parquet \
-  --profile balanced
+  --output /Volumes/openalex/extract.parquet
 ```
 
 ## Notes
