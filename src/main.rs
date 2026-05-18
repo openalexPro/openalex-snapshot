@@ -9096,7 +9096,7 @@ fn build_convert_plan(
                 let workers = w.max(1);
                 let memory_mb = max_memory_mb_override.unwrap_or(largest_stratum_mb);
                 let mut files = todo;
-                files.sort_by(|a, b| b.gz_size_bytes.cmp(&a.gz_size_bytes));
+                files.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
                 return Ok(ConvertPlan {
                     profile_name: profile_name.to_string(),
                     flat: true,
@@ -9113,7 +9113,7 @@ fn build_convert_plan(
             // For each file, walk the strata in order and place it in the first
             // one whose bound covers its size.
             let mut sorted = todo;
-            sorted.sort_by(|a, b| b.gz_size_bytes.cmp(&a.gz_size_bytes));
+            sorted.sort_by_key(|p| std::cmp::Reverse(p.gz_size_bytes));
             let n_strata = strata_defs.len();
             let mut buckets: Vec<Vec<FilePair>> = (0..n_strata).map(|_| Vec::new()).collect();
             for pair in sorted {
