@@ -12553,12 +12553,19 @@ profiles:
 
     #[test]
     fn derive_stratified_profile_scales_with_ram() {
-        // Baseline: 36 GB matches the empirical schedule exactly
+        // Baseline: 36 GB matches the empirical schedule.  Workers on the smallest-files
+        // strata can be capped below the baseline by the CPU count of the machine
+        // running the test (see `STRATIFIED_MAX_WORKERS` and `available_parallelism`).
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(STRATIFIED_MAX_WORKERS)
+            .min(STRATIFIED_MAX_WORKERS);
         let p36 = derive_stratified_profile_for_ram(Some(36 * 1024));
         let s36 = p36.strata.unwrap();
         assert_eq!(s36.len(), 4);
-        assert_eq!(s36[0].workers, 4);
+        assert_eq!(s36[0].workers, 4_usize.min(cpus));
         assert_eq!(s36[0].per_worker_mb, 4_800);
+        // Catch-all is always workers=1 (RAM ratio = 1.0 × 1 worker = 1)
         assert_eq!(s36[3].workers, 1);
         assert_eq!(s36[3].per_worker_mb, 13_000);
 
