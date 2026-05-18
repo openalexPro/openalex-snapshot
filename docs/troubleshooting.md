@@ -2,13 +2,15 @@
 
 ## Out of memory in convert
 
-Use:
+`safe` is the default profile and should handle the largest files (≈1 GB compressed) on
+any host via DuckDB spill-to-disk. If you still observe OOM:
 
-- `--profile safe`
-- `--workers 1`
-- explicit `--max-memory-mb`
+- Confirm you're on the default profile: drop `--profile <name>` to inherit `safe`.
+- Lower the memory cap so DuckDB spills earlier: `--max-memory-mb 2048`.
+- Pre-split very large gz files: `--split-size 256mb` (produces numbered parquets per chunk).
+- Isolate the suspect file with `--input-file <rel-path>` and retry.
 
-If needed, convert datasets and files in smaller units.
+See [`docs/operations/low-memory.md`](operations/low-memory.md) for the full runbook.
 
 ## Verify appears to slow down over time
 

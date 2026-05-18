@@ -4,6 +4,22 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Stratified profiles** for `convert` and `repair_convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.profiles.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
+- New global flag `--profiles-config <path>` (auto-discovers `./openalex-snapshot.profiles.yaml`).  Built-in profile names always work without this file.
+- `convert` and `repair_convert` log per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.
+
+### Changed
+
+- **Default profile for `convert` and `repair_convert` is now `safe`** (was `auto`).  Safe runs single-worker with generous per-worker memory (45 % of usable RAM, clamped 8–24 GiB on workers=1) and reliably handles the largest works files via DuckDB spill-to-disk.
+- `--workers N` on a stratified profile collapses the plan into a single flat pass with the largest stratum's memory.  Predictable: explicit flags always override.
+- `ConvertArgs::profile` and `RepairArgs::profile` are now `String` (was the `Profile` enum).  Profile names are resolved at runtime against the registry; unknown names produce a clear error listing the available profiles.
+
+### Fixed
+
+- DuckDB `SET temp_directory` is now applied exactly once via a `OnceLock`, eliminating the warning `Cannot switch temporary directory after the current one has been used` that appeared on the second and subsequent datasets of any `all` run.  Spill-to-disk now works reliably across multi-dataset runs.
+
 ## [0.4.1] - 2026-05-11
 
 ### Fixed

@@ -38,7 +38,9 @@ The entire application is a single binary implemented in `src/main.rs` (~10,400 
 
 **Extract routing** — IDs are routed by OpenAlex entity prefix (`W`=works, `A`=authors, etc.) and taxonomy namespace prefixes, resolving to the correct dataset index.
 
-**DuckDB** — all parquet reads and writes use the `duckdb` Rust crate in-process (statically linked; no external binary required). A global `Connection` is held in an `OnceLock<Mutex<Connection>>`; each rayon worker thread clones it via `try_clone()` and stores the clone in `thread_local!` storage. The global memory limit (`SET memory_limit`) is set once before the parallel pass as `per_worker_mb × workers` so all connections share a single budget.
+**DuckDB** — all parquet reads and writes use the `duckdb` Rust crate in-process (statically linked; no external binary required). A global `Connection` is held in an `OnceLock<Mutex<Connection>>`; each rayon worker thread clones it via `try_clone()` and stores the clone in `thread_local!` storage. Spill-to-disk is enabled via `SET temp_directory` (OnceLock-guarded so it's only applied once per process). The global memory limit (`SET memory_limit`) is set fresh per stratum — see "Profile / stratified plan" below.
+
+**Profile / stratified plan** — `convert` and `repair_convert` resolve `--profile <name>` against a `ProfileRegistry` (built-ins `safe`, `stratified-36`, plus optional user profiles from `profiles.yaml`). `build_convert_plan(...)` produces a `ConvertPlan { strata: Vec<StratumPlan>, flat }` where each `StratumPlan` carries its own worker count, per-worker memory cap, and the subset of files in that gz-size bucket. `run_convert` / `run_repair` iterate the strata, configuring DuckDB memory + rayon pool fresh per stratum. `--workers N` collapses a stratified plan into a single flat pass for compatibility. Non-Convert subcommands still use the legacy `Profile` enum + `resolve_tuning` (to be removed in a follow-up).
 
 ## Invariants (from ARCHITECTURE_AND_DECISIONS.md)
 
