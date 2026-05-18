@@ -627,6 +627,7 @@ enum Profile {
 // and optionally merged with a user-supplied `profiles.yaml`.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 /// One bucket in a stratified profile.  Files with `gz_size_bytes <= max_file_mb * 1MiB`
 /// (and larger than the previous stratum's `max_file_mb`) belong to this stratum.
 /// `max_file_mb = None` is the catch-all (no upper bound); a stratified profile must
@@ -643,6 +644,7 @@ struct Stratum {
     per_worker_mb: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ProfileKind {
@@ -653,6 +655,7 @@ enum ProfileKind {
     Stratified,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ProfileDef {
@@ -674,19 +677,37 @@ const STRATIFIED_MIN_PER_WORKER_MB: usize = 1280;
 /// due to CPU+I/O contention; cap at 8 to leave a tail of headroom for huge boxes.
 const STRATIFIED_MAX_WORKERS: usize = 8;
 
+#[allow(dead_code)]
 /// The empirical baseline used both for the built-in `stratified-36` profile and
 /// as the seed scaled by `derive_stratified_profile_for_ram`.  These exact values
 /// were measured this session on a 36 GB / 8+ core Mac with in-process DuckDB
 /// and spill-to-disk enabled.
 fn stratified_baseline_36gb_strata() -> Vec<Stratum> {
     vec![
-        Stratum { max_file_mb: Some(400), workers: 4, per_worker_mb: 4800 },
-        Stratum { max_file_mb: Some(600), workers: 3, per_worker_mb: 6400 },
-        Stratum { max_file_mb: Some(800), workers: 2, per_worker_mb: 9600 },
-        Stratum { max_file_mb: None,      workers: 1, per_worker_mb: 13_000 },
+        Stratum {
+            max_file_mb: Some(400),
+            workers: 4,
+            per_worker_mb: 4800,
+        },
+        Stratum {
+            max_file_mb: Some(600),
+            workers: 3,
+            per_worker_mb: 6400,
+        },
+        Stratum {
+            max_file_mb: Some(800),
+            workers: 2,
+            per_worker_mb: 9600,
+        },
+        Stratum {
+            max_file_mb: None,
+            workers: 1,
+            per_worker_mb: 13_000,
+        },
     ]
 }
 
+#[allow(dead_code)]
 /// Built-in profiles shipped with the binary.  User profiles loaded from
 /// `profiles.yaml` are merged on top via `profile_registry`.
 fn builtin_profiles() -> Vec<(String, ProfileDef)> {
@@ -717,6 +738,7 @@ fn builtin_profiles() -> Vec<(String, ProfileDef)> {
     ]
 }
 
+#[allow(dead_code)]
 /// Derive a stratified profile scaled from the 36 GB baseline to match the
 /// system's actual RAM.  File-size cutoffs (`max_file_mb`) stay fixed because
 /// they reflect the works dataset's compression shape (works gz files expand
@@ -736,26 +758,33 @@ fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef 
     let strata = match total_ram_mb {
         Some(mb) if mb > 0 => {
             let ratio = (mb as f64) / 36_864.0; // 36 GB baseline
-            // System-RAM safety caps applied after linear scaling.  Workers and
-            // per_worker_mb both scale with ratio, so total commitment scales as
-            // ratio^2 — that overshoots physical RAM on large hosts.  The 36 GB
-            // baseline uses ~53% of total RAM per parallel stratum and ~36% for
-            // the single-worker catch-all; preserve those ratios on every host.
+                                                // System-RAM safety caps applied after linear scaling.  Workers and
+                                                // per_worker_mb both scale with ratio, so total commitment scales as
+                                                // ratio^2 — that overshoots physical RAM on large hosts.  The 36 GB
+                                                // baseline uses ~53% of total RAM per parallel stratum and ~36% for
+                                                // the single-worker catch-all; preserve those ratios on every host.
             let parallel_cap_mb = ((mb as f64) * 0.55).floor() as usize;
             let single_cap_mb = ((mb as f64) * 0.40).floor() as usize;
             stratified_baseline_36gb_strata()
                 .into_iter()
                 .map(|s| {
-                    let scaled_workers =
-                        ((s.workers as f64) * ratio).round().max(1.0) as usize;
+                    let scaled_workers = ((s.workers as f64) * ratio).round().max(1.0) as usize;
                     let workers = scaled_workers.min(cpu_cap).max(1);
                     let scaled_mb = ((s.per_worker_mb as f64) * ratio).round() as usize;
                     let mut per_worker_mb = scaled_mb.max(STRATIFIED_MIN_PER_WORKER_MB);
-                    let global_cap = if workers == 1 { single_cap_mb } else { parallel_cap_mb };
+                    let global_cap = if workers == 1 {
+                        single_cap_mb
+                    } else {
+                        parallel_cap_mb
+                    };
                     if workers.saturating_mul(per_worker_mb) > global_cap {
                         per_worker_mb = (global_cap / workers).max(STRATIFIED_MIN_PER_WORKER_MB);
                     }
-                    Stratum { max_file_mb: s.max_file_mb, workers, per_worker_mb }
+                    Stratum {
+                        max_file_mb: s.max_file_mb,
+                        workers,
+                        per_worker_mb,
+                    }
                 })
                 .collect()
         }
@@ -774,13 +803,16 @@ fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef 
         kind: ProfileKind::Stratified,
         description: Some(format!(
             "Auto-derived from {} GB system RAM (scaled from the 36 GB baseline)",
-            ram_gb.map(|g| g.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            ram_gb
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
         )),
         min_ram_gb: ram_gb,
         strata: Some(strata),
     }
 }
 
+#[allow(dead_code)]
 /// YAML shape of a user-provided profiles config file.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -788,6 +820,7 @@ struct ProfilesYaml {
     profiles: BTreeMap<String, ProfileDef>,
 }
 
+#[allow(dead_code)]
 /// Resolved set of profile definitions visible to the binary.  Built-in profiles
 /// (see `builtin_profiles`) are always present; entries from a user-supplied
 /// `profiles.yaml` (loaded via `--profiles-config` or the default sibling-config
@@ -798,6 +831,7 @@ struct ProfileRegistry {
 }
 
 impl ProfileRegistry {
+    #[allow(dead_code)]
     /// Built-ins only; no YAML loaded.
     fn builtins_only() -> Self {
         let profiles = builtin_profiles().into_iter().collect();
@@ -806,6 +840,7 @@ impl ProfileRegistry {
 
     /// Built-ins plus optional user YAML.  A missing path is fine and yields built-ins only.
     /// An unreadable or invalid YAML returns Err with a helpful message.
+    #[allow(dead_code)]
     fn load(profiles_config_path: Option<&Path>) -> Result<Self> {
         let mut registry = Self::builtins_only();
         let Some(path) = profiles_config_path else {
@@ -816,9 +851,8 @@ impl ProfileRegistry {
         }
         let txt = fs::read_to_string(path)
             .with_context(|| format!("failed to read profiles config: {}", path.display()))?;
-        let parsed: ProfilesYaml = serde_yaml::from_str(&txt).with_context(|| {
-            format!("failed to parse profiles config YAML: {}", path.display())
-        })?;
+        let parsed: ProfilesYaml = serde_yaml::from_str(&txt)
+            .with_context(|| format!("failed to parse profiles config YAML: {}", path.display()))?;
         for (name, def) in parsed.profiles {
             validate_profile_def(&name, &def)
                 .with_context(|| format!("in profiles config: {}", path.display()))?;
@@ -847,6 +881,7 @@ impl ProfileRegistry {
     }
 }
 
+#[allow(dead_code)]
 /// Validate a single profile definition.  Returns a clear error if the shape
 /// violates invariants required by the planner (`build_convert_plan`).
 fn validate_profile_def(name: &str, def: &ProfileDef) -> Result<()> {
@@ -857,10 +892,9 @@ fn validate_profile_def(name: &str, def: &ProfileDef) -> Result<()> {
             }
         }
         ProfileKind::Stratified => {
-            let strata = def
-                .strata
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("profile '{name}': kind=stratified requires strata"))?;
+            let strata = def.strata.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("profile '{name}': kind=stratified requires strata")
+            })?;
             if strata.is_empty() {
                 anyhow::bail!("profile '{name}': strata must not be empty");
             }
@@ -8974,6 +9008,7 @@ fn duckdb_bin_from_option(p: &Option<PathBuf>) -> PathBuf {
 // file-size bucket.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct StratumPlan {
     workers: usize,
@@ -8983,6 +9018,7 @@ struct StratumPlan {
     files: Vec<FilePair>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ConvertPlan {
     /// Strata in execution order (largest files first under stratified mode).
@@ -8995,6 +9031,7 @@ struct ConvertPlan {
     profile_name: String,
 }
 
+#[allow(dead_code)]
 /// Build the execution plan for `run_convert` / `run_repair`.
 ///
 /// Behaviour by profile kind:
@@ -9023,10 +9060,7 @@ fn build_convert_plan(
 
     match def.kind {
         ProfileKind::Safe => {
-            let workers = workers_override
-                .map(|w| w.clamp(1, 2))
-                .unwrap_or(1)
-                .max(1);
+            let workers = workers_override.map(|w| w.clamp(1, 2)).unwrap_or(1).max(1);
             let memory_mb = if let Some(mb) = max_memory_mb_override {
                 mb
             } else {
@@ -9039,7 +9073,11 @@ fn build_convert_plan(
             Ok(ConvertPlan {
                 profile_name: profile_name.to_string(),
                 flat: true,
-                strata: vec![StratumPlan { workers, memory_mb, files: todo }],
+                strata: vec![StratumPlan {
+                    workers,
+                    memory_mb,
+                    files: todo,
+                }],
             })
         }
         ProfileKind::Stratified => {
@@ -9062,7 +9100,11 @@ fn build_convert_plan(
                 return Ok(ConvertPlan {
                     profile_name: profile_name.to_string(),
                     flat: true,
-                    strata: vec![StratumPlan { workers, memory_mb, files }],
+                    strata: vec![StratumPlan {
+                        workers,
+                        memory_mb,
+                        files,
+                    }],
                 });
             }
 
@@ -9090,7 +9132,7 @@ fn build_convert_plan(
             // backwards so the catch-all (most-risky big files) runs first.
             let plan_strata: Vec<StratumPlan> = strata_defs
                 .iter()
-                .zip(buckets.into_iter())
+                .zip(buckets)
                 .rev()
                 .filter(|(_, files)| !files.is_empty())
                 .map(|(sdef, files)| {
@@ -12344,4 +12386,3 @@ mod tests {
         );
     }
 }
-
