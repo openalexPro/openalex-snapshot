@@ -633,6 +633,7 @@ enum Profile {
 // and optionally merged with a user-supplied `profiles.yaml`.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 /// One bucket in a stratified profile.  Files with `gz_size_bytes <= max_file_mb * 1MiB`
 /// (and larger than the previous stratum's `max_file_mb`) belong to this stratum.
 /// `max_file_mb = None` is the catch-all (no upper bound); a stratified profile must
@@ -649,6 +650,7 @@ struct Stratum {
     per_worker_mb: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ProfileKind {
@@ -659,6 +661,7 @@ enum ProfileKind {
     Stratified,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ProfileDef {
@@ -684,6 +687,7 @@ const STRATIFIED_MIN_PER_WORKER_MB: usize = 1280;
 #[allow(dead_code)]
 const STRATIFIED_MAX_WORKERS: usize = 8;
 
+#[allow(dead_code)]
 /// The empirical baseline used both for the built-in `stratified-36` profile and
 /// as the seed scaled by `derive_stratified_profile_for_ram`.  These exact values
 /// were measured this session on a 36 GB / 8+ core Mac with in-process DuckDB
@@ -713,6 +717,7 @@ fn stratified_baseline_36gb_strata() -> Vec<Stratum> {
     ]
 }
 
+#[allow(dead_code)]
 /// Built-in profiles shipped with the binary.  User profiles loaded from
 /// `profiles.yaml` are merged on top via `profile_registry`.
 fn builtin_profiles() -> Vec<(String, ProfileDef)> {
@@ -743,6 +748,7 @@ fn builtin_profiles() -> Vec<(String, ProfileDef)> {
     ]
 }
 
+#[allow(dead_code)]
 /// Derive a stratified profile scaled from the 36 GB baseline to match the
 /// system's actual RAM.  File-size cutoffs (`max_file_mb`) stay fixed because
 /// they reflect the works dataset's compression shape (works gz files expand
@@ -817,6 +823,7 @@ fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef 
     }
 }
 
+#[allow(dead_code)]
 /// YAML shape of a user-provided profiles config file.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -824,6 +831,7 @@ struct ProfilesYaml {
     profiles: BTreeMap<String, ProfileDef>,
 }
 
+#[allow(dead_code)]
 /// Resolved set of profile definitions visible to the binary.  Built-in profiles
 /// (see `builtin_profiles`) are always present; entries from a user-supplied
 /// `profiles.yaml` (loaded via `--profiles-config` or the default sibling-config
@@ -834,6 +842,7 @@ struct ProfileRegistry {
 }
 
 impl ProfileRegistry {
+    #[allow(dead_code)]
     /// Built-ins only; no YAML loaded.
     fn builtins_only() -> Self {
         let profiles = builtin_profiles().into_iter().collect();
@@ -842,6 +851,7 @@ impl ProfileRegistry {
 
     /// Built-ins plus optional user YAML.  A missing path is fine and yields built-ins only.
     /// An unreadable or invalid YAML returns Err with a helpful message.
+    #[allow(dead_code)]
     fn load(profiles_config_path: Option<&Path>) -> Result<Self> {
         let mut registry = Self::builtins_only();
         let Some(path) = profiles_config_path else {
@@ -882,6 +892,7 @@ impl ProfileRegistry {
     }
 }
 
+#[allow(dead_code)]
 /// Validate a single profile definition.  Returns a clear error if the shape
 /// violates invariants required by the planner (`build_convert_plan`).
 fn validate_profile_def(name: &str, def: &ProfileDef) -> Result<()> {
@@ -9213,6 +9224,7 @@ fn legacy_profile_from_str(name: &str) -> Option<Profile> {
 // file-size bucket.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct StratumPlan {
     workers: usize,
@@ -9222,6 +9234,7 @@ struct StratumPlan {
     files: Vec<FilePair>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ConvertPlan {
     /// Strata in execution order (largest files first under stratified mode).
@@ -9234,6 +9247,7 @@ struct ConvertPlan {
     profile_name: String,
 }
 
+#[allow(dead_code)]
 /// Build the execution plan for `run_convert` / `run_repair`.
 ///
 /// Behaviour by profile kind:
