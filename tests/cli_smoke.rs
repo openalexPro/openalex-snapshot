@@ -266,8 +266,6 @@ fn index_builds_expected_columns() {
             root.to_str().unwrap(),
             "--dataset",
             "works",
-            "--profile",
-            "balanced",
         ])
         .status()
         .unwrap();

@@ -343,7 +343,7 @@ Output:
   optional: limit conversion to selected files via --input-file
 
 Defaults:
-  profile: auto
+  profile: safe
   memory: auto-detected from system RAM unless --max-memory-mb is provided
   disk preflight: requires at least 900 GiB free at <root_dir>/parquet
 
@@ -612,15 +612,6 @@ struct SharedArgs {
     #[arg(long)]
     #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
     duckdb_bin: Option<PathBuf>,
-}
-
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Profile {
-    Auto,
-    Safe,
-    Balanced,
-    Fast,
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,12 +1067,6 @@ struct VerifyArgs {
     #[command(flatten)]
     shared: SharedArgs,
 
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
-
     #[arg(long)]
     #[arg(
         help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
@@ -1123,12 +1108,6 @@ struct VerifyArgs {
 struct SchemaArgs {
     #[command(flatten)]
     shared: SharedArgs,
-
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
 
     #[arg(long)]
     #[arg(
@@ -1175,12 +1154,6 @@ struct SchemaArgs {
 struct VerifySchemaArgs {
     #[command(flatten)]
     shared: SharedArgs,
-
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
 
     #[arg(long)]
     #[arg(
@@ -1234,12 +1207,6 @@ struct IndexArgs {
     #[arg(help = "Number of workers (0 = auto: cpus-2, same semantics as convert)")]
     workers: usize,
 
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
-
     #[arg(long)]
     #[arg(help = "Per-worker memory cap override in MB (same semantics as convert)")]
     max_memory_mb: Option<usize>,
@@ -1279,12 +1246,6 @@ struct ExtractArgs {
     #[arg(long)]
     #[arg(help = "Output parquet base path (writes <base>_<dataset>.parquet)")]
     output: PathBuf,
-
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
 
     #[arg(long)]
     #[arg(
@@ -1462,12 +1423,6 @@ struct ValidateDownloadArgs {
     #[arg(help = "Detect extra local files not present remotely")]
     check_extra: bool,
 
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
-
     #[arg(long, default_value_t = 0)]
     #[arg(help = "Number of worker threads for local integrity checks (0 = auto: cpus-2)")]
     workers: usize,
@@ -1506,12 +1461,6 @@ struct VerifyIndexArgs {
     #[arg(long, default_value_t = 0)]
     #[arg(help = "Number of workers (0 = auto: cpus-2)")]
     workers: usize,
-
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
 
     #[arg(long)]
     #[arg(help = "Per-worker memory cap override in MB")]
@@ -1699,12 +1648,6 @@ struct CheckArgs {
     #[arg(help = "Use signed AWS requests (overrides --no-sign-request)")]
     signed: bool,
 
-    #[arg(long, value_enum, default_value = "balanced")]
-    #[arg(
-        help = "Performance/memory profile: safe (workers≤2, 1–8 GiB), balanced (4–24 GiB), fast (8–32 GiB)"
-    )]
-    profile: Profile,
-
     #[arg(long)]
     #[arg(help = "Per-worker memory cap override in MB")]
     max_memory_mb: Option<usize>,
@@ -1802,7 +1745,6 @@ struct VerifyConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     duckdb_bin: Option<PathBuf>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
@@ -1819,7 +1761,6 @@ struct SchemaConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     duckdb_bin: Option<PathBuf>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     state_flush_every: Option<usize>,
     from: Option<SchemaFrom>,
@@ -1837,7 +1778,6 @@ struct IndexConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     duckdb_bin: Option<PathBuf>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
@@ -1852,7 +1792,6 @@ struct ExtractConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     duckdb_bin: Option<PathBuf>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
@@ -1900,7 +1839,6 @@ struct ValidateDownloadConfig {
     s3_uri: Option<String>,
     dataset: Option<String>,
     workers: Option<usize>,
-    profile: Option<Profile>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
     aws_bin: Option<PathBuf>,
@@ -1919,7 +1857,6 @@ struct VerifyIndexConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     duckdb_bin: Option<PathBuf>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     index_file: Option<PathBuf>,
@@ -1971,7 +1908,6 @@ struct CheckConfig {
     profile_name: Option<String>,
     no_sign_request: Option<bool>,
     signed: Option<bool>,
-    profile: Option<Profile>,
     max_memory_mb: Option<usize>,
     precise: Option<bool>,
     strict: Option<bool>,
@@ -2159,11 +2095,7 @@ fn main() -> Result<()> {
                     &args,
                     &resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?,
                     &duckdb_bin(&args.shared),
-                    &resolve_tuning(
-                        args.profile.clone(),
-                        args.shared.workers,
-                        args.max_memory_mb,
-                    ),
+                    &light_tuning_with_override(args.shared.workers, args.max_memory_mb),
                 );
                 return Ok(());
             }
@@ -2179,11 +2111,7 @@ fn main() -> Result<()> {
                     &args,
                     &resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?,
                     &duckdb_bin(&args.shared),
-                    &resolve_tuning(
-                        args.profile.clone(),
-                        args.shared.workers,
-                        args.max_memory_mb,
-                    ),
+                    &light_tuning_with_override(args.shared.workers, args.max_memory_mb),
                 );
                 return Ok(());
             }
@@ -2207,7 +2135,7 @@ fn main() -> Result<()> {
                         .index_file
                         .clone()
                         .unwrap_or_else(|| PathBuf::from("auto")),
-                    &resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb),
+                    &light_tuning_with_override(args.workers, args.max_memory_mb),
                 );
                 return Ok(());
             }
@@ -2222,11 +2150,7 @@ fn main() -> Result<()> {
                 explain_extract(
                     &args,
                     &duckdb_bin(&args.shared),
-                    &resolve_tuning(
-                        args.profile.clone(),
-                        args.shared.workers,
-                        args.max_memory_mb,
-                    ),
+                    &light_tuning_with_override(args.shared.workers, args.max_memory_mb),
                 );
                 return Ok(());
             }
@@ -2641,13 +2565,6 @@ fn apply_verify_config(
     };
     if let Some(d) = &cfg.defaults {
         apply_shared_defaults(&mut args.shared, d, matches);
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -2681,11 +2598,6 @@ fn apply_verify_config(
         if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.shared.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -2736,13 +2648,6 @@ fn apply_schema_config(
     };
     if let Some(d) = &cfg.defaults {
         apply_shared_defaults(&mut args.shared, d, matches);
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -2771,11 +2676,6 @@ fn apply_schema_config(
         if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.shared.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -2842,13 +2742,6 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
                 args.duckdb_bin = Some(v.clone());
             }
         }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -2882,11 +2775,6 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -2925,13 +2813,6 @@ fn apply_extract_config(
     };
     if let Some(d) = &cfg.defaults {
         apply_shared_defaults(&mut args.shared, d, matches);
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -2965,11 +2846,6 @@ fn apply_extract_config(
         if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.shared.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -3195,13 +3071,6 @@ fn apply_validate_download_config(
                 args.dataset = v.clone();
             }
         }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.workers = v;
@@ -3237,11 +3106,6 @@ fn apply_validate_download_config(
         if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "progress") {
@@ -3315,13 +3179,6 @@ fn apply_verify_index_config(
                 args.duckdb_bin = Some(v.clone());
             }
         }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -3350,11 +3207,6 @@ fn apply_verify_index_config(
         if !cli_explicit(matches, "duckdb_bin") {
             if let Some(v) = &c.duckdb_bin {
                 args.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -3510,13 +3362,6 @@ fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>, matches: Op
                 args.shared.duckdb_bin = Some(v.clone());
             }
         }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                if let Some(p) = legacy_profile_from_str(v) {
-                    args.profile = p;
-                }
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             if let Some(v) = d.max_memory_mb {
                 args.max_memory_mb = Some(v);
@@ -3577,11 +3422,6 @@ fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "signed") {
             if let Some(v) = c.signed {
                 args.signed = v;
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -3730,15 +3570,18 @@ defaults:
   # allowed values: any valid executable path
   # duckdb_bin: /usr/local/bin/duckdb
   # Profile controls DuckDB memory budget and worker count.
-  # auto (default) — two-tier: small files run in parallel (balanced), large files
-  #   run serially with maximised memory. Threshold derived from system RAM.
-  # safe     — workers capped at 2, memory 15% of usable RAM (1–8 GiB)
-  # balanced — workers cpus-2,      memory 35% of usable RAM (4–24 GiB)
-  # fast     — workers cpus-2,      memory 55% of usable RAM (8–32 GiB)
-  # Fallback when RAM is undetectable: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
-  # allowed values: auto | safe | balanced | fast
-  # profile: auto
-  # Workers: 0 (default) = auto-detect (cpus-2 for auto/balanced/fast, 1 for safe).
+  # safe (default) — single-pass, single worker, generous per-worker memory
+  #   (45% of usable RAM, clamped 8-24 GiB).  Reliable on any host; uses DuckDB
+  #   spill-to-disk for files larger than the memory budget.
+  # stratified-36 — multi-pass; partitions files by gz size and runs one rayon
+  #   pass per non-empty stratum (4-/3-/2-/1-workers on <400/400-600/600-800/800+ MB).
+  #   Empirically tuned for ~36 GB RAM hosts.
+  # Custom profiles for other RAM tiers go in a sibling `openalex-snapshot.profiles.yaml`
+  # (auto-discovered) — see `docs/commands/convert.md` for the schema.
+  # allowed values: safe | stratified-36 | <user-defined>
+  # profile: safe
+  # Workers: 0 (default) = auto-detect per profile. `--workers N` on a stratified
+  # profile collapses it into a single flat pass.
   # Override only if you want to pin a specific value.
   # allowed values: integer >= 0 (0 = auto)
   # workers: 0
@@ -3828,7 +3671,6 @@ verify_download:
   # root_dir: .
   # dataset: all
   # workers: 4
-  # profile: balanced
   # progress: true
   # state_flush_every: 25
 
@@ -3854,7 +3696,7 @@ convert:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
+  # profile: safe
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -3910,7 +3752,6 @@ verify_convert:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -3938,7 +3779,7 @@ repair_convert:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
+  # profile: safe
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -3957,7 +3798,6 @@ index:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -3981,7 +3821,6 @@ verify_index:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
   # max_memory_mb: 8192
   # progress: true
 
@@ -3999,7 +3838,6 @@ schema:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
   # max_memory_mb: 8192
   # state_flush_every: 25
 
@@ -4033,7 +3871,6 @@ extract:
   # dataset: all
   # workers: 4
   # duckdb_bin: /usr/local/bin/duckdb
-  # profile: balanced
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -4113,12 +3950,9 @@ check:
   # Shared-default overrides supported here (optional, uncomment to override defaults):
   # root_dir: .
   # dataset: all
-  # profile: balanced
 
   # allowed values: any valid path
   root_dir: .
-  # allowed values: safe | balanced | fast
-  profile: balanced
   # allowed values: true | false
   precise: true
   # allowed values: true | false
@@ -4308,7 +4142,6 @@ fn run_check(args: CheckArgs) -> Result<()> {
     report_args.insert("strict".to_string(), args.strict.to_string());
     report_args.insert("precise".to_string(), args.precise.to_string());
     report_args.insert("workers".to_string(), args.shared.workers.to_string());
-    report_args.insert("profile".to_string(), format!("{:?}", args.profile));
     report_args.insert(
         "memory_mb".to_string(),
         format!("{:?}", args.max_memory_mb.clone()),
@@ -4405,7 +4238,6 @@ fn run_check(args: CheckArgs) -> Result<()> {
             no_sign_request: args.no_sign_request,
             signed: args.signed,
             check_extra: true,
-            profile: args.profile.clone(),
             workers: args.shared.workers,
             progress: false,
             explain: false,
@@ -4544,11 +4376,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     let total = detect_total_memory_mb();
     if let Some(total_mb) = total {
         let mem = tuning.memory_mb.unwrap_or(0);
@@ -5403,7 +5231,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
             no_sign_request: true,
             signed: false,
             check_extra: true,
-            profile: Profile::Balanced,
             workers: 0,
             progress: true,
             explain: false,
@@ -5491,7 +5318,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
                     workers: 0,
                     duckdb_bin: None,
                 },
-                profile: Profile::Balanced,
                 max_memory_mb: None,
                 scope: VerifyScope::Snapshot,
                 metadata_level: VerifyMetadataLevel::Both,
@@ -5586,7 +5412,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
             dataset: "all".to_string(),
             index_file: None,
             workers: 0,
-            profile: Profile::Balanced,
             max_memory_mb: None,
             duckdb_bin: None,
             progress: true,
@@ -5617,7 +5442,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
             dataset: "all".to_string(),
             index_file: None,
             workers: 0,
-            profile: Profile::Balanced,
             max_memory_mb: None,
             duckdb_bin: None,
             progress: true,
@@ -5760,7 +5584,7 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
         .index_file
         .clone()
         .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
-    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
+    let tuning = light_tuning_with_override(args.workers, args.max_memory_mb);
     if args.explain {
         println!("--explain: verify-index");
         println!("duckdb_bin: {}", bin.display());
@@ -6726,7 +6550,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
         .index_file
         .clone()
         .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
-    let tuning = resolve_tuning(args.profile.clone(), args.workers, args.max_memory_mb);
+    let tuning = light_tuning_with_override(args.workers, args.max_memory_mb);
     if args.explain {
         explain_index(&args, &bin, &corpus_dir, &index_file, &tuning);
         return Ok(());
@@ -6972,11 +6796,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
 fn run_extract(args: ExtractArgs) -> Result<()> {
     let bin = duckdb_bin(&args.shared);
     let parquet_dir = args.shared.parquet_dir.clone();
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     if args.explain {
         explain_extract(&args, &bin, &tuning);
         return Ok(());
@@ -7391,11 +7211,7 @@ fn extract_output_path(base: &Path, dataset: &str) -> PathBuf {
 fn run_verify(args: VerifyArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     if args.explain {
         explain_verify(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
@@ -7752,11 +7568,7 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
 fn run_schema(args: SchemaArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     if args.explain {
         explain_schema(&args, &datasets, &duckdb_bin, &tuning);
         return Ok(());
@@ -7972,11 +7784,7 @@ fn run_schema(args: SchemaArgs) -> Result<()> {
 fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let duckdb_bin = duckdb_bin(&args.shared);
-    let tuning = resolve_tuning(
-        args.profile.clone(),
-        args.shared.workers,
-        args.max_memory_mb,
-    );
+    let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     if args.explain {
         println!(
             "--explain: verify_schema from={:?} diff_with={:?} datasets={} sample_size={} refresh_cache={}",
@@ -8561,7 +8369,6 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         no_sign_request: effective_no_sign,
         signed: args.signed,
         check_extra: effective_delete,
-        profile: Profile::Balanced,
         workers: 0,
         progress: false,
         explain: false,
@@ -8702,7 +8509,7 @@ fn run_download(args: DownloadArgs) -> Result<()> {
 fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
     ensure_aws_cli(&args.aws_bin)?;
     fs::create_dir_all(&args.snapshot_dir)?;
-    let tuning = resolve_tuning(args.profile.clone(), args.workers, None);
+    let tuning = light_tuning_with_override(args.workers, None);
     if args.explain {
         explain_validate_download(&args, &tuning);
         return Ok(());
@@ -9116,6 +8923,27 @@ fn duckdb_bin_from_option(p: &Option<PathBuf>) -> PathBuf {
     p.clone().unwrap_or_else(|| PathBuf::from("duckdb"))
 }
 
+/// Tuning for parquet-side commands (verify, schema, index, extract, verify_index,
+/// check, …) where the heavy lifting is parquet read/scan rather than JSON gz
+/// parsing.  Workers scale with detected CPU count, capped at 4 (these
+/// workloads don't benefit from more parallelism on local disk); per-worker
+/// memory defaults to 8 GiB.  An explicit `--workers N` or `--max-memory-mb N`
+/// wins.
+fn light_tuning_with_override(workers: usize, memory_mb_override: Option<usize>) -> Tuning {
+    let workers = if workers > 0 {
+        workers
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(2)
+    };
+    let memory_mb = memory_mb_override.unwrap_or(8192);
+    Tuning {
+        workers,
+        memory_mb: Some(memory_mb),
+    }
+}
+
 /// Resolve the path to a profiles config YAML.  If `cli_arg` is set, use that
 /// directly.  Otherwise auto-discover `./openalex-snapshot.profiles.yaml` if it
 /// exists.  Returns `None` when no profiles config is in use (built-ins only).
@@ -9153,7 +8981,7 @@ fn representative_tuning(
             let memory_mb = if let Some(mb) = max_memory_mb_override {
                 Some(mb)
             } else {
-                let mut mb = auto_profile_memory_mb(Profile::Safe, total_ram_mb);
+                let mut mb = auto_profile_safe_memory_mb(total_ram_mb);
                 if workers == 1 {
                     mb = mb.max(auto_profile_single_worker_safe_memory_mb(total_ram_mb));
                 }
@@ -9185,21 +9013,6 @@ fn representative_tuning(
             let _ = profile_name; // for symmetry; intentionally unused
             Tuning { workers, memory_mb }
         }
-    }
-}
-
-/// Best-effort translation of a profile name to the legacy `Profile` enum,
-/// used by non-Convert/Repair subcommands while they continue to rely on
-/// `resolve_tuning`.  Stratified profile names (e.g. "stratified-36",
-/// "stratified-64") return `None` — those subcommands don't need fancy
-/// tuning, so the caller falls back to its CLI default.
-fn legacy_profile_from_str(name: &str) -> Option<Profile> {
-    match name {
-        "auto" => Some(Profile::Auto),
-        "safe" => Some(Profile::Safe),
-        "balanced" => Some(Profile::Balanced),
-        "fast" => Some(Profile::Fast),
-        _ => None,
     }
 }
 
@@ -9266,7 +9079,7 @@ fn build_convert_plan(
             let memory_mb = if let Some(mb) = max_memory_mb_override {
                 mb
             } else {
-                let mut mb = auto_profile_memory_mb(Profile::Safe, total_ram_mb);
+                let mut mb = auto_profile_safe_memory_mb(total_ram_mb);
                 if workers == 1 {
                     mb = mb.max(auto_profile_single_worker_safe_memory_mb(total_ram_mb));
                 }
@@ -9362,78 +9175,6 @@ struct Tuning {
     memory_mb: Option<usize>,
 }
 
-fn resolve_tuning(profile: Profile, workers: usize, max_memory_mb: Option<usize>) -> Tuning {
-    let total_mb = detect_total_memory_mb();
-    resolve_tuning_with_total(profile, workers, max_memory_mb, total_mb)
-}
-
-fn auto_worker_count() -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    cpus.saturating_sub(2).max(1)
-}
-
-fn resolve_tuning_with_total(
-    profile: Profile,
-    workers: usize,
-    max_memory_mb: Option<usize>,
-    total_mb: Option<usize>,
-) -> Tuning {
-    // workers==0 means "auto": cpus-2 for Auto/Balanced/Fast, capped at 2 for Safe
-    let resolved_workers = if workers == 0 {
-        match profile {
-            Profile::Auto | Profile::Balanced | Profile::Fast => auto_worker_count(),
-            Profile::Safe => 1,
-        }
-    } else {
-        workers
-    };
-    let mut out = Tuning {
-        workers: resolved_workers.max(1),
-        memory_mb: max_memory_mb,
-    };
-    match profile {
-        Profile::Auto | Profile::Balanced => {
-            if out.memory_mb.is_none() {
-                // Divide total balanced budget across workers so aggregate stays within 35% of RAM.
-                // 1280 MiB floor per worker gives ~8 workers on a 36 GB machine
-                // (8 × 1290 MB = 10 320 MB total budget), preventing the original swap
-                // pressure caused by giving each worker the full undivided budget.
-                // If that floor would need more workers than the budget allows, cap worker count.
-                const MIN_PER_WORKER_MB: usize = 1280;
-                let total = auto_profile_memory_mb(Profile::Balanced, total_mb);
-                let max_workers = (total / MIN_PER_WORKER_MB).max(1);
-                out.workers = out.workers.min(max_workers).max(1);
-                let per_worker = (total / out.workers).max(MIN_PER_WORKER_MB);
-                out.memory_mb = Some(per_worker);
-            }
-        }
-        Profile::Safe => {
-            out.workers = out.workers.clamp(1, 2);
-            if out.memory_mb.is_none() {
-                let mut mb = auto_profile_memory_mb(Profile::Safe, total_mb);
-                if out.workers == 1 {
-                    mb = mb.max(auto_profile_single_worker_safe_memory_mb(total_mb));
-                }
-                out.memory_mb = Some(mb);
-            }
-        }
-        Profile::Fast => {
-            if out.memory_mb.is_none() {
-                // Same treatment as Balanced: divide total budget across workers.
-                const MIN_PER_WORKER_MB: usize = 1280;
-                let total = auto_profile_memory_mb(Profile::Fast, total_mb);
-                let max_workers = (total / MIN_PER_WORKER_MB).max(1);
-                out.workers = out.workers.min(max_workers).max(1);
-                let per_worker = (total / out.workers).max(MIN_PER_WORKER_MB);
-                out.memory_mb = Some(per_worker);
-            }
-        }
-    }
-    out
-}
-
 fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
     let t = match total_mb {
         Some(v) if v > 0 => v,
@@ -9445,37 +9186,19 @@ fn auto_profile_single_worker_safe_memory_mb(total_mb: Option<usize>) -> usize {
     mb.clamp(8192, 24_576)
 }
 
-fn auto_profile_memory_mb(profile: Profile, total_mb: Option<usize>) -> usize {
-    // Conservative defaults when RAM cannot be detected.
-    let fallback = match profile {
-        Profile::Auto | Profile::Balanced => 6144,
-        Profile::Safe => 2048,
-        Profile::Fast => 12_288,
-    };
+/// Memory budget (MB) for the multi-worker `safe` profile path: 15% of usable
+/// RAM, clamped to [1024, 8192].  Used as the floor by `representative_tuning`
+/// when `workers > 1`.  `auto_profile_single_worker_safe_memory_mb` is used as
+/// the floor when `workers == 1` (it overrides with a more generous cap so
+/// huge files can be processed without OOM).
+fn auto_profile_safe_memory_mb(total_mb: Option<usize>) -> usize {
     let t = match total_mb {
         Some(v) if v > 0 => v,
-        _ => return fallback,
+        _ => return 2048,
     };
-
-    // Keep some headroom for OS and other processes.
     let usable = (t as f64 * 0.80).floor() as usize;
-    // With in-process DuckDB the global memory_limit is shared across all worker connections
-    // (set once via set_duckdb_memory_limit = per_worker × workers). The fractions here
-    // represent the TOTAL budget for the whole DuckDB instance, not a per-subprocess budget.
-    // Old subprocess model used 0.35 for Balanced, which was per-process; in-process needs a
-    // higher total to avoid OOM when multiple workers concurrently process large files.
-    let mb = match profile {
-        Profile::Auto | Profile::Balanced => ((usable as f64) * 0.65).floor() as usize,
-        Profile::Safe => ((usable as f64) * 0.15).floor() as usize,
-        Profile::Fast => ((usable as f64) * 0.80).floor() as usize,
-    };
-
-    let (min_mb, max_mb) = match profile {
-        Profile::Auto | Profile::Balanced => (4096, 32_768),
-        Profile::Safe => (1024, 8192),
-        Profile::Fast => (8192, 49_152),
-    };
-    mb.max(min_mb).min(max_mb)
+    let mb = ((usable as f64) * 0.15).floor() as usize;
+    mb.clamp(1024, 8192)
 }
 
 /// Parse a human-readable size string to bytes.
@@ -12484,38 +12207,6 @@ mod tests {
         assert_eq!(duckdb_to_arrow_type("BIGINT"), "int64");
         assert_eq!(duckdb_to_arrow_type("VARCHAR"), "utf8");
         assert_eq!(arrow_to_duckdb_type("utf8"), "VARCHAR");
-    }
-
-    #[test]
-    fn test_resolve_tuning_profiles() {
-        let s = resolve_tuning_with_total(Profile::Safe, 8, None, Some(32_768));
-        assert_eq!(s.workers, 2);
-        assert_eq!(s.memory_mb, Some(3932));
-
-        let s1 = resolve_tuning_with_total(Profile::Safe, 1, None, Some(32_768));
-        assert_eq!(s1.workers, 1);
-        assert_eq!(s1.memory_mb, Some(11_796));
-
-        let b = resolve_tuning_with_total(Profile::Balanced, 8, None, Some(32_768));
-        // Balanced: usable=26214, total=26214*0.65=17039, max_workers=17039/1280=13, workers=min(8,13)=8
-        assert_eq!(b.workers, 8);
-        assert_eq!(b.memory_mb, Some(17039 / 8));
-
-        let f = resolve_tuning_with_total(Profile::Fast, 8, None, Some(32_768));
-        // Fast: usable=26214, total=26214*0.80=20971, max_workers=20971/1280=16, workers=min(8,16)=8
-        assert_eq!(f.workers, 8);
-        assert_eq!(f.memory_mb, Some(20_971 / 8));
-
-        let ov = resolve_tuning_with_total(Profile::Safe, 3, Some(999), Some(32_768));
-        assert_eq!(ov.memory_mb, Some(999));
-    }
-
-    #[test]
-    fn test_auto_profile_memory_fallback() {
-        assert_eq!(auto_profile_memory_mb(Profile::Safe, None), 2048);
-        assert_eq!(auto_profile_memory_mb(Profile::Balanced, None), 6144);
-        assert_eq!(auto_profile_memory_mb(Profile::Fast, None), 12_288);
-        assert_eq!(auto_profile_single_worker_safe_memory_mb(None), 8192);
     }
 
     #[test]
