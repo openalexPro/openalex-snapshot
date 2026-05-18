@@ -673,11 +673,15 @@ struct ProfileDef {
 
 /// Minimum per-worker DuckDB memory (MB) when scaling.  Keeps tiny machines from
 /// landing in pathological 100-MB-per-worker territory.
+/// Used by `derive_stratified_profile_for_ram` (which is currently only wired
+/// into the upcoming `config --create-profiles` flow — hence `allow(dead_code)`).
+#[allow(dead_code)]
 const STRATIFIED_MIN_PER_WORKER_MB: usize = 1280;
 
 /// Hard cap on CPU-bound rayon workers regardless of derived value.  Empirically
 /// this session showed workers=6 is already slower than workers=4 on small files
 /// due to CPU+I/O contention; cap at 8 to leave a tail of headroom for huge boxes.
+#[allow(dead_code)]
 const STRATIFIED_MAX_WORKERS: usize = 8;
 
 /// The empirical baseline used both for the built-in `stratified-36` profile and
@@ -686,10 +690,26 @@ const STRATIFIED_MAX_WORKERS: usize = 8;
 /// and spill-to-disk enabled.
 fn stratified_baseline_36gb_strata() -> Vec<Stratum> {
     vec![
-        Stratum { max_file_mb: Some(400), workers: 4, per_worker_mb: 4800 },
-        Stratum { max_file_mb: Some(600), workers: 3, per_worker_mb: 6400 },
-        Stratum { max_file_mb: Some(800), workers: 2, per_worker_mb: 9600 },
-        Stratum { max_file_mb: None,      workers: 1, per_worker_mb: 13_000 },
+        Stratum {
+            max_file_mb: Some(400),
+            workers: 4,
+            per_worker_mb: 4800,
+        },
+        Stratum {
+            max_file_mb: Some(600),
+            workers: 3,
+            per_worker_mb: 6400,
+        },
+        Stratum {
+            max_file_mb: Some(800),
+            workers: 2,
+            per_worker_mb: 9600,
+        },
+        Stratum {
+            max_file_mb: None,
+            workers: 1,
+            per_worker_mb: 13_000,
+        },
     ]
 }
 
@@ -733,6 +753,7 @@ fn builtin_profiles() -> Vec<(String, ProfileDef)> {
 /// Used by `config --create-profiles` to emit a starter `profiles.yaml`
 /// calibrated for the host.  Not registered as a runtime profile — the user
 /// reviews/tunes the YAML and then references the profile by name.
+#[allow(dead_code)]
 fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef {
     let cpu_cap = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -742,26 +763,33 @@ fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef 
     let strata = match total_ram_mb {
         Some(mb) if mb > 0 => {
             let ratio = (mb as f64) / 36_864.0; // 36 GB baseline
-            // System-RAM safety caps applied after linear scaling.  Workers and
-            // per_worker_mb both scale with ratio, so total commitment scales as
-            // ratio^2 — that overshoots physical RAM on large hosts.  The 36 GB
-            // baseline uses ~53% of total RAM per parallel stratum and ~36% for
-            // the single-worker catch-all; preserve those ratios on every host.
+                                                // System-RAM safety caps applied after linear scaling.  Workers and
+                                                // per_worker_mb both scale with ratio, so total commitment scales as
+                                                // ratio^2 — that overshoots physical RAM on large hosts.  The 36 GB
+                                                // baseline uses ~53% of total RAM per parallel stratum and ~36% for
+                                                // the single-worker catch-all; preserve those ratios on every host.
             let parallel_cap_mb = ((mb as f64) * 0.55).floor() as usize;
             let single_cap_mb = ((mb as f64) * 0.40).floor() as usize;
             stratified_baseline_36gb_strata()
                 .into_iter()
                 .map(|s| {
-                    let scaled_workers =
-                        ((s.workers as f64) * ratio).round().max(1.0) as usize;
+                    let scaled_workers = ((s.workers as f64) * ratio).round().max(1.0) as usize;
                     let workers = scaled_workers.min(cpu_cap).max(1);
                     let scaled_mb = ((s.per_worker_mb as f64) * ratio).round() as usize;
                     let mut per_worker_mb = scaled_mb.max(STRATIFIED_MIN_PER_WORKER_MB);
-                    let global_cap = if workers == 1 { single_cap_mb } else { parallel_cap_mb };
+                    let global_cap = if workers == 1 {
+                        single_cap_mb
+                    } else {
+                        parallel_cap_mb
+                    };
                     if workers.saturating_mul(per_worker_mb) > global_cap {
                         per_worker_mb = (global_cap / workers).max(STRATIFIED_MIN_PER_WORKER_MB);
                     }
-                    Stratum { max_file_mb: s.max_file_mb, workers, per_worker_mb }
+                    Stratum {
+                        max_file_mb: s.max_file_mb,
+                        workers,
+                        per_worker_mb,
+                    }
                 })
                 .collect()
         }
@@ -780,7 +808,9 @@ fn derive_stratified_profile_for_ram(total_ram_mb: Option<usize>) -> ProfileDef 
         kind: ProfileKind::Stratified,
         description: Some(format!(
             "Auto-derived from {} GB system RAM (scaled from the 36 GB baseline)",
-            ram_gb.map(|g| g.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            ram_gb
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
         )),
         min_ram_gb: ram_gb,
         strata: Some(strata),
@@ -822,9 +852,8 @@ impl ProfileRegistry {
         }
         let txt = fs::read_to_string(path)
             .with_context(|| format!("failed to read profiles config: {}", path.display()))?;
-        let parsed: ProfilesYaml = serde_yaml::from_str(&txt).with_context(|| {
-            format!("failed to parse profiles config YAML: {}", path.display())
-        })?;
+        let parsed: ProfilesYaml = serde_yaml::from_str(&txt)
+            .with_context(|| format!("failed to parse profiles config YAML: {}", path.display()))?;
         for (name, def) in parsed.profiles {
             validate_profile_def(&name, &def)
                 .with_context(|| format!("in profiles config: {}", path.display()))?;
@@ -863,10 +892,9 @@ fn validate_profile_def(name: &str, def: &ProfileDef) -> Result<()> {
             }
         }
         ProfileKind::Stratified => {
-            let strata = def
-                .strata
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("profile '{name}': kind=stratified requires strata"))?;
+            let strata = def.strata.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("profile '{name}': kind=stratified requires strata")
+            })?;
             if strata.is_empty() {
                 anyhow::bail!("profile '{name}': strata must not be empty");
             }
@@ -5995,7 +6023,8 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
     let duckdb_bin = duckdb_bin(&args.shared);
 
     let total_mb = detect_total_memory_mb();
-    let profile_registry = ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
+    let profile_registry =
+        ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
     let resolved_profile = profile_registry
         .get(&args.profile)
         .ok_or_else(|| profile_registry.unknown_profile_error(&args.profile))?
@@ -6024,7 +6053,11 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
     eprintln!(
         "[convert] profile={} workers_override={} max_memory_mb_override={:?}",
         args.profile,
-        if args.shared.workers == 0 { "auto".to_string() } else { args.shared.workers.to_string() },
+        if args.shared.workers == 0 {
+            "auto".to_string()
+        } else {
+            args.shared.workers.to_string()
+        },
         args.max_memory_mb,
     );
     let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
@@ -6397,32 +6430,42 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
             &format!("convert:{dataset}"),
         );
 
-        // memory_limit is a global DuckDB setting shared by all in-process connections.
-        // Set it once to the total budget (per_worker × workers) before the parallel pass,
-        // not per-query (which would cap all workers collectively at per_worker).
-        if let Some(mb) = tuning.memory_mb {
-            set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
-        }
-
         // Enable spill-to-disk so DuckDB can handle files larger than memory_limit.
         // Without a temp_directory an in-memory connection cannot spill and will OOM.
-        // Place the spill dir next to the parquet output (same filesystem) so spill
-        // writes are fast and we can clean up easily.
+        // The OnceLock inside this function makes it idempotent across strata + datasets.
         {
             let spill_dir = metadata_root(&args.shared.parquet_dir).join("duckdb_tmp");
             set_duckdb_temp_directory(&spill_dir);
         }
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(tuning.workers)
-            .build()
-            .context("failed to build rayon thread pool")?;
+        // Build the stratified execution plan.  Safe profile produces a single
+        // stratum; stratified profiles partition `todo` by gz size and emit one
+        // stratum per non-empty bucket (largest-files-first).  `--workers`
+        // collapses a stratified plan into one flat pass.
+        let workers_override = if args.shared.workers == 0 {
+            None
+        } else {
+            Some(args.shared.workers)
+        };
+        let plan = build_convert_plan(
+            &args.profile,
+            workers_override,
+            args.max_memory_mb,
+            total_mb,
+            todo.clone(),
+            &profile_registry,
+        )?;
+        eprintln!(
+            "[convert] dataset={dataset} profile={} strata={} flat={}",
+            plan.profile_name,
+            plan.strata.len(),
+            plan.flat,
+        );
 
         let schema_arc = Arc::new(columns_clause);
         let duckdb_arc = Arc::new(duckdb_bin.clone());
         let compression = args.compression.clone();
         let row_group_rows = args.row_group_rows;
-        let memory_mb = tuning.memory_mb;
         let parquet_root = Arc::new(args.shared.parquet_dir.clone());
         let dataset_name = dataset.clone();
         let extra_json_options = if dataset == "works" {
@@ -6431,17 +6474,57 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
             "".to_string()
         };
 
-        for chunk in todo.chunks(flush_every) {
-            let results: Vec<Option<FailureEntry>> = pool.install(|| {
-                chunk
-                    .par_iter()
-                    .map(|pair| {
-                        if !args.skip_disk_check && args.disk_check_scope == DiskCheckScope::File {
-                            match available_disk_bytes(parquet_root.as_path()) {
-                                Ok(free_bytes) => {
-                                    let input_size = fs::metadata(&pair.input_gz).map(|m| m.len()).unwrap_or(0);
-                                    let required_bytes = input_size.saturating_add(64 * 1024 * 1024);
-                                    if free_bytes < required_bytes {
+        for (stratum_idx, stratum) in plan.strata.iter().enumerate() {
+            eprintln!(
+                "[convert] dataset={dataset} stratum {}/{}: files={} workers={} per_worker_mb={}",
+                stratum_idx + 1,
+                plan.strata.len(),
+                stratum.files.len(),
+                stratum.workers,
+                stratum.memory_mb,
+            );
+
+            // memory_limit is a global DuckDB setting shared by all in-process
+            // connections.  Set it freshly per stratum so each pass gets the
+            // appropriate per_worker × workers budget.  Safe to change between
+            // strata (unlike temp_directory, which is OnceLock-guarded).
+            set_duckdb_memory_limit(stratum.memory_mb.saturating_mul(stratum.workers));
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(stratum.workers)
+                .build()
+                .context("failed to build rayon thread pool")?;
+
+            let memory_mb = Some(stratum.memory_mb);
+
+            for chunk in stratum.files.chunks(flush_every) {
+                let results: Vec<Option<FailureEntry>> = pool.install(|| {
+                    chunk
+                        .par_iter()
+                        .map(|pair| {
+                            if !args.skip_disk_check && args.disk_check_scope == DiskCheckScope::File {
+                                match available_disk_bytes(parquet_root.as_path()) {
+                                    Ok(free_bytes) => {
+                                        let input_size = fs::metadata(&pair.input_gz).map(|m| m.len()).unwrap_or(0);
+                                        let required_bytes = input_size.saturating_add(64 * 1024 * 1024);
+                                        if free_bytes < required_bytes {
+                                            pb.inc(1);
+                                            return Some(FailureEntry {
+                                                dataset: dataset.clone(),
+                                                phase: "convert_disk_space".to_string(),
+                                                rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                                source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                                output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
+                                                error_message: format!(
+                                                    "insufficient free disk space for file preflight: available={} GiB required={} GiB",
+                                                    bytes_to_gib(free_bytes),
+                                                    bytes_to_gib(required_bytes)
+                                                ),
+                                                suggested_recovery: Some("Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string()),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
                                         pb.inc(1);
                                         return Some(FailureEntry {
                                             dataset: dataset.clone(),
@@ -6449,84 +6532,68 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
                                             rel_path: Some(pair.rel.to_string_lossy().to_string()),
                                             source_path: Some(pair.input_gz.to_string_lossy().to_string()),
                                             output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
-                                            error_message: format!(
-                                                "insufficient free disk space for file preflight: available={} GiB required={} GiB",
-                                                bytes_to_gib(free_bytes),
-                                                bytes_to_gib(required_bytes)
-                                            ),
+                                            error_message: format!("disk space check failed: {e:#}"),
                                             suggested_recovery: Some("Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string()),
                                         });
                                     }
                                 }
+                            }
+                            let out = convert_one(
+                                &duckdb_arc,
+                                pair,
+                                &schema_arc,
+                                &compression,
+                                row_group_rows,
+                                memory_mb,
+                                &extra_json_options,
+                            );
+                            pb.inc(1);
+                            match out {
+                                Ok(()) => {
+                                    try_log_dataset(
+                                        parquet_root.as_path(),
+                                        &dataset_name,
+                                        "convert",
+                                        &format!("file converted {}", pair.rel.to_string_lossy()),
+                                    );
+                                    None
+                                }
                                 Err(e) => {
-                                    pb.inc(1);
-                                    return Some(FailureEntry {
+                                    let msg = format!("{e:#}");
+                                    let suggestion = if msg.contains("Out of Memory Error") {
+                                        Some(format!(
+                                            "openalex-snapshot convert --root-dir {} --dataset {} --profile safe",
+                                            args.shared.root_dir.display(),
+                                            dataset
+                                        ))
+                                    } else {
+                                        Some("retry converting this single file via --input-file".to_string())
+                                    };
+                                    Some(FailureEntry {
                                         dataset: dataset.clone(),
-                                        phase: "convert_disk_space".to_string(),
+                                        phase: "convert_file".to_string(),
                                         rel_path: Some(pair.rel.to_string_lossy().to_string()),
                                         source_path: Some(pair.input_gz.to_string_lossy().to_string()),
                                         output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
-                                        error_message: format!("disk space check failed: {e:#}"),
-                                        suggested_recovery: Some("Free up disk space, or set skip_disk_check: true under convert: in your config, or pass --skip-disk-check to the convert/all command".to_string()),
-                                    });
+                                        error_message: msg,
+                                        suggested_recovery: suggestion,
+                                    })
                                 }
                             }
-                        }
-                        let out = convert_one(
-                            &duckdb_arc,
-                            pair,
-                            &schema_arc,
-                            &compression,
-                            row_group_rows,
-                            memory_mb,
-                            &extra_json_options,
-                        );
-                        pb.inc(1);
-                        match out {
-                            Ok(()) => {
-                                try_log_dataset(
-                                    parquet_root.as_path(),
-                                    &dataset_name,
-                                    "convert",
-                                    &format!("file converted {}", pair.rel.to_string_lossy()),
-                                );
-                                None
-                            }
-                            Err(e) => {
-                                let msg = format!("{e:#}");
-                                let suggestion = if msg.contains("Out of Memory Error") {
-                                    Some(format!(
-                                        "./target/release/openalex-snapshot convert --root-dir {} --dataset {} --profile safe --workers 1 --max-memory-mb 4096",
-                                        args.shared.root_dir.display(),
-                                        dataset
-                                    ))
-                                } else {
-                                    Some("retry converting this single file via --input-file".to_string())
-                                };
-                                Some(FailureEntry {
-                                    dataset: dataset.clone(),
-                                    phase: "convert_file".to_string(),
-                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
-                                    output_path: Some(pair.output_parquet.to_string_lossy().to_string()),
-                                    error_message: msg,
-                                    suggested_recovery: suggestion,
-                                })
-                            }
-                        }
-                    })
-                    .collect()
-            });
-            for f in results.into_iter().flatten() {
-                ds.failed += 1;
-                report.failures.push(f);
+                        })
+                        .collect()
+                });
+                for f in results.into_iter().flatten() {
+                    ds.failed += 1;
+                    report.failures.push(f);
+                }
+                ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+                let mut preview = report.clone();
+                preview.datasets.retain(|d| d.dataset != *dataset);
+                preview.datasets.push(ds.clone());
+                report_finalize(&mut preview);
+                let _ = write_run_reports(&args.shared.parquet_dir, &preview);
             }
-            ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
-            let mut preview = report.clone();
-            preview.datasets.retain(|d| d.dataset != *dataset);
-            preview.datasets.push(ds.clone());
-            report_finalize(&mut preview);
-            let _ = write_run_reports(&args.shared.parquet_dir, &preview);
         }
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -8054,7 +8121,8 @@ fn run_repair(args: RepairArgs, profiles_config: Option<&Path>) -> Result<()> {
     let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
     let allowed: BTreeSet<String> = datasets.iter().cloned().collect();
     let total_mb = detect_total_memory_mb();
-    let profile_registry = ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
+    let profile_registry =
+        ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
     let resolved_profile = profile_registry
         .get(&args.profile)
         .ok_or_else(|| profile_registry.unknown_profile_error(&args.profile))?
@@ -8232,17 +8300,43 @@ fn run_repair(args: RepairArgs, profiles_config: Option<&Path>) -> Result<()> {
             ds_targets.len() as u64,
             &format!("repair:{dataset}"),
         );
-        if let Some(mb) = tuning.memory_mb {
-            set_duckdb_memory_limit(mb.saturating_mul(tuning.workers));
-        }
+        // Spill directory (OnceLock-guarded; idempotent across strata + datasets).
         {
             let spill_dir = metadata_root(&args.shared.parquet_dir).join("duckdb_tmp");
             set_duckdb_temp_directory(&spill_dir);
         }
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(tuning.workers)
-            .build()
-            .context("failed to build rayon thread pool")?;
+
+        // Build FilePairs from repair targets so the planner can partition by gz size.
+        let repair_pairs: Vec<FilePair> = ds_targets
+            .iter()
+            .map(|t| FilePair {
+                input_gz: t.source_path.clone(),
+                output_parquet: t.output_path.clone(),
+                rel: t.rel.clone(),
+                gz_size_bytes: fs::metadata(&t.source_path).map(|m| m.len()).unwrap_or(0),
+            })
+            .collect();
+
+        let workers_override = if args.shared.workers == 0 {
+            None
+        } else {
+            Some(args.shared.workers)
+        };
+        let plan = build_convert_plan(
+            &args.profile,
+            workers_override,
+            args.max_memory_mb,
+            total_mb,
+            repair_pairs,
+            &profile_registry,
+        )?;
+        eprintln!(
+            "[repair] dataset={dataset} profile={} strata={} flat={}",
+            plan.profile_name,
+            plan.strata.len(),
+            plan.flat,
+        );
+
         let duckdb_arc = Arc::new(duckdb_bin.clone());
         let dataset_arc = Arc::new(dataset.clone());
         let snapshot_root_arc = Arc::new(args.shared.snapshot_dir.clone());
@@ -8264,114 +8358,135 @@ fn run_repair(args: RepairArgs, profiles_config: Option<&Path>) -> Result<()> {
             &dataset,
         )?));
 
-        for chunk in ds_targets.chunks(flush_every) {
-            let failures: Vec<Option<FailureEntry>> = pool.install(|| {
-                chunk
-                    .par_iter()
-                    .map(|t| {
-                        if t.output_path.exists() {
-                            if let Err(e) = fs::remove_file(&t.output_path) {
+        for (stratum_idx, stratum) in plan.strata.iter().enumerate() {
+            eprintln!(
+                "[repair] dataset={dataset} stratum {}/{}: files={} workers={} per_worker_mb={}",
+                stratum_idx + 1,
+                plan.strata.len(),
+                stratum.files.len(),
+                stratum.workers,
+                stratum.memory_mb,
+            );
+
+            set_duckdb_memory_limit(stratum.memory_mb.saturating_mul(stratum.workers));
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(stratum.workers)
+                .build()
+                .context("failed to build rayon thread pool")?;
+
+            let memory_mb = Some(stratum.memory_mb);
+
+            for chunk in stratum.files.chunks(flush_every) {
+                let failures: Vec<Option<FailureEntry>> = pool.install(|| {
+                    chunk
+                        .par_iter()
+                        .map(|pair| {
+                            if pair.output_parquet.exists() {
+                                if let Err(e) = fs::remove_file(&pair.output_parquet) {
+                                    pb.inc(1);
+                                    return Some(FailureEntry {
+                                        dataset: dataset_arc.to_string(),
+                                        phase: "repair_delete".to_string(),
+                                        rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                        source_path: Some(
+                                            pair.input_gz.to_string_lossy().to_string(),
+                                        ),
+                                        output_path: Some(
+                                            pair.output_parquet.to_string_lossy().to_string(),
+                                        ),
+                                        error_message: format!("{e:#}"),
+                                        suggested_recovery: Some(
+                                            "fix file permissions or remove file manually"
+                                                .to_string(),
+                                        ),
+                                    });
+                                }
+                            }
+
+                            if let Err(e) = convert_one(
+                                &duckdb_arc,
+                                pair,
+                                &columns_clause,
+                                &compression,
+                                row_group_rows,
+                                memory_mb,
+                                &extra_json_options,
+                            ) {
                                 pb.inc(1);
                                 return Some(FailureEntry {
                                     dataset: dataset_arc.to_string(),
-                                    phase: "repair_delete".to_string(),
-                                    rel_path: Some(t.rel.to_string_lossy().to_string()),
-                                    source_path: Some(t.source_path.to_string_lossy().to_string()),
-                                    output_path: Some(t.output_path.to_string_lossy().to_string()),
+                                    phase: "repair_convert".to_string(),
+                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                    output_path: Some(
+                                        pair.output_parquet.to_string_lossy().to_string(),
+                                    ),
                                     error_message: format!("{e:#}"),
                                     suggested_recovery: Some(
-                                        "fix file permissions or remove file manually".to_string(),
+                                        "retry with --profile safe (single-worker, max memory)"
+                                            .to_string(),
                                     ),
                                 });
                             }
-                        }
 
-                        let pair = FilePair {
-                            input_gz: t.source_path.clone(),
-                            output_parquet: t.output_path.clone(),
-                            rel: t.rel.clone(),
-                            gz_size_bytes: fs::metadata(&t.source_path)
-                                .map(|m| m.len())
-                                .unwrap_or(0),
-                        };
-                        if let Err(e) = convert_one(
-                            &duckdb_arc,
-                            &pair,
-                            &columns_clause,
-                            &compression,
-                            row_group_rows,
-                            tuning.memory_mb,
-                            &extra_json_options,
-                        ) {
+                            if let Err(e) = verify_file_metrics(
+                                &duckdb_arc,
+                                pair,
+                                VerifyMetadataLevel::Both,
+                                &source_metrics_arc,
+                                &parquet_metrics_arc,
+                                memory_mb,
+                            ) {
+                                pb.inc(1);
+                                return Some(FailureEntry {
+                                    dataset: dataset_arc.to_string(),
+                                    phase: "repair_verify".to_string(),
+                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
+                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
+                                    output_path: Some(
+                                        pair.output_parquet.to_string_lossy().to_string(),
+                                    ),
+                                    error_message: format!("{e:#}"),
+                                    suggested_recovery: Some(
+                                        "run verify for this file and inspect mismatch".to_string(),
+                                    ),
+                                });
+                            }
+                            try_log_dataset(
+                                parquet_root_arc.as_path(),
+                                &dataset_arc,
+                                "repair_convert",
+                                &format!("repaired {}", pair.rel.to_string_lossy()),
+                            );
+                            let _ = snapshot_root_arc;
                             pb.inc(1);
-                            return Some(FailureEntry {
-                                dataset: dataset_arc.to_string(),
-                                phase: "repair_convert".to_string(),
-                                rel_path: Some(t.rel.to_string_lossy().to_string()),
-                                source_path: Some(t.source_path.to_string_lossy().to_string()),
-                                output_path: Some(t.output_path.to_string_lossy().to_string()),
-                                error_message: format!("{e:#}"),
-                                suggested_recovery: Some(
-                                    "retry with --profile safe --workers 1 --max-memory-mb 4096"
-                                        .to_string(),
-                                ),
-                            });
-                        }
+                            None
+                        })
+                        .collect()
+                });
+                for f in failures.into_iter().flatten() {
+                    ds.failed += 1;
+                    report.failures.push(f);
+                }
+                let source_metrics = source_metrics_arc
+                    .lock()
+                    .map_err(|_| anyhow!("repair source metrics cache lock poisoned"))?
+                    .clone();
+                let parquet_metrics = parquet_metrics_arc
+                    .lock()
+                    .map_err(|_| anyhow!("repair parquet metrics cache lock poisoned"))?
+                    .clone();
+                save_source_metrics_cache(&args.shared.parquet_dir, &dataset, &source_metrics)?;
+                save_parquet_metrics_cache(&args.shared.parquet_dir, &dataset, &parquet_metrics)?;
 
-                        if let Err(e) = verify_file_metrics(
-                            &duckdb_arc,
-                            &pair,
-                            VerifyMetadataLevel::Both,
-                            &source_metrics_arc,
-                            &parquet_metrics_arc,
-                            tuning.memory_mb,
-                        ) {
-                            pb.inc(1);
-                            return Some(FailureEntry {
-                                dataset: dataset_arc.to_string(),
-                                phase: "repair_verify".to_string(),
-                                rel_path: Some(t.rel.to_string_lossy().to_string()),
-                                source_path: Some(t.source_path.to_string_lossy().to_string()),
-                                output_path: Some(t.output_path.to_string_lossy().to_string()),
-                                error_message: format!("{e:#}"),
-                                suggested_recovery: Some(
-                                    "run verify for this file and inspect mismatch".to_string(),
-                                ),
-                            });
-                        }
-                        try_log_dataset(
-                            parquet_root_arc.as_path(),
-                            &dataset_arc,
-                            "repair_convert",
-                            &format!("repaired {}", t.rel.to_string_lossy()),
-                        );
-                        let _ = snapshot_root_arc;
-                        pb.inc(1);
-                        None
-                    })
-                    .collect()
-            });
-            for f in failures.into_iter().flatten() {
-                ds.failed += 1;
-                report.failures.push(f);
+                ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+                let mut preview = report.clone();
+                preview.datasets.retain(|d| d.dataset != dataset);
+                preview.datasets.push(ds.clone());
+                report_finalize(&mut preview);
+                let _ = write_run_reports(&args.shared.parquet_dir, &preview);
             }
-            let source_metrics = source_metrics_arc
-                .lock()
-                .map_err(|_| anyhow!("repair source metrics cache lock poisoned"))?
-                .clone();
-            let parquet_metrics = parquet_metrics_arc
-                .lock()
-                .map_err(|_| anyhow!("repair parquet metrics cache lock poisoned"))?
-                .clone();
-            save_source_metrics_cache(&args.shared.parquet_dir, &dataset, &source_metrics)?;
-            save_parquet_metrics_cache(&args.shared.parquet_dir, &dataset, &parquet_metrics)?;
-
-            ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
-            let mut preview = report.clone();
-            preview.datasets.retain(|d| d.dataset != dataset);
-            preview.datasets.push(ds.clone());
-            report_finalize(&mut preview);
-            let _ = write_run_reports(&args.shared.parquet_dir, &preview);
         }
         pb.finish_with_message(format!("repair:{dataset} done"));
         ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
@@ -9147,10 +9262,7 @@ fn build_convert_plan(
 
     match def.kind {
         ProfileKind::Safe => {
-            let workers = workers_override
-                .map(|w| w.clamp(1, 2))
-                .unwrap_or(1)
-                .max(1);
+            let workers = workers_override.map(|w| w.clamp(1, 2)).unwrap_or(1).max(1);
             let memory_mb = if let Some(mb) = max_memory_mb_override {
                 mb
             } else {
@@ -9163,7 +9275,11 @@ fn build_convert_plan(
             Ok(ConvertPlan {
                 profile_name: profile_name.to_string(),
                 flat: true,
-                strata: vec![StratumPlan { workers, memory_mb, files: todo }],
+                strata: vec![StratumPlan {
+                    workers,
+                    memory_mb,
+                    files: todo,
+                }],
             })
         }
         ProfileKind::Stratified => {
@@ -9186,7 +9302,11 @@ fn build_convert_plan(
                 return Ok(ConvertPlan {
                     profile_name: profile_name.to_string(),
                     flat: true,
-                    strata: vec![StratumPlan { workers, memory_mb, files }],
+                    strata: vec![StratumPlan {
+                        workers,
+                        memory_mb,
+                        files,
+                    }],
                 });
             }
 
@@ -9214,7 +9334,7 @@ fn build_convert_plan(
             // backwards so the catch-all (most-risky big files) runs first.
             let plan_strata: Vec<StratumPlan> = strata_defs
                 .iter()
-                .zip(buckets.into_iter())
+                .zip(buckets)
                 .rev()
                 .filter(|(_, files)| !files.is_empty())
                 .map(|(sdef, files)| {
@@ -12468,4 +12588,3 @@ mod tests {
         );
     }
 }
-
