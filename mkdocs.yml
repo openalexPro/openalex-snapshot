@@ -12,7 +12,6 @@ nav:
       - verify_download: commands/verify_download.md
       - convert: commands/convert.md
       - verify_convert: commands/verify.md
-      - repair_convert: commands/repair.md
       - index: commands/index.md
       - verify_index: commands/verify_index.md
       - extract: commands/extract.md

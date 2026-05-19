@@ -6,22 +6,33 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ### Added
 
-- **Stratified profiles** for `convert` and `repair_convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.profiles.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
+- **`convert` auto-repair from the latest `verify_convert` report.**  On startup `convert`
+  reads `<root>/openalex-snapshot_metadata/reports/verify_convert-*.json` (most recent),
+  deletes any output parquet that report flagged (`phase ∈ { verify_metrics, convert_file }`),
+  and lets the normal *skip-if-exists* filter re-include those files in the convert pass.
+  Net effect: running `convert` a second time fixes whatever `verify_convert` flagged —
+  no separate `repair_convert` subcommand needed.  Default on; opt out per-run with
+  `--auto-repair=false`, in config with `convert.auto_repair: false`, or by passing
+  `--input-file` (which always takes precedence over the verify report).
+- **Stratified profiles** for `convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.profiles.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
 - New global flag `--profiles-config <path>` (auto-discovers `./openalex-snapshot.profiles.yaml`).  Built-in profile names always work without this file.
 - New `config --create-profiles` flag scaffolds a starter `profiles.yaml` auto-derived from the host's detected RAM.  The emitted profile is named `stratified-<RAM_GB>`, with workers + per-worker memory linearly scaled from the 36 GB baseline and capped so total memory never exceeds 55 % of system RAM (parallel) or 40 % (single-worker catch-all).
 - New `config --list-profiles` flag prints all built-in + user profiles with their strata as a table.
-- `convert` and `repair_convert` log per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.
+- `convert` logs per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.
 
 ### Changed
 
-- **Default profile for `convert` and `repair_convert` is now `safe`** (was `auto`).  Safe runs single-worker with generous per-worker memory (45 % of usable RAM, clamped 8–24 GiB on workers=1) and reliably handles the largest works files via DuckDB spill-to-disk.
+- `all` now loops `convert → verify_convert` (instead of `convert → verify_convert → repair_convert`) up to `--retry N` times.  Each retry uses convert's new auto-repair to delete and re-build the parquets the prior verify flagged.  `--retry`'s default is unchanged (1 extra attempt).
+- **Default profile for `convert` is now `safe`** (was `auto`).  Safe runs single-worker with generous per-worker memory (45 % of usable RAM, clamped 8–24 GiB on workers=1) and reliably handles the largest works files via DuckDB spill-to-disk.
 - `--workers N` on a stratified profile collapses the plan into a single flat pass with the largest stratum's memory.  Predictable: explicit flags always override.
-- `ConvertArgs::profile` and `RepairArgs::profile` are now `String` (was the `Profile` enum).  Profile names are resolved at runtime against the registry; unknown names produce a clear error listing the available profiles.
+- `ConvertArgs::profile` is now `String` (was the `Profile` enum).  Profile names are resolved at runtime against the registry; unknown names produce a clear error listing the available profiles.
 
 ### Removed
 
+- **The `repair_convert` subcommand is gone.**  Its work folds into `convert`'s auto-repair path (see Added).  Configs containing a `repair_convert:` section or `all.enable_repair_convert: ...` will now fail `config --verify` with `unknown field`.  Migration: delete those entries.  Scripts calling `openalex-snapshot repair_convert ...` should be rewritten as `openalex-snapshot convert ...` (no extra flags needed — auto-repair runs by default).
+- The `--from-verify-report <path>` flag is gone with the subcommand.  Auto-repair always uses the latest report under `reports/`.
 - The `Profile` enum (`Auto` / `Balanced` / `Fast`) is gone.  `safe` remains as a named built-in profile (`ProfileKind::Safe`); the other names are no longer accepted.  Existing configs containing `profile: auto|balanced|fast` will fail `config --verify` and produce a clear "unknown profile" error at runtime — replace with `safe` or `stratified-36`.
-- The `--profile` flag has been removed from all non-Convert/Repair subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`).  These commands now use a fixed light tuning (workers = min(detected_cpus, 4), memory = 8 GiB) with `--workers` / `--max-memory-mb` overrides — they don't benefit from profile tuning the way `convert` does.
+- The `--profile` flag has been removed from all non-Convert subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`).  These commands now use a fixed light tuning (workers = min(detected_cpus, 4), memory = 8 GiB) with `--workers` / `--max-memory-mb` overrides — they don't benefit from profile tuning the way `convert` does.
 - The `config --create fast` template mode is removed (the `fast` profile no longer exists).  Only `complete` and `safe` template modes remain.
 - Helper functions `resolve_tuning`, `resolve_tuning_with_total`, `auto_profile_memory_mb` are removed.  Two legacy unit tests covering them are gone.
 

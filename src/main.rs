@@ -42,7 +42,6 @@ This binary provides:
 - index: build *_id_idx.parquet lookup index (R build_corpus_index equivalent)
 - extract: extract rows by OpenAlex IDs using per-dataset indexes
 - verify_index: validate index integrity and coverage
-- repair_convert: re-convert files that failed prior verify runs
 - report: view stored reports
 - prune-reports: remove old report files
 - progress: monitor live status from reports/logs
@@ -79,11 +78,12 @@ extract (detailed):
   - resolves files via *_id_idx.parquet
   - writes one parquet output per dataset
 
-repair_convert (detailed):
-  - reads a verify report JSON
-  - selects file-level verify failures (phase=verify_metrics)
-  - deletes failed parquet files and re-converts only those files
-  - runs targeted re-verify for repaired files
+auto-repair (built into convert):
+  - on every run, convert reads the latest verify_convert report
+  - deletes any output parquet that verify flagged as bad
+  - the normal skip-if-exists filter then re-includes those files
+  - disable with `--auto-repair=false` (or per-config `convert.auto_repair: false`)
+  - ignored when --input-file is given (so ad-hoc single-file runs are predictable)
 
 download/verify_download (detailed):
   - default sync command:
@@ -98,10 +98,9 @@ Examples:
   openalex-snapshot verify_convert --root-dir /data --dataset works --scope dataset --metadata-level both
   openalex-snapshot schema --root-dir /data --dataset works --format arrow-r
   openalex-snapshot verify_schema --root-dir /data --dataset works
-  openalex-snapshot index --root-dir /data --dataset works --profile balanced
+  openalex-snapshot index --root-dir /data --dataset works
   openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
   openalex-snapshot verify_index --root-dir /data --dataset works
-  openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/openalex-snapshot_metadata/reports/verify_convert-123456.json
   openalex-snapshot report --root-dir /data --latest
   openalex-snapshot prune-reports --root-dir /data
   openalex-snapshot skills --root-dir /data
@@ -116,28 +115,6 @@ Examples:
   openalex-snapshot config --create-profiles      # scaffold profiles.yaml from detected RAM
   openalex-snapshot config --list-profiles        # show all available profiles
   openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
-";
-
-const REPAIR_LONG_ABOUT: &str = "\
-Repair parquet outputs based on verify report failures.
-
-Behavior:
-1) Reads a verify report JSON from --from-verify-report
-2) Selects actionable file failures with phase=verify_metrics
-3) Deletes mapped parquet output files (if present)
-4) Re-converts only selected source .gz files to parquet
-5) Re-verifies repaired files and records outcome
-
-Selection rules:
-  - only failures with phase=verify_metrics are eligible
-  - requires actionable source/output paths (or resolvable rel_path)
-  - deduplicates by output parquet file path
-  - optional --dataset filter limits selected repairs
-
-Output:
-  - shared run report schema written to:
-    <root>/openalex-snapshot_metadata/reports/repair_convert-<timestamp>.json
-  - non-zero exit if any repair/delete/re-verify failures remain
 ";
 
 const DOWNLOAD_LONG_ABOUT: &str = "\
@@ -291,11 +268,11 @@ Behavior:
 Default stage order:
   1) download
   2) verify_download
-  3) convert
-  4) verify_convert
-  5) repair_convert (loop action)
-  6) index
-  7) verify_index
+  3) convert  ──┐
+  4) verify_convert ┴── looped up to --retry times: convert auto-repairs any
+                       parquet flagged by the latest verify_convert report.
+  5) index
+  6) verify_index
 ";
 
 const INDEX_LONG_ABOUT: &str = "\
@@ -501,12 +478,6 @@ enum Commands {
         name = "verify_index"
     )]
     VerifyIndex(VerifyIndexArgs),
-    #[command(
-        about = "Repair failed files from a verify report.",
-        long_about = REPAIR_LONG_ABOUT,
-        name = "repair_convert"
-    )]
-    Repair(RepairArgs),
     #[command(about = "View stored reports.", long_about = REPORT_LONG_ABOUT)]
     Report(ReportArgs),
     #[command(about = "Prune old reports.", long_about = PRUNE_REPORTS_LONG_ABOUT)]
@@ -536,7 +507,9 @@ struct AllArgs {
     root_dir: PathBuf,
 
     #[arg(long, default_value_t = 1)]
-    #[arg(help = "Max number of repair_convert attempts after verify_convert failures")]
+    #[arg(
+        help = "Max number of extra `convert` retries when verify_convert reports failures (convert auto-repairs flagged parquets on each retry)"
+    )]
     retry: usize,
 
     #[arg(long, default_value_t = false)]
@@ -1078,6 +1051,12 @@ struct ConvertArgs {
     #[arg(long, default_value_t = 25)]
     #[arg(help = "Flush state/report every N items (for crash resilience)")]
     state_flush_every: usize,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(
+        help = "Auto-repair: at startup, read the latest verify_convert report and re-do any parquet it flagged (delete + reconvert). Default true. Disable with --auto-repair=false; ignored when --input-file is given."
+    )]
+    auto_repair: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -1266,44 +1245,6 @@ struct ExtractArgs {
     #[arg(long)]
     #[arg(help = "Output parquet base path (writes <base>_<dataset>.parquet)")]
     output: PathBuf,
-
-    #[arg(long)]
-    #[arg(
-        help = "Per-worker memory cap override in MB (auto-detected from system RAM if omitted)"
-    )]
-    max_memory_mb: Option<usize>,
-
-    #[arg(long, default_value_t = true)]
-    #[arg(help = "Show progress bars with rough ETA")]
-    progress: bool,
-
-    #[arg(long, default_value_t = false)]
-    #[arg(help = "Explain planned actions and exit without executing")]
-    explain: bool,
-
-    #[arg(long, default_value_t = 25)]
-    #[arg(help = "Flush state/report every N items (for crash resilience)")]
-    state_flush_every: usize,
-}
-
-#[derive(clap::Args, Debug, Clone)]
-#[command(about = "Repair failed files from a verify report")]
-#[command(long_about = REPAIR_LONG_ABOUT)]
-struct RepairArgs {
-    #[command(flatten)]
-    shared: SharedArgs,
-
-    #[arg(long)]
-    #[arg(
-        help = "Path to verify_convert report JSON; if omitted, the latest verify_convert report under <root>/openalex-snapshot_metadata/reports/ is used automatically"
-    )]
-    from_verify_report: Option<PathBuf>,
-
-    #[arg(long, default_value = "safe")]
-    #[arg(
-        help = "Performance/memory profile (default: safe). Built-in: safe, stratified-36 (fixed 36 GB baseline). For other RAM sizes run `config --create-profiles` to scaffold a tuned profiles.yaml."
-    )]
-    profile: String,
 
     #[arg(long)]
     #[arg(
@@ -1699,7 +1640,6 @@ struct AppConfig {
     schema: Option<SchemaConfig>,
     index: Option<IndexConfig>,
     extract: Option<ExtractConfig>,
-    repair_convert: Option<RepairConfig>,
     download: Option<DownloadConfig>,
     verify_download: Option<ValidateDownloadConfig>,
     verify_index: Option<VerifyIndexConfig>,
@@ -1716,7 +1656,6 @@ struct AllConfig {
     enable_verify_download: Option<bool>,
     enable_convert: Option<bool>,
     enable_verify_convert: Option<bool>,
-    enable_repair_convert: Option<bool>,
     enable_index: Option<bool>,
     enable_verify_index: Option<bool>,
     retry: Option<usize>,
@@ -1756,6 +1695,7 @@ struct ConvertConfig {
     skip_disk_check: Option<bool>,
     split_size: Option<String>,
     split_temp_dir: Option<PathBuf>,
+    auto_repair: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1817,20 +1757,6 @@ struct ExtractConfig {
     state_flush_every: Option<usize>,
     ids: Option<PathBuf>,
     output: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RepairConfig {
-    root_dir: Option<PathBuf>,
-    dataset: Option<String>,
-    workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
-    profile: Option<String>,
-    max_memory_mb: Option<usize>,
-    progress: Option<bool>,
-    state_flush_every: Option<usize>,
-    from_verify_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1963,8 +1889,14 @@ struct FilePair {
 #[derive(Debug, Clone)]
 struct RepairTarget {
     dataset: String,
+    /// Resolved snapshot source path (unused by auto-repair but kept for the
+    /// `test_collect_repair_targets_filters_and_dedups` test and as useful
+    /// context if the caller wants to log/inspect targets).
+    #[allow(dead_code)]
     source_path: PathBuf,
     output_path: PathBuf,
+    /// Relative path under the dataset; same use as `source_path`.
+    #[allow(dead_code)]
     rel: PathBuf,
 }
 
@@ -2175,13 +2107,6 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             run_extract(args)
-        }
-        Commands::Repair(mut args) => {
-            fill_shared_dirs(&mut args.shared);
-            apply_repair_config(&mut args, cfg.as_ref(), sub_matches);
-            fill_shared_dirs(&mut args.shared);
-            try_migrate_metadata_root(&args.shared.root_dir);
-            run_repair(args, cli.profiles_config.as_deref())
         }
         Commands::Download(mut args) => {
             fill_download_dirs(&mut args);
@@ -2572,6 +2497,11 @@ fn apply_convert_config(
                 args.split_temp_dir = Some(v.clone());
             }
         }
+        if !cli_explicit(matches, "auto_repair") {
+            if let Some(v) = c.auto_repair {
+                args.auto_repair = v;
+            }
+        }
     }
 }
 
@@ -2891,84 +2821,6 @@ fn apply_extract_config(
         if !cli_explicit(matches, "output") {
             if let Some(v) = &c.output {
                 args.output = v.clone();
-            }
-        }
-    }
-}
-
-fn apply_repair_config(
-    args: &mut RepairArgs,
-    cfg: Option<&AppConfig>,
-    matches: Option<&ArgMatches>,
-) {
-    let Some(cfg) = cfg else {
-        return;
-    };
-    if let Some(d) = &cfg.defaults {
-        apply_shared_defaults(&mut args.shared, d, matches);
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &d.profile {
-                args.profile = v.clone();
-            }
-        }
-        if !cli_explicit(matches, "max_memory_mb") {
-            args.max_memory_mb = d.max_memory_mb;
-        }
-        if !cli_explicit(matches, "progress") {
-            if let Some(v) = d.progress {
-                args.progress = v;
-            }
-        }
-        if !cli_explicit(matches, "state_flush_every") {
-            if let Some(v) = d.state_flush_every {
-                args.state_flush_every = v;
-            }
-        }
-    }
-    if let Some(c) = &cfg.repair_convert {
-        if !cli_explicit(matches, "root_dir") {
-            if let Some(v) = &c.root_dir {
-                args.shared.root_dir = v.clone();
-            }
-        }
-        if !cli_explicit(matches, "dataset") {
-            if let Some(v) = &c.dataset {
-                args.shared.dataset = v.clone();
-            }
-        }
-        if !cli_explicit(matches, "workers") {
-            if let Some(v) = c.workers {
-                args.shared.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.shared.duckdb_bin = Some(v.clone());
-            }
-        }
-        if !cli_explicit(matches, "profile") {
-            if let Some(v) = &c.profile {
-                args.profile = v.clone();
-            }
-        }
-        if !cli_explicit(matches, "max_memory_mb") {
-            if let Some(v) = c.max_memory_mb {
-                args.max_memory_mb = Some(v);
-            }
-        }
-        if !cli_explicit(matches, "progress") {
-            if let Some(v) = c.progress {
-                args.progress = v;
-            }
-        }
-        if !cli_explicit(matches, "state_flush_every") {
-            if let Some(v) = c.state_flush_every {
-                args.state_flush_every = v;
-            }
-        }
-        if !cli_explicit(matches, "from_verify_report") {
-            if let Some(v) = &c.from_verify_report {
-                args.from_verify_report = Some(v.clone());
             }
         }
     }
@@ -3539,10 +3391,9 @@ fn config_template_complete() -> String {
 # ---------------------------------------------------------------------------
 #   1) download
 #   2) verify_download
-#   3) convert
-#   4) verify_convert
-#   5) repair_convert (only if verify_convert fails)
-#   6) index
+#   3) convert        ──┐ looped: convert auto-repairs parquets flagged by
+#   4) verify_convert ──┘ the latest verify report, up to --retry attempts
+#   5) index
 #   7) verify_index
 #
 # Stages can be disabled in `all:` for partial/local workflows.
@@ -3598,8 +3449,10 @@ all:
   # Full pipeline orchestrator (openalex-snapshot all --config ...)
   # ---------------------------------------------------------------------------
 
-  # Max number of repair_convert attempts in verify/repair loop.
-  # 0 means: run verify_convert once and fail immediately on errors.
+  # Max number of extra `convert` retries when verify_convert reports
+  # failures.  Each retry uses convert's auto-repair to delete and re-convert
+  # the parquets flagged by the latest verify_convert report.  0 means: run
+  # verify_convert once and fail immediately on errors.
   # allowed values: integer >= 0
   retry: 1
 
@@ -3613,8 +3466,6 @@ all:
   enable_convert: true
   # allowed values: true | false
   enable_verify_convert: true
-  # allowed values: true | false
-  enable_repair_convert: true
   # allowed values: true | false
   enable_index: true
   # allowed values: true | false
@@ -3742,6 +3593,14 @@ convert:
   # allowed values: any valid path
   # split_temp_dir: /Volumes/openalex/.split_tmp
 
+  # Auto-repair: at startup, read the latest verify_convert report under
+  # <root>/openalex-snapshot_metadata/reports/ and delete any output parquet
+  # it flagged so the normal skip-if-exists filter re-includes it.  Effectively
+  # "run convert twice fixes things" after a verify failure.  Ignored when
+  # --input-file is given (so named-file runs stay predictable).
+  # allowed values: true | false
+  # auto_repair: true
+
 verify_convert:
   # ---------------------------------------------------------------------------
   # Verify converted parquet against snapshot source (integrity gate)
@@ -3767,26 +3626,6 @@ verify_convert:
   file_sample_n: 50
   # allowed values: integer >= 0
   seed: 42
-
-repair_convert:
-  # ---------------------------------------------------------------------------
-  # Repair failed conversion outputs based on verify_convert report
-  # Typical use: rerun only broken files after a failed verify_convert.
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: safe
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # Repair is driven by an existing verify_convert report.
-  # No corpus_dir here by design (root_dir + dataset model).
-  # allowed values: any valid report path
-  # from_verify_report: ./openalex-snapshot_metadata/reports/verify_convert-123456.json
 
 index:
   # ---------------------------------------------------------------------------
@@ -4179,10 +4018,7 @@ fn render_stratified_profiles_yaml(name: &str, ram_gb: usize, def: &ProfileDef) 
         "# Share this file across machines with similar RAM by copying it next to openalex-snapshot.yaml."
     );
     let _ = writeln!(s, "#");
-    let _ = writeln!(
-        s,
-        "# Reference the profile by name from `convert` / `repair_convert`:"
-    );
+    let _ = writeln!(s, "# Reference the profile by name from `convert`:");
     let _ = writeln!(s, "#   openalex-snapshot convert --profile {name} ...");
     let _ = writeln!(s);
     let _ = writeln!(s, "profiles:");
@@ -5268,7 +5104,6 @@ struct AllResolved {
     enable_verify_download: bool,
     enable_convert: bool,
     enable_verify_convert: bool,
-    enable_repair_convert: bool,
     enable_index: bool,
     enable_verify_index: bool,
     skip_disk_check: bool,
@@ -5285,7 +5120,6 @@ fn resolve_all_settings(args: &AllArgs, cfg: &AppConfig) -> AllResolved {
         enable_verify_download: c.enable_verify_download.unwrap_or(true),
         enable_convert: c.enable_convert.unwrap_or(true),
         enable_verify_convert: c.enable_verify_convert.unwrap_or(true),
-        enable_repair_convert: c.enable_repair_convert.unwrap_or(true),
         enable_index: c.enable_index.unwrap_or(true),
         enable_verify_index: c.enable_verify_index.unwrap_or(true),
         skip_disk_check,
@@ -5355,12 +5189,11 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
         println!("root_dir: {}", resolved.root_dir.display());
         println!("retry: {}", resolved.retry);
         println!(
-            "steps: download={} verify_download={} convert={} verify_convert={} repair_convert={} index={} verify_index={}",
+            "steps: download={} verify_download={} convert={} verify_convert={} index={} verify_index={}",
             resolved.enable_download,
             resolved.enable_verify_download,
             resolved.enable_convert,
             resolved.enable_verify_convert,
-            resolved.enable_repair_convert,
             resolved.enable_index,
             resolved.enable_verify_index
         );
@@ -5467,59 +5300,78 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
     }
 
     if resolved.enable_convert {
-        let mut ca = ConvertArgs {
-            shared: SharedArgs {
-                root_dir: resolved.root_dir.clone(),
-                snapshot_dir: PathBuf::new(),
-                parquet_dir: PathBuf::new(),
-                dataset: "all".to_string(),
-                workers: 0,
-                duckdb_bin: None,
-            },
-            profile: "safe".to_string(),
-            max_memory_mb: None,
-            row_group_rows: 100_000,
-            batch_rows: 5_000,
-            compression: "snappy".to_string(),
-            sample_size: 100,
-            input_files: Vec::new(),
-            progress: true,
-            seed: 42,
-            skip_disk_check: resolved.skip_disk_check,
-            disk_check_scope: DiskCheckScope::Dataset,
-            refresh_cache: false,
-            split_size: "0".to_string(),
-            split_temp_dir: None,
-            explain: false,
-            state_flush_every: 25,
-        };
-        fill_shared_dirs(&mut ca.shared);
-        apply_convert_config(&mut ca, Some(cfg), None);
-        fill_shared_dirs(&mut ca.shared);
-        // CLI --skip-disk-check always wins over config
-        if resolved.skip_disk_check {
-            ca.skip_disk_check = true;
-        }
-        record_all_step(
-            &mut report,
-            &mut step_failed,
-            &snapshot_dir,
-            &parquet_dir,
-            "convert",
-            run_convert(ca, profiles_config),
-            None,
-        );
-        if step_failed {
-            report_finalize(&mut report);
-            let _ = write_run_reports(&parquet_dir, &report);
-            bail!("[all] aborting after convert failure");
-        }
-    }
-
-    if resolved.enable_verify_convert {
+        // New flow (replaces the standalone repair_convert subcommand):
+        //   loop:
+        //     run convert  — auto-repair from latest verify_convert report (no-op on iter 1)
+        //     run verify   — if no failures, break
+        //     if attempts >= retry: break
+        //     attempts += 1
+        // The convert command reads the latest verify_convert report at startup
+        // and deletes any flagged parquets so the normal skip-if-exists filter
+        // re-includes them.  Each subsequent verify produces a fresh report that
+        // the next convert iteration sees.  `--retry N` caps the *additional*
+        // convert attempts after the first failed verify (default 1).
         let mut verify_ok = false;
         let mut attempts = 0usize;
         loop {
+            let mut ca = ConvertArgs {
+                shared: SharedArgs {
+                    root_dir: resolved.root_dir.clone(),
+                    snapshot_dir: PathBuf::new(),
+                    parquet_dir: PathBuf::new(),
+                    dataset: "all".to_string(),
+                    workers: 0,
+                    duckdb_bin: None,
+                },
+                profile: "safe".to_string(),
+                max_memory_mb: None,
+                row_group_rows: 100_000,
+                batch_rows: 5_000,
+                compression: "snappy".to_string(),
+                sample_size: 100,
+                input_files: Vec::new(),
+                progress: true,
+                seed: 42,
+                skip_disk_check: resolved.skip_disk_check,
+                disk_check_scope: DiskCheckScope::Dataset,
+                refresh_cache: false,
+                split_size: "0".to_string(),
+                split_temp_dir: None,
+                explain: false,
+                state_flush_every: 25,
+                auto_repair: true,
+            };
+            fill_shared_dirs(&mut ca.shared);
+            apply_convert_config(&mut ca, Some(cfg), None);
+            fill_shared_dirs(&mut ca.shared);
+            // CLI --skip-disk-check always wins over config
+            if resolved.skip_disk_check {
+                ca.skip_disk_check = true;
+            }
+            record_all_step(
+                &mut report,
+                &mut step_failed,
+                &snapshot_dir,
+                &parquet_dir,
+                "convert",
+                run_convert(ca, profiles_config),
+                if attempts == 0 {
+                    None
+                } else {
+                    Some(format!("attempt={}", attempts + 1))
+                },
+            );
+            if step_failed {
+                report_finalize(&mut report);
+                let _ = write_run_reports(&parquet_dir, &report);
+                bail!("[all] aborting after convert failure");
+            }
+
+            if !resolved.enable_verify_convert {
+                verify_ok = true; // verify is disabled, nothing to retry against
+                break;
+            }
+
             let mut va = VerifyArgs {
                 shared: SharedArgs {
                     root_dir: resolved.root_dir.clone(),
@@ -5556,47 +5408,12 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
                 verify_ok = true;
                 break;
             }
-            if !resolved.enable_repair_convert || attempts >= resolved.retry {
+            if attempts >= resolved.retry {
                 break;
             }
             attempts += 1;
-            let report_path =
-                latest_report_path_for_command(&snapshot_dir, &parquet_dir, "verify_convert")
-                    .ok_or_else(|| {
-                        anyhow!("[all] cannot locate latest verify_convert report for repair loop")
-                    })?;
-            let mut ra = RepairArgs {
-                shared: SharedArgs {
-                    root_dir: resolved.root_dir.clone(),
-                    snapshot_dir: PathBuf::new(),
-                    parquet_dir: PathBuf::new(),
-                    dataset: "all".to_string(),
-                    workers: 0,
-                    duckdb_bin: None,
-                },
-                from_verify_report: Some(report_path.clone()),
-                profile: "safe".to_string(),
-                max_memory_mb: None,
-                progress: true,
-                explain: false,
-                state_flush_every: 25,
-            };
-            fill_shared_dirs(&mut ra.shared);
-            apply_repair_config(&mut ra, Some(cfg), None);
-            fill_shared_dirs(&mut ra.shared);
-            // Always repair from loop-selected verify report.
-            ra.from_verify_report = Some(report_path);
-            record_all_step(
-                &mut report,
-                &mut step_failed,
-                &snapshot_dir,
-                &parquet_dir,
-                "repair_convert",
-                run_repair(ra, profiles_config),
-                Some(format!("attempt={}", attempts)),
-            );
         }
-        if !verify_ok {
+        if resolved.enable_verify_convert && !verify_ok {
             report.failures.push(FailureEntry {
                 dataset: "all".to_string(),
                 phase: "all_verify_repair_loop".to_string(),
@@ -5604,16 +5421,17 @@ fn run_all(args: AllArgs, cfg: &AppConfig, profiles_config: Option<&Path>) -> Re
                 source_path: None,
                 output_path: None,
                 error_message: format!(
-                    "verify_convert did not pass after {} repair attempt(s)",
+                    "verify_convert did not pass after {} convert retry attempt(s)",
                     resolved.retry
                 ),
                 suggested_recovery: Some(
-                    "rerun repair_convert manually with higher memory profile".to_string(),
+                    "investigate the latest verify_convert report and rerun `convert` (auto-repair) with a more generous --profile or split-size"
+                        .to_string(),
                 ),
             });
             report_finalize(&mut report);
             let _ = write_run_reports(&parquet_dir, &report);
-            bail!("[all] verify/repair loop exhausted");
+            bail!("[all] verify/retry loop exhausted");
         }
     }
 
@@ -6095,6 +5913,28 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
         },
         args.max_memory_mb,
     );
+
+    // Capture auto-repair targets BEFORE `archive_completed_run` moves the
+    // latest verify_convert report out of `reports/` into archived/.  The
+    // per-dataset loop below consumes these to delete the flagged parquets.
+    let auto_repair_targets_by_dataset: std::collections::HashMap<String, Vec<RepairTarget>> =
+        if args.auto_repair && args.input_files.is_empty() {
+            let all_allowed: BTreeSet<String> = datasets.iter().cloned().collect();
+            let all_targets = verify_failures_for_repair(
+                &args.shared.snapshot_dir,
+                &args.shared.parquet_dir,
+                &all_allowed,
+            );
+            let mut by_ds: std::collections::HashMap<String, Vec<RepairTarget>> =
+                std::collections::HashMap::new();
+            for t in all_targets {
+                by_ds.entry(t.dataset.clone()).or_default().push(t);
+            }
+            by_ds
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
@@ -6204,6 +6044,46 @@ fn run_convert(args: ConvertArgs, profiles_config: Option<&Path>) -> Result<()> 
             continue;
         }
         let pairs_len = pairs.len();
+
+        // Auto-repair: use the cached verify_convert targets (captured BEFORE
+        // archive_completed_run moved the report) to delete any output parquet
+        // flagged for this dataset.  The normal skip-if-exists filter below
+        // then re-includes those files.  Disabled by `--auto-repair=false` or
+        // when the user named specific files via `--input-file`.
+        if args.auto_repair && args.input_files.is_empty() {
+            let force_outputs: std::collections::HashSet<PathBuf> = auto_repair_targets_by_dataset
+                .get(dataset.as_str())
+                .map(|ts| ts.iter().map(|t| t.output_path.clone()).collect())
+                .unwrap_or_default();
+            let mut auto_repaired = 0usize;
+            for p in &pairs {
+                if force_outputs.contains(&p.output_parquet) && p.output_parquet.exists() {
+                    if let Err(e) = fs::remove_file(&p.output_parquet) {
+                        eprintln!(
+                            "[convert] auto-repair: could not delete {} ({e}); leaving it for the next run",
+                            p.output_parquet.display()
+                        );
+                    } else {
+                        auto_repaired += 1;
+                    }
+                }
+            }
+            if auto_repaired > 0 {
+                eprintln!(
+                    "[convert] dataset={dataset} auto-repair: re-doing {} file(s) flagged by latest verify_convert report",
+                    auto_repaired
+                );
+                try_log_dataset(
+                    &args.shared.parquet_dir,
+                    dataset,
+                    "convert",
+                    &format!(
+                        "auto-repair from latest verify_convert report: deleted {} parquet(s) for reconversion",
+                        auto_repaired
+                    ),
+                );
+            }
+        }
 
         let mut todo: Vec<FilePair> = pairs
             .into_iter()
@@ -8075,470 +7955,6 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
     Ok(())
 }
 
-fn explain_repair(
-    args: &RepairArgs,
-    verify_report_path: &Path,
-    datasets: &[String],
-    duckdb_bin: &Path,
-    tuning: &Tuning,
-) -> Result<()> {
-    let txt = fs::read_to_string(verify_report_path).with_context(|| {
-        format!(
-            "failed to read verify report {}",
-            verify_report_path.display()
-        )
-    })?;
-    let verify_report: RunReport = serde_json::from_str(&txt).with_context(|| {
-        format!(
-            "failed to parse verify report {}",
-            verify_report_path.display()
-        )
-    })?;
-    let targets = collect_repair_targets(
-        &verify_report,
-        &datasets.iter().cloned().collect::<BTreeSet<_>>(),
-        &args.shared.snapshot_dir,
-        &args.shared.parquet_dir,
-    );
-    println!("--explain: repair_convert");
-    println!("duckdb_bin: {}", duckdb_bin.display());
-    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
-    println!("parquet_dir: {}", args.shared.parquet_dir.display());
-    println!("from_verify_report: {}", verify_report_path.display());
-    println!("datasets filter: {}", datasets.join(", "));
-    println!("workers: {}", tuning.workers);
-    println!("memory_mb: {:?}", tuning.memory_mb);
-    println!("state_flush_every: {}", args.state_flush_every);
-    println!("selected_files: {}", targets.len());
-    println!("post_verify: targeted file-level verify enabled");
-    Ok(())
-}
-
-fn resolve_verify_report_path(args: &RepairArgs) -> Result<PathBuf> {
-    if let Some(p) = &args.from_verify_report {
-        return Ok(p.clone());
-    }
-    let reports_dir = global_reports_dir(&args.shared.parquet_dir);
-    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "verify_convert") {
-        return Ok(p);
-    }
-    if let Some(p) = latest_report_for_command(&args.shared.parquet_dir, "convert") {
-        eprintln!(
-            "[repair] no verify_convert report found; using convert report: {}",
-            p.display()
-        );
-        return Ok(p);
-    }
-    bail!(
-        "no verify_convert or convert report found under {}; run convert or verify_convert first, or pass --from-verify-report",
-        reports_dir.display()
-    )
-}
-
-fn run_repair(args: RepairArgs, profiles_config: Option<&Path>) -> Result<()> {
-    let duckdb_bin = duckdb_bin(&args.shared);
-    let datasets = resolve_datasets(&args.shared.snapshot_dir, &args.shared.dataset)?;
-    let allowed: BTreeSet<String> = datasets.iter().cloned().collect();
-    let total_mb = detect_total_memory_mb();
-    let profile_registry =
-        ProfileRegistry::load(discover_profiles_config(profiles_config).as_deref())?;
-    let resolved_profile = profile_registry
-        .get(&args.profile)
-        .ok_or_else(|| profile_registry.unknown_profile_error(&args.profile))?
-        .clone();
-    let tuning = representative_tuning(
-        &args.profile,
-        &resolved_profile,
-        args.shared.workers,
-        args.max_memory_mb,
-        total_mb,
-    );
-    let verify_report_path = resolve_verify_report_path(&args)?;
-
-    if args.explain {
-        explain_repair(&args, &verify_report_path, &datasets, &duckdb_bin, &tuning)?;
-        return Ok(());
-    }
-    let _lock = acquire_lock(&args.shared.parquet_dir, "repair")?;
-    // Do NOT archive here — repair reads an existing verify report
-    let _ = cleanup_command_reports(&args.shared.parquet_dir, "repair_convert");
-    let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "repair_convert");
-
-    let mut report_args = BTreeMap::new();
-    report_args.insert("dataset".to_string(), args.shared.dataset.clone());
-    report_args.insert(
-        "from_verify_report".to_string(),
-        verify_report_path.to_string_lossy().to_string(),
-    );
-    report_args.insert("workers".to_string(), tuning.workers.to_string());
-    report_args.insert("memory_mb".to_string(), format!("{:?}", tuning.memory_mb));
-    report_args.insert(
-        "state_flush_every".to_string(),
-        args.state_flush_every.to_string(),
-    );
-    let mut report = report_new("repair_convert", report_args);
-    let flush_every = args.state_flush_every.max(1);
-
-    let verify_report: RunReport = match fs::read_to_string(&verify_report_path)
-        .with_context(|| {
-            format!(
-                "failed to read verify report {}",
-                verify_report_path.display()
-            )
-        })
-        .and_then(|txt| {
-            serde_json::from_str(&txt).with_context(|| {
-                format!(
-                    "failed to parse verify report {}",
-                    verify_report_path.display()
-                )
-            })
-        }) {
-        Ok(v) => v,
-        Err(e) => {
-            report.failures.push(FailureEntry {
-                dataset: args.shared.dataset.clone(),
-                phase: "repair_report_parse".to_string(),
-                rel_path: None,
-                source_path: Some(verify_report_path.to_string_lossy().to_string()),
-                output_path: None,
-                error_message: format!("{e:#}"),
-                suggested_recovery: Some("provide a valid verify report JSON".to_string()),
-            });
-            report_finalize(&mut report);
-            let _ = write_run_reports(&args.shared.parquet_dir, &report);
-            bail!("[repair] failed to parse verify report");
-        }
-    };
-
-    for f in &verify_report.failures {
-        if f.phase != "verify_metrics" || !allowed.contains(&f.dataset) {
-            continue;
-        }
-        let has_source = f
-            .source_path
-            .as_ref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        let has_output = f
-            .output_path
-            .as_ref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        let has_rel = f.rel_path.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-        if !(has_rel || has_source && has_output) {
-            report.failures.push(FailureEntry {
-                dataset: f.dataset.clone(),
-                phase: "repair_select".to_string(),
-                rel_path: f.rel_path.clone(),
-                source_path: f.source_path.clone(),
-                output_path: f.output_path.clone(),
-                error_message: "verify failure entry is not actionable (missing paths)".to_string(),
-                suggested_recovery: Some(
-                    "rerun verify to generate complete failure paths".to_string(),
-                ),
-            });
-        }
-    }
-
-    let targets = collect_repair_targets(
-        &verify_report,
-        &allowed,
-        &args.shared.snapshot_dir,
-        &args.shared.parquet_dir,
-    );
-    if targets.is_empty() {
-        eprintln!("[repair] no eligible verify failures found in report");
-        report_finalize(&mut report);
-        let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
-        eprintln!(
-            "[repair] summary scanned=0 ok=0 failed=0 reports={}",
-            report_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        return Ok(());
-    }
-
-    let mut by_dataset: BTreeMap<String, Vec<RepairTarget>> = BTreeMap::new();
-    for t in targets {
-        by_dataset.entry(t.dataset.clone()).or_default().push(t);
-    }
-
-    for (dataset, ds_targets) in by_dataset {
-        try_log_dataset(
-            &args.shared.parquet_dir,
-            &dataset,
-            "repair_convert",
-            &format!(
-                "start files={} workers={} memory_mb={:?}",
-                ds_targets.len(),
-                tuning.workers,
-                tuning.memory_mb
-            ),
-        );
-        let mut ds = DatasetReportSummary {
-            dataset: dataset.clone(),
-            items_scanned: ds_targets.len() as u64,
-            ..Default::default()
-        };
-        let schema = match load_or_infer_source_schema(
-            &duckdb_bin,
-            &args.shared.snapshot_dir,
-            &args.shared.parquet_dir,
-            &dataset,
-            100,
-            false,
-            tuning.memory_mb,
-            tuning.workers,
-            args.state_flush_every,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                ds.failed = ds.items_scanned;
-                report.failures.push(FailureEntry {
-                    dataset: dataset.clone(),
-                    phase: "repair_select".to_string(),
-                    rel_path: None,
-                    source_path: None,
-                    output_path: None,
-                    error_message: format!("{e:#}"),
-                    suggested_recovery: Some("refresh schema cache and retry repair".to_string()),
-                });
-                report.datasets.push(ds);
-                report_finalize(&mut report);
-                let _ = write_run_reports(&args.shared.parquet_dir, &report);
-                continue;
-            }
-        };
-        let columns_clause = Arc::new(to_duckdb_columns_clause(&schema.fields));
-        let pb = make_progress_bar(
-            args.progress,
-            ds_targets.len() as u64,
-            &format!("repair:{dataset}"),
-        );
-        // Spill directory (OnceLock-guarded; idempotent across strata + datasets).
-        {
-            let spill_dir = metadata_root(&args.shared.parquet_dir).join("duckdb_tmp");
-            set_duckdb_temp_directory(&spill_dir);
-        }
-
-        // Build FilePairs from repair targets so the planner can partition by gz size.
-        let repair_pairs: Vec<FilePair> = ds_targets
-            .iter()
-            .map(|t| FilePair {
-                input_gz: t.source_path.clone(),
-                output_parquet: t.output_path.clone(),
-                rel: t.rel.clone(),
-                gz_size_bytes: fs::metadata(&t.source_path).map(|m| m.len()).unwrap_or(0),
-            })
-            .collect();
-
-        let workers_override = if args.shared.workers == 0 {
-            None
-        } else {
-            Some(args.shared.workers)
-        };
-        let plan = build_convert_plan(
-            &args.profile,
-            workers_override,
-            args.max_memory_mb,
-            total_mb,
-            repair_pairs,
-            &profile_registry,
-        )?;
-        eprintln!(
-            "[repair] dataset={dataset} profile={} strata={} flat={}",
-            plan.profile_name,
-            plan.strata.len(),
-            plan.flat,
-        );
-
-        let duckdb_arc = Arc::new(duckdb_bin.clone());
-        let dataset_arc = Arc::new(dataset.clone());
-        let snapshot_root_arc = Arc::new(args.shared.snapshot_dir.clone());
-        let parquet_root_arc = Arc::new(args.shared.parquet_dir.clone());
-        let extra_json_options = if dataset == "works" {
-            ", maximum_object_size=1000000000".to_string()
-        } else {
-            "".to_string()
-        };
-        let compression = "snappy".to_string();
-        let row_group_rows = 100_000usize;
-
-        let source_metrics_arc = Arc::new(std::sync::Mutex::new(load_source_metrics_cache(
-            &args.shared.parquet_dir,
-            &dataset,
-        )?));
-        let parquet_metrics_arc = Arc::new(std::sync::Mutex::new(load_parquet_metrics_cache(
-            &args.shared.parquet_dir,
-            &dataset,
-        )?));
-
-        for (stratum_idx, stratum) in plan.strata.iter().enumerate() {
-            eprintln!(
-                "[repair] dataset={dataset} stratum {}/{}: files={} workers={} per_worker_mb={}",
-                stratum_idx + 1,
-                plan.strata.len(),
-                stratum.files.len(),
-                stratum.workers,
-                stratum.memory_mb,
-            );
-
-            set_duckdb_memory_limit(stratum.memory_mb.saturating_mul(stratum.workers));
-
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(stratum.workers)
-                .build()
-                .context("failed to build rayon thread pool")?;
-
-            let memory_mb = Some(stratum.memory_mb);
-
-            for chunk in stratum.files.chunks(flush_every) {
-                let failures: Vec<Option<FailureEntry>> = pool.install(|| {
-                    chunk
-                        .par_iter()
-                        .map(|pair| {
-                            if pair.output_parquet.exists() {
-                                if let Err(e) = fs::remove_file(&pair.output_parquet) {
-                                    pb.inc(1);
-                                    return Some(FailureEntry {
-                                        dataset: dataset_arc.to_string(),
-                                        phase: "repair_delete".to_string(),
-                                        rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                                        source_path: Some(
-                                            pair.input_gz.to_string_lossy().to_string(),
-                                        ),
-                                        output_path: Some(
-                                            pair.output_parquet.to_string_lossy().to_string(),
-                                        ),
-                                        error_message: format!("{e:#}"),
-                                        suggested_recovery: Some(
-                                            "fix file permissions or remove file manually"
-                                                .to_string(),
-                                        ),
-                                    });
-                                }
-                            }
-
-                            if let Err(e) = convert_one(
-                                &duckdb_arc,
-                                pair,
-                                &columns_clause,
-                                &compression,
-                                row_group_rows,
-                                memory_mb,
-                                &extra_json_options,
-                            ) {
-                                pb.inc(1);
-                                return Some(FailureEntry {
-                                    dataset: dataset_arc.to_string(),
-                                    phase: "repair_convert".to_string(),
-                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
-                                    output_path: Some(
-                                        pair.output_parquet.to_string_lossy().to_string(),
-                                    ),
-                                    error_message: format!("{e:#}"),
-                                    suggested_recovery: Some(
-                                        "retry with --profile safe (single-worker, max memory)"
-                                            .to_string(),
-                                    ),
-                                });
-                            }
-
-                            if let Err(e) = verify_file_metrics(
-                                &duckdb_arc,
-                                pair,
-                                VerifyMetadataLevel::Both,
-                                &source_metrics_arc,
-                                &parquet_metrics_arc,
-                                memory_mb,
-                            ) {
-                                pb.inc(1);
-                                return Some(FailureEntry {
-                                    dataset: dataset_arc.to_string(),
-                                    phase: "repair_verify".to_string(),
-                                    rel_path: Some(pair.rel.to_string_lossy().to_string()),
-                                    source_path: Some(pair.input_gz.to_string_lossy().to_string()),
-                                    output_path: Some(
-                                        pair.output_parquet.to_string_lossy().to_string(),
-                                    ),
-                                    error_message: format!("{e:#}"),
-                                    suggested_recovery: Some(
-                                        "run verify for this file and inspect mismatch".to_string(),
-                                    ),
-                                });
-                            }
-                            try_log_dataset(
-                                parquet_root_arc.as_path(),
-                                &dataset_arc,
-                                "repair_convert",
-                                &format!("repaired {}", pair.rel.to_string_lossy()),
-                            );
-                            let _ = snapshot_root_arc;
-                            pb.inc(1);
-                            None
-                        })
-                        .collect()
-                });
-                for f in failures.into_iter().flatten() {
-                    ds.failed += 1;
-                    report.failures.push(f);
-                }
-                let source_metrics = source_metrics_arc
-                    .lock()
-                    .map_err(|_| anyhow!("repair source metrics cache lock poisoned"))?
-                    .clone();
-                let parquet_metrics = parquet_metrics_arc
-                    .lock()
-                    .map_err(|_| anyhow!("repair parquet metrics cache lock poisoned"))?
-                    .clone();
-                save_source_metrics_cache(&args.shared.parquet_dir, &dataset, &source_metrics)?;
-                save_parquet_metrics_cache(&args.shared.parquet_dir, &dataset, &parquet_metrics)?;
-
-                ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
-                let mut preview = report.clone();
-                preview.datasets.retain(|d| d.dataset != dataset);
-                preview.datasets.push(ds.clone());
-                report_finalize(&mut preview);
-                let _ = write_run_reports(&args.shared.parquet_dir, &preview);
-            }
-        }
-        pb.finish_with_message(format!("repair:{dataset} done"));
-        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
-        report.datasets.push(ds.clone());
-        try_log_dataset(
-            &args.shared.parquet_dir,
-            &dataset,
-            "repair_convert",
-            &format!("done files={} failed={}", ds.items_scanned, ds.failed),
-        );
-        report_finalize(&mut report);
-        let _ = write_run_reports(&args.shared.parquet_dir, &report);
-    }
-
-    report_finalize(&mut report);
-    let report_paths = write_run_reports(&args.shared.parquet_dir, &report)?;
-    eprintln!(
-        "[repair] summary scanned={} ok={} failed={} reports={}",
-        report.totals_items_scanned,
-        report.totals_succeeded,
-        report.totals_failed,
-        report_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    if report.totals_failed > 0 {
-        bail!("[repair] failures detected: {}", report.totals_failed);
-    }
-    Ok(())
-}
-
 fn run_download(args: DownloadArgs) -> Result<()> {
     ensure_aws_cli(&args.aws_bin)?;
     fs::create_dir_all(&args.snapshot_dir)?;
@@ -9261,7 +8677,7 @@ struct ConvertPlan {
 }
 
 #[allow(dead_code)]
-/// Build the execution plan for `run_convert` / `run_repair`.
+/// Build the execution plan for `run_convert`.
 ///
 /// Behaviour by profile kind:
 ///   - Safe: one stratum.  Workers clamped to [1, 2].  Memory derived from RAM
@@ -9655,6 +9071,42 @@ fn collect_repair_targets(
         }
     }
     out
+}
+
+/// Auto-repair entry point used by `run_convert`.  Best-effort: returns empty
+/// when no verify_convert report exists, when it can't be parsed, or when no
+/// failures in it match the datasets being converted.  Never errors — failures
+/// here just mean the normal skip-if-exists logic runs unchanged.
+///
+/// Used to replace the standalone `repair_convert` subcommand: convert now
+/// reads the latest verify report at startup and includes flagged parquets in
+/// its `todo` list.
+fn verify_failures_for_repair(
+    snapshot_dir: &Path,
+    parquet_dir: &Path,
+    allowed_datasets: &BTreeSet<String>,
+) -> Vec<RepairTarget> {
+    let Some(report_path) = latest_report_for_command(parquet_dir, "verify_convert") else {
+        return Vec::new();
+    };
+    let Ok(txt) = fs::read_to_string(&report_path) else {
+        eprintln!(
+            "[convert] auto-repair: could not read latest verify_convert report at {} — skipping",
+            report_path.display()
+        );
+        return Vec::new();
+    };
+    let report: RunReport = match serde_json::from_str(&txt) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[convert] auto-repair: latest verify_convert report at {} failed to parse ({e:#}) — skipping",
+                report_path.display()
+            );
+            return Vec::new();
+        }
+    };
+    collect_repair_targets(&report, allowed_datasets, snapshot_dir, parquet_dir)
 }
 
 fn resolve_report_path_for_root(
@@ -10613,7 +10065,7 @@ These skills help AI coding agents operate and develop `openalex-snapshot` safel
 `openalex-snapshot` is a root-dir-first CLI for OpenAlex snapshot workflows:
 
 1. `download` / `verify_download`
-2. `convert` / `verify_convert` / `repair_convert`
+2. `convert` (with built-in auto-repair from verify report) / `verify_convert`
 3. `index` / `verify_index`
 4. `extract`
 5. `schema` / `verify_schema`
@@ -10691,8 +10143,9 @@ openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
 # Extract by IDs
 openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.parquet>
 
-# Repair from verify report
-openalex-snapshot repair_convert --root-dir <root> --from-verify-report <report.json>
+# Repair failed files: just run convert again — it auto-repairs anything flagged
+# by the latest verify_convert report.
+openalex-snapshot convert --root-dir <root> --dataset works
 
 # Scaffold a custom profiles.yaml auto-derived from this host's RAM
 openalex-snapshot config --create-profiles
@@ -10704,10 +10157,10 @@ openalex-snapshot config --list-profiles
 ## Failure Handling
 - On non-zero exit, inspect latest report: `report --latest --full`.
 - Datasets with failures are marked `!` in the default report view.
-- Use `repair_convert` for verify-driven reconversion.
+- For verify-driven reconversion: just re-run `convert` (auto-repair is on by default).
 
 ## Decision rules
-- Default profile is `safe` for `convert` / `repair_convert`: single worker, generous per-worker memory (~45% of usable RAM, clamped 8–24 GiB on single-worker mode).  Works on any host; the most reliable choice for the worst-case files.
+- Default profile is `safe` for `convert`: single worker, generous per-worker memory (~45% of usable RAM, clamped 8–24 GiB on single-worker mode).  Works on any host; the most reliable choice for the worst-case files.
 - On a 32+ GB host, use `--profile stratified-36` for a faster run: it partitions the file list by gz size (4-/3-/2-/1-worker buckets) and runs one rayon pass per bucket.
 - Custom RAM tiers (e.g. 16 GB, 64 GB) need a user-supplied `openalex-snapshot.profiles.yaml` — see [`docs/commands/convert.md`](../../docs/commands/convert.md#custom-profiles-via-profilesyaml).
 - To isolate a single problematic file: repeated `--input-file` on `convert`.
@@ -10731,18 +10184,17 @@ Execute the recommended end-to-end flow safely.
 1. `check`
 2. `download`
 3. `verify_download`
-4. `convert`
-5. `verify_convert`
-6. `repair_convert` (only when verify reports failures)
-7. `index`
-8. `verify_index`
-9. `extract`
+4. `convert`            ──┐ looped by `all` up to --retry times:
+5. `verify_convert`  ──┘ convert auto-repairs anything verify flagged
+6. `index`
+7. `verify_index`
+8. `extract`
 
 ## Auto orchestration (recommended)
 ```bash
 openalex-snapshot all --config <path> --retry 2
 ```
-Runs all enabled stages in order with a bounded verify/repair loop.
+Runs all enabled stages in order with a bounded convert/verify loop.
 Edit `all:` section in the config to disable stages you don't need (e.g. `enable_download: false`).
 
 ## Local snapshot already present (skip download)
@@ -10759,7 +10211,7 @@ openalex-snapshot verify_index --root-dir <root>
 - For other RAM tiers, supply a user-defined profile in `openalex-snapshot.profiles.yaml` (sibling to the main config or via `--profiles-config`).
 - Use `--dataset <name>` to rerun a single dataset without touching others.
 - Check `report --latest` after each stage to confirm success before proceeding.
-- Keep reports: they drive `repair_convert` and provide audit trails.
+- Keep reports: they drive convert's auto-repair and provide audit trails.
 "#
             .to_string(),
         ),
@@ -10775,7 +10227,7 @@ Triage failures using metadata and reports.
 2. `openalex-snapshot --config <cfg> report --latest --full` — full JSON for root cause
 3. `progress --once` — check if a run is still live
 4. Run targeted command with `--explain` to preview what it would do
-5. Rerun failed dataset or use `repair_convert` as indicated
+5. Rerun the failed dataset with `convert` — auto-repair (default) re-does whatever the latest verify flagged
 
 ## Common Traps
 - Wrong `root-dir` (snapshot/parquet/metadata dirs won't be found)
@@ -10786,7 +10238,7 @@ Triage failures using metadata and reports.
 ## Failure phase hints
 - `check_dependency`: missing `aws` binary (duckdb is bundled — not an external dep)
 - `check_download_disk` / `check_convert_disk`: insufficient free space
-- `verify_metrics`: file-level parity mismatch — run `repair_convert`
+- `verify_metrics`: file-level parity mismatch — just re-run `convert` (auto-repair handles it)
 - `download_sync`: S3 sync / auth / endpoint failure
 - `validate_gzip_integrity`: corrupted `.json.gz` file
 
@@ -10841,7 +10293,7 @@ cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
   Without this, an in-memory connection has no temp dir and OOMs when memory_limit is hit.
 
 ## Profiles and the stratified plan
-- `convert` and `repair_convert` resolve `--profile <name>` against a `ProfileRegistry`
+- `convert` resolves `--profile <name>` against a `ProfileRegistry`
   populated from `builtin_profiles()` plus an optional user `openalex-snapshot.profiles.yaml`.
 - Built-in profiles:
   - `safe` (default) — single pass, workers clamped 1..=2, generous per-worker memory
@@ -10854,7 +10306,7 @@ cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
   - Stratified → file list partitioned by `gz_size_bytes`; one StratumPlan per non-empty
     bucket; largest-files-first execution order.
   - `--workers N` collapses stratified into one flat pass (largest stratum's memory).
-- `run_convert` / `run_repair` iterate `plan.strata`, reconfiguring DuckDB + rayon per stratum.
+- `run_convert` iterates `plan.strata`, reconfiguring DuckDB + rayon per stratum.
 
 ## Worktree and PR conventions
 - All changes go through a PR from a `claude/<name>` worktree branch.
@@ -11048,7 +10500,6 @@ fn command_flow_rank(cmd: &str) -> usize {
         "index" => 7,
         "extract" => 8,
         "verify-index" | "verify_index" => 9,
-        "repair_convert" | "repair-convert" | "repair" => 10,
         _ => 100,
     }
 }

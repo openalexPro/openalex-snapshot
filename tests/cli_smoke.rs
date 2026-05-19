@@ -705,7 +705,7 @@ fn legacy_schema_cache_is_auto_migrated() {
 }
 
 #[test]
-fn repair_reconverts_failed_verify_files() {
+fn convert_auto_repairs_failed_verify_files() {
     if !has_duckdb() {
         return;
     }
@@ -724,6 +724,7 @@ fn repair_reconverts_failed_verify_files() {
     );
 
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    // First convert: produces a good parquet.
     assert!(Command::new(&exe)
         .args([
             "convert",
@@ -736,6 +737,7 @@ fn repair_reconverts_failed_verify_files() {
         .unwrap()
         .success());
 
+    // Corrupt the output and verify — should flag it.
     let out_file = parquet.join("authors/part_000/part1.parquet");
     fs::write(&out_file, b"bad").unwrap();
 
@@ -755,30 +757,15 @@ fn repair_reconverts_failed_verify_files() {
         .unwrap();
     assert!(!failed_verify.success());
 
-    let reports_dir = root.join("openalex-snapshot_metadata/reports");
-    let mut verify_reports: Vec<PathBuf> = fs::read_dir(&reports_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("verify_convert-") && n.ends_with(".json"))
-                .unwrap_or(false)
-        })
-        .collect();
-    verify_reports.sort();
-    let verify_report = verify_reports.last().unwrap().clone();
-
+    // Now run convert AGAIN — auto-repair (the default) should pick up the
+    // verify_convert failure, delete the corrupt parquet, and re-build it.
     let repair_status = Command::new(&exe)
         .args([
-            "repair_convert",
+            "convert",
             "--root-dir",
             root.to_str().unwrap(),
             "--dataset",
             "authors",
-            "--from-verify-report",
-            verify_report.to_str().unwrap(),
         ])
         .status()
         .unwrap();
@@ -799,6 +786,78 @@ fn repair_reconverts_failed_verify_files() {
         .status()
         .unwrap();
     assert!(ok_verify.success());
+}
+
+#[test]
+fn convert_no_auto_repair_skips_flagged_parquet() {
+    if !has_duckdb() {
+        return;
+    }
+    // With --auto-repair=false, convert must NOT touch the corrupt parquet
+    // (the skip-if-exists filter sees it and skips the file).
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let snapshot = root.join("snapshot");
+    let parquet = root.join("parquet");
+    let ds = snapshot.join("data/authors/part_000");
+    fs::create_dir_all(&ds).unwrap();
+    write_gz_ndjson(
+        &ds.join("part1.gz"),
+        &[r#"{"id":"https://openalex.org/A1","display_name":"A"}"#],
+    );
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+    assert!(Command::new(&exe)
+        .args([
+            "convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "authors",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let out_file = parquet.join("authors/part_000/part1.parquet");
+    let original_bytes = fs::read(&out_file).unwrap();
+    // Corrupt the output.
+    fs::write(&out_file, b"bad").unwrap();
+
+    let _ = Command::new(&exe)
+        .args([
+            "verify_convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "authors",
+            "--scope",
+            "dataset",
+            "--metadata-level",
+            "both",
+        ])
+        .status()
+        .unwrap();
+
+    // Convert with --auto-repair=false — the corrupt parquet must remain corrupt.
+    assert!(Command::new(&exe)
+        .args([
+            "convert",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "authors",
+            "--auto-repair=false",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let after = fs::read(&out_file).unwrap();
+    assert_eq!(
+        after, b"bad",
+        "corrupt parquet must be untouched when --auto-repair=false"
+    );
+    let _ = original_bytes;
 }
 
 #[test]
@@ -959,7 +1018,9 @@ fn config_create_mode_contracts() {
     assert!(complete.status.success());
     let c = String::from_utf8_lossy(&complete.stdout);
     assert!(c.contains("schema:"));
-    assert!(c.contains("repair_convert:"));
+    // repair_convert was removed in favour of auto-repair inside `convert`
+    assert!(!c.contains("repair_convert:"));
+    assert!(c.contains("auto_repair"));
     assert!(c.contains("progress:"));
     assert!(!c.contains("\ncorpus_dir:"));
 
@@ -1147,7 +1208,6 @@ all:
   enable_verify_download: false
   enable_convert: true
   enable_verify_convert: true
-  enable_repair_convert: true
   enable_index: true
   enable_verify_index: true
 index:

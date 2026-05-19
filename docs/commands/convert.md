@@ -22,9 +22,35 @@ openalex-snapshot convert \
 
 - 1 input `.gz` maps to 1 output `.parquet` (unless `--split-size` is set; see below)
 - Resume-safe output skipping
+- **Auto-repair from the latest `verify_convert` report** — see "Auto-repair" below.
 - Verification is separate via `verify_convert`
 - Supports selected-file conversion via repeated `--input-file`
 - Per-stratum execution under stratified profiles — see "Profile / tuning" below
+
+## Auto-repair from verify report
+
+At startup, `convert` reads the most-recent `verify_convert` report under
+`<root>/openalex-snapshot_metadata/reports/`.  For any parquet that report flagged
+(phase `verify_metrics` or `convert_file`), the existing parquet is deleted so the
+normal *skip-if-exists* filter re-includes that file in the convert pass.
+
+**Net effect: running `convert` a second time fixes whatever `verify_convert` flagged.**
+There is no separate `repair_convert` subcommand — convert is its own repair.
+
+Behaviour:
+
+- **Default:** enabled.  No flag needed.
+- **Opt-out per-run:** `--auto-repair=false`.
+- **Opt-out in config:** `convert.auto_repair: false` in `openalex-snapshot.yaml`.
+- **Ignored when `--input-file` is given:** if you explicitly name files, only those
+  are processed and the verify report is not consulted.  Most predictable for ad-hoc
+  work.
+- **No-op when there's no verify report** (or when the report has no `verify_metrics`
+  / `convert_file` failures for the current datasets).
+
+In a pipeline (`all`), the orchestrator loops `convert → verify_convert` up to
+`--retry N` times.  Each retry's convert call auto-repairs whatever the prior
+verify flagged.
 
 ## Profile / tuning
 
