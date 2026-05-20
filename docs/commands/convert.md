@@ -70,17 +70,17 @@ verify flagged.
 | 600–800 MB        | 2       | 9 600 MB       |
 | 800+ MB           | 1       | 13 000 MB      |
 
-For hosts with different RAM than 36 GB, write a custom `profiles.yaml` (see below) or use `safe`.
+For hosts with different RAM than 36 GB, write a custom `performance.yaml` (see below) or use `safe`.
 
-### Custom profiles via `profiles.yaml`
+### Custom profiles via `performance.yaml`
 
-A sibling YAML file `openalex-snapshot.profiles.yaml` (in the working directory, or via the `--profiles-config <path>` global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.
+A sibling YAML file `openalex-snapshot.performance.yaml` (in the working directory, or via the `--performance-config <path>` global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.
 
 **Fastest path** — scaffold a profile auto-derived from your host's RAM:
 
 ```bash
 openalex-snapshot config --create-profiles
-# writes ./openalex-snapshot.profiles.yaml with a `stratified-<RAM_GB>` profile,
+# writes ./openalex-snapshot.performance.yaml with a `stratified-<RAM_GB>` profile,
 # plus commented examples for half- and double-RAM tiers.
 ```
 
@@ -90,7 +90,7 @@ To preview what would be written without creating the file:
 openalex-snapshot config --create-profiles --stdout
 ```
 
-To inspect what profiles are visible (built-ins + anything loaded from your `profiles.yaml`):
+To inspect what profiles are visible (built-ins + anything loaded from your `performance.yaml`):
 
 ```bash
 openalex-snapshot config --list-profiles
@@ -99,7 +99,7 @@ openalex-snapshot config --list-profiles
 The generated file's schema:
 
 ```yaml
-# openalex-snapshot.profiles.yaml
+# openalex-snapshot.performance.yaml
 profiles:
   stratified-16:
     description: "Tuned for ~16 GB RAM"

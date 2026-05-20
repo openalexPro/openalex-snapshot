@@ -24,4 +24,4 @@ openalex-snapshot index \
 
 `index` reads parquet files (already-converted output of `convert`), so its memory needs are modest compared to `convert`. The default tuning is fine for any host with ≥4 GB RAM. Use `--max-memory-mb <N>` and `--workers <N>` only if you need to constrain resources.
 
-> **Note**: the legacy `--profile safe|balanced|fast` flag is accepted on this command for backwards compatibility but doesn't drive stratified parallelism. The stratified profile system (`safe`, `stratified-36`, custom `stratified-N` from `openalex-snapshot.profiles.yaml`) currently applies only to `convert` and `repair_convert`. See [`convert.md`](./convert.md#profile--tuning).
+> **Note**: the legacy `--profile safe|balanced|fast` flag is accepted on this command for backwards compatibility but doesn't drive stratified parallelism. The stratified profile system (`safe`, `stratified-36`, custom `stratified-N` from `openalex-snapshot.performance.yaml`) currently applies only to `convert` and `repair_convert`. See [`convert.md`](./convert.md#profile--tuning).
