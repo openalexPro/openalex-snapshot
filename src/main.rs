@@ -6410,6 +6410,19 @@ fn run_convert(args: ConvertArgs, performance_config: Option<&Path>) -> Result<(
         } else {
             "".to_string()
         };
+        // For works, append two derived columns to the COPY SELECT:
+        //   abstract  — reconstructed from abstract_inverted_index
+        //   citation  — "Author (year)" / "A & B (year)" / "A et al. (year)"
+        // abstract_inverted_index itself is kept in the output for callers that
+        // want the original form.  Guarded by presence in the inferred schema
+        // so synthetic test fixtures without these columns convert cleanly.
+        let select_extras = if dataset == "works" {
+            let field_names: std::collections::HashSet<&str> =
+                schema.fields.iter().map(|f| f.name.as_str()).collect();
+            works_enrichment_select_extras_if_supported(&field_names)
+        } else {
+            String::new()
+        };
 
         for (stratum_idx, stratum) in plan.strata.iter().enumerate() {
             eprintln!(
@@ -6483,6 +6496,7 @@ fn run_convert(args: ConvertArgs, performance_config: Option<&Path>) -> Result<(
                                 row_group_rows,
                                 memory_mb,
                                 &extra_json_options,
+                                &select_extras,
                             );
                             pb.inc(1);
                             match out {
@@ -10980,6 +10994,7 @@ fn list_split_parquets(out_path: &Path) -> Vec<PathBuf> {
     chunks
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_one(
     duckdb_bin: &Path,
     pair: &FilePair,
@@ -10988,6 +11003,7 @@ fn convert_one(
     row_group_rows: usize,
     memory_mb: Option<usize>,
     extra_json_options: &str,
+    select_extras: &str,
 ) -> Result<()> {
     if let Some(parent) = pair.output_parquet.parent() {
         fs::create_dir_all(parent)?;
@@ -10997,34 +11013,77 @@ fn convert_one(
     let in_q = sql_quote(&pair.input_gz.to_string_lossy());
     let out_q = sql_quote(&tmp.to_string_lossy());
 
+    // `select_extras` is a comma-prefixed list of additional projected columns
+    // appended after `SELECT *` (e.g. derived `abstract`, `citation` for works).
+    // Empty for datasets without enrichment.
     let mut sql = String::new();
     sql.push_str("SET preserve_insertion_order = false;");
     sql.push_str(&format!(
-        "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true)) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
-        in_q,
-        columns_clause,
-        out_q,
-        compression.to_uppercase(),
-        row_group_rows
+        "COPY (SELECT *{select_extras} FROM read_json({in_q}, columns = {columns_clause}, union_by_name = true, ignore_errors = true{extra_json_options})) TO {out_q} (FORMAT PARQUET, COMPRESSION {compression}, ROW_GROUP_SIZE {row_group_rows});",
+        compression = compression.to_uppercase(),
     ));
-    if !extra_json_options.is_empty() {
-        sql.clear();
-        sql.push_str("SET preserve_insertion_order = false;");
-        sql.push_str(&format!(
-            "COPY (SELECT * FROM read_json({}, columns = {}, union_by_name = true, ignore_errors = true{}) ) TO {} (FORMAT PARQUET, COMPRESSION {}, ROW_GROUP_SIZE {});",
-            in_q,
-            columns_clause,
-            extra_json_options,
-            out_q,
-            compression.to_uppercase(),
-            row_group_rows
-        ));
-    }
     let _ = memory_mb; // set globally via set_duckdb_memory_limit before the parallel pass
 
     run_duckdb_sql(duckdb_bin, &sql)?;
     fs::rename(&tmp, &pair.output_parquet)?;
     Ok(())
+}
+
+/// Returns the works-enrichment SELECT-extras string if and only if all the
+/// source columns the expressions reference are present in the inferred schema.
+/// Used by run_convert to skip enrichment for synthetic / minimal test data
+/// that lacks `abstract_inverted_index`, `authorships`, or `publication_year`.
+fn works_enrichment_select_extras_if_supported(
+    field_names: &std::collections::HashSet<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if field_names.contains("abstract_inverted_index") {
+        parts.push(format!(", {} AS abstract", works_abstract_expr()));
+    }
+    if field_names.contains("authorships") && field_names.contains("publication_year") {
+        parts.push(format!(", {} AS citation", works_citation_expr()));
+    }
+    parts.concat()
+}
+
+/// SQL expression: reconstruct a plain-text abstract from `abstract_inverted_index`
+/// (MAP(VARCHAR, BIGINT[])).  list_sort on STRUCT sorts by field order
+/// (pos:BIGINT first, ascending) which is what we want for word ordering.
+fn works_abstract_expr() -> &'static str {
+    "CASE WHEN abstract_inverted_index IS NULL THEN NULL \
+     ELSE array_to_string( \
+         list_transform( \
+             list_sort( \
+                 flatten( \
+                     apply( \
+                         map_entries(abstract_inverted_index), \
+                         x -> apply(x.value, p -> {pos: p, word: x.key}) \
+                     ) \
+                 ) \
+             ), \
+             e -> e.word \
+         ), \
+         ' ' \
+     ) END"
+}
+
+/// SQL expression: `"Author (year)"` / `"A & B (year)"` / `"A et al. (year)"`,
+/// with `(n.d.)` when publication_year is null.  Mirrors the jq filter in
+/// openalexPro/R/jq_execute.R.
+fn works_citation_expr() -> String {
+    let year_expr = "COALESCE(publication_year::VARCHAR, 'n.d.')";
+    format!(
+        "CASE \
+            WHEN authorships IS NULL OR len(authorships) = 0 THEN NULL \
+            WHEN len(authorships) = 1 THEN \
+                authorships[1].author.display_name || ' (' || {year_expr} || ')' \
+            WHEN len(authorships) = 2 THEN \
+                authorships[1].author.display_name || ' & ' || authorships[2].author.display_name \
+                || ' (' || {year_expr} || ')' \
+            ELSE \
+                authorships[1].author.display_name || ' et al. (' || {year_expr} || ')' \
+        END"
+    )
 }
 
 fn list_parquet_rel(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -11642,8 +11701,77 @@ fn widen_type(a: &str, b: &str) -> String {
     }
 }
 
+/// Canonicalize a DuckDB type string for comparison and storage.
+///
+/// Uppercases recognised TYPE KEYWORDS (BIGINT, VARCHAR, STRUCT, LIST, MAP, …)
+/// while PRESERVING the case of identifiers (struct field names).  This is
+/// load-bearing for nested types: `read_json(columns = {...})` is case-sensitive
+/// when matching JSON keys to the field names declared in a STRUCT schema, so
+/// uppercasing the field names of `STRUCT(author STRUCT(display_name VARCHAR))`
+/// to `STRUCT(AUTHOR STRUCT(DISPLAY_NAME VARCHAR))` against lowercase JSON
+/// keys silently fills every inner field with NULL.
 fn normalize_duckdb_type(t: &str) -> String {
-    t.trim().to_uppercase()
+    static KEYWORDS: &[&str] = &[
+        "BOOLEAN",
+        "BOOL",
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "INT",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "FLOAT",
+        "REAL",
+        "DOUBLE",
+        "DECIMAL",
+        "VARCHAR",
+        "TEXT",
+        "CHAR",
+        "STRING",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "INTERVAL",
+        "BLOB",
+        "BYTEA",
+        "UUID",
+        "STRUCT",
+        "LIST",
+        "MAP",
+        "ARRAY",
+        "BIT",
+        "JSON",
+        "NULL",
+        "ENUM",
+    ];
+    let trimmed = t.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            let upper = word.to_ascii_uppercase();
+            if KEYWORDS.contains(&upper.as_str()) {
+                out.push_str(&upper);
+            } else {
+                out.push_str(word);
+            }
+            word.clear();
+        }
+    };
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 fn sql_quote(s: &str) -> String {

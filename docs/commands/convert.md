@@ -22,6 +22,10 @@ openalex-snapshot convert \
 
 - 1 input `.gz` maps to 1 output `.parquet` (unless `--split-size` is set; see below)
 - Resume-safe output skipping
+- **Works enrichment** — for the `works` dataset, two derived columns are written
+  alongside the source columns: `abstract` (plain text, reconstructed from
+  `abstract_inverted_index`) and `citation` (`"Author (year)"` / `"A & B (year)"` /
+  `"A et al. (year)"`).  `abstract_inverted_index` is kept as-is in the output.
 - **Auto-repair from the latest `verify_convert` report** — see "Auto-repair" below.
 - Verification is separate via `verify_convert`
 - Supports selected-file conversion via repeated `--input-file`

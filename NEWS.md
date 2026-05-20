@@ -6,6 +6,32 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ### Added
 
+- **Works enrichment in `convert`.**  Two derived columns are now written to every works parquet:
+  - `abstract` (VARCHAR) — plain-text abstract reconstructed from `abstract_inverted_index`
+    (positions sorted ascending, words joined with single spaces).
+  - `citation` (VARCHAR) — `"Author (year)"` / `"A & B (year)"` / `"A et al. (year)"`
+    derived from `authorships` + `publication_year`.  Null `publication_year` renders as
+    `"(n.d.)"`.  Null/empty `authorships` ⇒ null citation.
+  - `abstract_inverted_index` is **kept** in the output for callers that want the original
+    inverted form.
+  - Both columns are added only when the underlying source columns are present in the
+    inferred schema (so synthetic / minimal test fixtures convert cleanly).
+
+### Fixed
+
+- **Schema cache no longer uppercases STRUCT field identifiers.**  `normalize_duckdb_type`
+  used to apply `to_uppercase()` to the entire type string, including struct field names.
+  DuckDB's `read_json(columns = …)` matches JSON keys to struct field names
+  case-sensitively, so a cached schema like `STRUCT(AUTHOR STRUCT(DISPLAY_NAME VARCHAR))`
+  silently filled every inner struct field with NULL when reading JSON with lowercase
+  keys (`{"author": {"display_name": ...}}`).  This affected every nested-struct column
+  in works (and other datasets): `authorships[*].author`, `apc_list.value`, `biblio.*`,
+  `best_oa_location.source`, …  The fix preserves identifier case while still uppercasing
+  type keywords (`BIGINT`, `VARCHAR`, `STRUCT`, …).  **Migration:** run
+  `convert --refresh-cache` once to regenerate the schema cache with corrected field-name
+  case; existing parquets containing NULL nested-struct fields will need a re-convert
+  (or rely on convert's auto-repair from a fresh `verify_convert` report).
+
 - **`convert` auto-repair from the latest `verify_convert` report.**  On startup `convert`
   reads `<root>/openalex-snapshot_metadata/reports/verify_convert-*.json` (most recent),
   deletes any output parquet that report flagged (`phase ∈ { verify_metrics, convert_file }`),
