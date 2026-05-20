@@ -2,9 +2,22 @@
 //!
 //! This crate is the home of logic that needs to be callable from both the
 //! `openalex-snapshot` CLI and the `openalexPro` R package (via `extendr`).
-//! It starts small — two pure SQL-string helpers extracted from the CLI's
-//! works-enrichment path — and will grow as more pure logic moves out of
-//! `main.rs`.
+//!
+//! # Modules
+//!
+//! - [`profile`] — performance-profile types, registry, and convert-plan builder
+//! - [`sql`] — SQL string utilities (`normalize_duckdb_type`, `sql_quote`, `parse_size_str`)
+//!
+//! # Re-exports
+//!
+//! The two works-enrichment SQL helpers are re-exported at the crate root for
+//! backwards compatibility and convenience.
+
+pub mod profile;
+pub mod sql;
+
+// Convenience re-exports — callers can `use openalex_core::{works_abstract_expr, …}`.
+pub use sql::{normalize_duckdb_type, parse_size_str, sql_quote};
 
 /// SQL expression that reconstructs a plain-text abstract from a
 /// `MAP(VARCHAR, BIGINT[])` named `abstract_inverted_index`.  Walks the map,

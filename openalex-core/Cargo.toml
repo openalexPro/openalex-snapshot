@@ -5,3 +5,6 @@ edition = { workspace = true }
 description = "Core logic for OpenAlex snapshot conversion, shared between the CLI and the R package"
 
 [dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }

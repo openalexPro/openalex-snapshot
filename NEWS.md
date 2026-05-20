@@ -6,6 +6,17 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ### Added
 
+- **`openalex-core` Phase B: profile system + SQL helpers extracted.**  The following
+  are now `pub` items in `openalex-core` rather than private CLI internals:
+  - **`profile` module** — `Stratum`, `ProfileKind`, `ProfileDef`, `ProfilesYaml`,
+    `ProfileRegistry`, `FilePair`, `StratumPlan`, `ConvertPlan`, `build_convert_plan`,
+    `validate_profile_def`, `derive_stratified_profile_for_ram`, `detect_total_memory_mb`,
+    and the two safe-mode memory-budget helpers.  The profile planner is now independently
+    testable and reusable without importing DuckDB or the CLI.
+  - **`sql` module** — `normalize_duckdb_type`, `sql_quote`, `parse_size_str`.
+  - 10 new unit tests in `openalex-core` cover all extracted items.
+  - `serde` and `serde_yaml` are now workspace-level dependency declarations.
+
 - **Cargo workspace skeleton.**  The repository is now a Cargo workspace with two members:
   `openalex-core` (shared library crate) and `openalex-snapshot` (the CLI binary, now under
   `openalex-snapshot/`).  The binary name, `cargo install` target, release artifacts, and
