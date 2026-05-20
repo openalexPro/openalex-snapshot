@@ -3,6 +3,7 @@ use chrono::{Local, TimeZone};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use openalex_core::{works_abstract_expr, works_citation_expr};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -11046,45 +11047,8 @@ fn works_enrichment_select_extras_if_supported(
     parts.concat()
 }
 
-/// SQL expression: reconstruct a plain-text abstract from `abstract_inverted_index`
-/// (MAP(VARCHAR, BIGINT[])).  list_sort on STRUCT sorts by field order
-/// (pos:BIGINT first, ascending) which is what we want for word ordering.
-fn works_abstract_expr() -> &'static str {
-    "CASE WHEN abstract_inverted_index IS NULL THEN NULL \
-     ELSE array_to_string( \
-         list_transform( \
-             list_sort( \
-                 flatten( \
-                     apply( \
-                         map_entries(abstract_inverted_index), \
-                         x -> apply(x.value, p -> {pos: p, word: x.key}) \
-                     ) \
-                 ) \
-             ), \
-             e -> e.word \
-         ), \
-         ' ' \
-     ) END"
-}
-
-/// SQL expression: `"Author (year)"` / `"A & B (year)"` / `"A et al. (year)"`,
-/// with `(n.d.)` when publication_year is null.  Mirrors the jq filter in
-/// openalexPro/R/jq_execute.R.
-fn works_citation_expr() -> String {
-    let year_expr = "COALESCE(publication_year::VARCHAR, 'n.d.')";
-    format!(
-        "CASE \
-            WHEN authorships IS NULL OR len(authorships) = 0 THEN NULL \
-            WHEN len(authorships) = 1 THEN \
-                authorships[1].author.display_name || ' (' || {year_expr} || ')' \
-            WHEN len(authorships) = 2 THEN \
-                authorships[1].author.display_name || ' & ' || authorships[2].author.display_name \
-                || ' (' || {year_expr} || ')' \
-            ELSE \
-                authorships[1].author.display_name || ' et al. (' || {year_expr} || ')' \
-        END"
-    )
-}
+// works_abstract_expr and works_citation_expr are re-exported from openalex_core.
+// See openalex-core/src/lib.rs for the implementations.
 
 fn list_parquet_rel(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut out = BTreeSet::new();

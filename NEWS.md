@@ -6,6 +6,13 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ### Added
 
+- **Cargo workspace skeleton.**  The repository is now a Cargo workspace with two members:
+  `openalex-core` (shared library crate) and `openalex-snapshot` (the CLI binary, now under
+  `openalex-snapshot/`).  The binary name, `cargo install` target, release artifacts, and
+  runtime behaviour are **unchanged**.  `openalex-core` starts with two pure SQL-string helpers
+  (`works_abstract_expr`, `works_citation_expr`) extracted from the CLI — the foundation for
+  future `extendr`-based R integration.
+
 - **Works enrichment in `convert`.**  Two derived columns are now written to every works parquet:
   - `abstract` (VARCHAR) — plain-text abstract reconstructed from `abstract_inverted_index`
     (positions sorted ascending, words joined with single spaces).

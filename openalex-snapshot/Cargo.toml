@@ -1,0 +1,28 @@
+[package]
+name = "openalex-snapshot"
+version = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "openalex-snapshot"
+path = "src/main.rs"
+
+[dependencies]
+openalex-core = { path = "../openalex-core" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
+indicatif = "0.17"
+flate2 = "1"
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+walkdir = "2"
+chrono = { version = "0.4", features = ["clock"] }
+
+[dev-dependencies]
+flate2 = "1"
+tempfile = "3"

@@ -17,7 +17,14 @@ Tests in `tests/cli_smoke.rs` use the `duckdb` CLI binary for parquet verificati
 
 ## Architecture
 
-The entire application is a single binary implemented in `src/main.rs` (~10,400 lines). There are no library crates or submodules.
+This repository is a **Cargo workspace** with two members:
+
+- **`openalex-core/`** — shared library crate (`openalex-core`).  Starts with two pure SQL-string helpers (`works_abstract_expr`, `works_citation_expr`) extracted from the CLI.  This is where logic shared with the future `openalexPro` R package (via `extendr`) will live.
+- **`openalex-snapshot/`** — the CLI binary (`openalex-snapshot`).  Its source is `openalex-snapshot/src/main.rs` (~10,400 lines).  The binary name, install path, and behaviour are unchanged.
+
+The binary is built with `cargo build --release -p openalex-snapshot`; the release workflow passes `-p openalex-snapshot` to avoid building the library unnecessarily.  All workspace members are tested with `cargo test --workspace`.
+
+The entire CLI is a single binary implemented in `openalex-snapshot/src/main.rs`. There are no additional library crates or submodules beyond `openalex-core`.
 
 **Path model** — all runtime paths derive from a single `--root-dir`:
 - `<root>/snapshot/` — downloaded snapshot (JSON.GZ files)
