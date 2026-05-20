@@ -15,7 +15,7 @@ All notable changes to `openalex-snapshot` are documented in this file.
   `--auto-repair=false`, in config with `convert.auto_repair: false`, or by passing
   `--input-file` (which always takes precedence over the verify report).
 - **Stratified profiles** for `convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.performance.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
-- New global flag `--profiles-config <path>` (auto-discovers `./openalex-snapshot.performance.yaml`).  Built-in profile names always work without this file.
+- New global flag `--performance-config <path>` (auto-discovers `./openalex-snapshot.performance.yaml`).  Built-in profile names always work without this file.
 - New `config --create-profiles` flag scaffolds a starter `performance.yaml` auto-derived from the host's detected RAM.  The emitted profile is named `stratified-<RAM_GB>`, with workers + per-worker memory linearly scaled from the 36 GB baseline and capped so total memory never exceeds 55 % of system RAM (parallel) or 40 % (single-worker catch-all).
 - New `config --list-profiles` flag prints all built-in + user profiles with their strata as a table.
 - `convert` logs per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.

@@ -74,7 +74,7 @@ For hosts with different RAM than 36 GB, write a custom `performance.yaml` (see 
 
 ### Custom profiles via `performance.yaml`
 
-A sibling YAML file `openalex-snapshot.performance.yaml` (in the working directory, or via the `--profiles-config <path>` global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.
+A sibling YAML file `openalex-snapshot.performance.yaml` (in the working directory, or via the `--performance-config <path>` global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.
 
 **Fastest path** — scaffold a profile auto-derived from your host's RAM:
 
