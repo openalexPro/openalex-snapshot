@@ -913,10 +913,30 @@ pub fn lookup_by_id(
         })
         .collect();
 
+    // Group entries into batches so each output parquet file holds ~10,000 rows.
+    // This prevents the 1-file-per-source-partition explosion that occurs with
+    // date-partitioned corpora (e.g. updated_date=X/part_0000.parquet each
+    // containing only ~130 matching rows).
+    const TARGET_ROWS_PER_OUTPUT: usize = 10_000;
+    let mut batches: Vec<Vec<(String, Vec<i64>)>> = Vec::new();
+    let mut current_batch: Vec<(String, Vec<i64>)> = Vec::new();
+    let mut current_count: usize = 0;
+    for (pq_file, row_numbers) in entries {
+        let n = row_numbers.len();
+        if current_count + n > TARGET_ROWS_PER_OUTPUT && !current_batch.is_empty() {
+            batches.push(std::mem::take(&mut current_batch));
+            current_count = 0;
+        }
+        current_count += n;
+        current_batch.push((pq_file, row_numbers));
+    }
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+
     let output_str = dq(output_path);
 
-    let written =
-        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let written_clone = Arc::clone(&written);
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -925,44 +945,46 @@ pub fn lookup_by_id(
         .context("build rayon pool")?;
 
     pool.install(|| {
-        entries.par_iter().enumerate().for_each(|(idx, (pq_file, row_numbers))| {
-            // Use a zero-padded index as the output filename so that files
-            // from different partition directories (e.g. updated_date=X/part_0000.parquet
-            // and updated_date=Y/part_0000.parquet) never collide.
+        batches.par_iter().enumerate().for_each(|(idx, batch)| {
             let out_file = format!("{}/part_{:05}.parquet", output_str, idx);
 
-            let row_filter = row_numbers
+            // Build a UNION ALL across all source files in this batch.
+            let selects: Vec<String> = batch
                 .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+                .map(|(pq_file, row_numbers)| {
+                    let row_filter = row_numbers
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "SELECT * FROM read_parquet('{}', file_row_number = true) \
+                         WHERE file_row_number IN ({})",
+                        pq_file, row_filter
+                    )
+                })
+                .collect();
+
+            let batch_rows: u64 = batch.iter().map(|(_, r)| r.len() as u64).sum();
+            let copy_sql = format!(
+                "COPY ({}) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+                selects.join(" UNION ALL BY NAME "),
+                out_file
+            );
 
             let result = (|| -> Result<()> {
                 let conn = Connection::open_in_memory().context("open DuckDB")?;
-                let copy_sql = format!(
-                    "COPY (\
-                        SELECT * FROM read_parquet('{}', file_row_number = true) \
-                        WHERE file_row_number IN ({})\
-                    ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
-                    pq_file, row_filter, out_file
-                );
                 conn.execute_batch(&copy_sql)
-                    .with_context(|| format!("COPY failed for {}", pq_file))?;
+                    .with_context(|| format!("COPY failed for batch {}", idx))?;
                 Ok(())
             })();
 
             match result {
                 Ok(()) => {
-                    written_clone.fetch_add(
-                        row_numbers.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    written_clone.fetch_add(batch_rows, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[lookup_by_id] Failed to extract from {}: {}",
-                        pq_file, e
-                    );
+                    eprintln!("[lookup_by_id] Failed to write batch {}: {}", idx, e);
                 }
             }
         });
