@@ -926,12 +926,10 @@ pub fn lookup_by_id(
 
     pool.install(|| {
         entries.par_iter().enumerate().for_each(|(idx, (pq_file, row_numbers))| {
-            // Derive a unique output filename from the source basename.
-            let part_name = Path::new(pq_file)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("part{:05}.parquet", idx));
-            let out_file = format!("{}/part_{}", output_str, part_name);
+            // Use a zero-padded index as the output filename so that files
+            // from different partition directories (e.g. updated_date=X/part_0000.parquet
+            // and updated_date=Y/part_0000.parquet) never collide.
+            let out_file = format!("{}/part_{:05}.parquet", output_str, idx);
 
             let row_filter = row_numbers
                 .iter()
