@@ -73,7 +73,11 @@ fn widen_types(types: &[String]) -> String {
     }
 
     // Complex types (STRUCT/LIST/MAP) beat simple types.
-    let complex: Vec<&str> = unique.iter().copied().filter(|t| is_complex_type(t)).collect();
+    let complex: Vec<&str> = unique
+        .iter()
+        .copied()
+        .filter(|t| is_complex_type(t))
+        .collect();
     match complex.len() {
         0 => {}
         1 => return complex[0].to_string(),
@@ -114,7 +118,10 @@ fn merge_schemas(schemas: Vec<Vec<ColumnDef>>) -> Vec<ColumnDef> {
                 ordered_names.push(col.name.clone());
                 col_type_map.insert(col.name.clone(), Vec::new());
             }
-            col_type_map.get_mut(&col.name).unwrap().push(col.col_type.clone());
+            col_type_map
+                .get_mut(&col.name)
+                .unwrap()
+                .push(col.col_type.clone());
         }
     }
 
@@ -165,7 +172,10 @@ fn load_schema_cache(cache_path: &Path) -> Option<Vec<ColumnDef>> {
     let content = std::fs::read_to_string(cache_path).ok()?;
     let mut lines = content.lines();
     let header = lines.next()?;
-    if !header.trim_start_matches('\u{feff}').starts_with("col_name") {
+    if !header
+        .trim_start_matches('\u{feff}')
+        .starts_with("col_name")
+    {
         return None;
     }
     let cols: Vec<ColumnDef> = lines
@@ -183,10 +193,7 @@ fn load_schema_cache(cache_path: &Path) -> Option<Vec<ColumnDef>> {
                 (name, col_type)
             } else {
                 let mut parts = line.splitn(2, ',');
-                (
-                    parts.next()?.to_string(),
-                    parts.next()?.to_string(),
-                )
+                (parts.next()?.to_string(), parts.next()?.to_string())
             };
             if name.is_empty() {
                 None
@@ -274,7 +281,11 @@ pub fn snapshot_to_parquet(
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name != "merged_ids" { Some(name) } else { None }
+                if name != "merged_ids" {
+                    Some(name)
+                } else {
+                    None
+                }
             })
             .collect();
         dirs.sort();
@@ -283,8 +294,16 @@ pub fn snapshot_to_parquet(
         data_sets
     };
 
-    let ml = if memory_limit.is_empty() { None } else { Some(memory_limit) };
-    let td = if temp_dir.is_empty() { None } else { Some(temp_dir) };
+    let ml = if memory_limit.is_empty() {
+        None
+    } else {
+        Some(memory_limit)
+    };
+    let td = if temp_dir.is_empty() {
+        None
+    } else {
+        Some(temp_dir)
+    };
 
     for ds in &ds_list {
         if verbose {
@@ -308,11 +327,7 @@ pub fn snapshot_to_parquet(
         // Resume: skip already-converted files.
         let existing_parquets: HashSet<PathBuf> = collect_files_recursive(&parquet_ds, ".parquet")
             .into_iter()
-            .map(|p| {
-                p.strip_prefix(&parquet_ds)
-                    .unwrap_or(&p)
-                    .to_path_buf()
-            })
+            .map(|p| p.strip_prefix(&parquet_ds).unwrap_or(&p).to_path_buf())
             .collect();
 
         let todo: Vec<(PathBuf, PathBuf)> = gz_files
@@ -372,8 +387,7 @@ pub fn snapshot_to_parquet(
             } else {
                 todo.len()
             };
-            let sample_files: Vec<&PathBuf> =
-                todo[..n_sample].iter().map(|(gf, _)| gf).collect();
+            let sample_files: Vec<&PathBuf> = todo[..n_sample].iter().map(|(gf, _)| gf).collect();
 
             if verbose {
                 eprintln!(
@@ -385,7 +399,8 @@ pub fn snapshot_to_parquet(
             let conn = Connection::open_in_memory().context("open DuckDB for schema")?;
             conn.execute_batch("INSTALL json; LOAD json;").ok();
             if let Some(m) = ml {
-                conn.execute_batch(&format!("SET memory_limit = '{}'", m)).ok();
+                conn.execute_batch(&format!("SET memory_limit = '{}'", m))
+                    .ok();
             }
 
             let schemas: Vec<Vec<ColumnDef>> = sample_files
@@ -413,8 +428,9 @@ pub fn snapshot_to_parquet(
                 // Works: store abstract_inverted_index as raw VARCHAR to avoid
                 // DuckDB's case-folding collision on duplicate JSON keys.
                 if ds == "works" {
-                    if let Some(col) =
-                        merged.iter_mut().find(|c| c.name == "abstract_inverted_index")
+                    if let Some(col) = merged
+                        .iter_mut()
+                        .find(|c| c.name == "abstract_inverted_index")
                     {
                         col.col_type = "VARCHAR".to_string();
                     }
@@ -482,10 +498,12 @@ fn convert_one_file(
     let conn = Connection::open_in_memory().context("open worker DuckDB")?;
     conn.execute_batch("INSTALL json; LOAD json;").ok();
     if let Some(m) = memory_limit {
-        conn.execute_batch(&format!("SET memory_limit = '{}'", m)).ok();
+        conn.execute_batch(&format!("SET memory_limit = '{}'", m))
+            .ok();
     }
     if let Some(t) = temp_dir {
-        conn.execute_batch(&format!("SET temp_directory = '{}'", t)).ok();
+        conn.execute_batch(&format!("SET temp_directory = '{}'", t))
+            .ok();
     }
 
     let read_fn = if let Some(cols) = columns_clause {
@@ -530,8 +548,16 @@ pub fn api_files_to_parquet(
         anyhow::bail!("input_files and output_files must have the same length");
     }
 
-    let af = if array_field.is_empty() { None } else { Some(array_field) };
-    let lt = if list_type.is_empty() { None } else { Some(list_type) };
+    let af = if array_field.is_empty() {
+        None
+    } else {
+        Some(array_field)
+    };
+    let lt = if list_type.is_empty() {
+        None
+    } else {
+        Some(list_type)
+    };
 
     let array_field_arc = Arc::new(af.map(str::to_string));
     let list_type_arc = Arc::new(lt.map(str::to_string));
@@ -578,10 +604,7 @@ pub fn api_files_to_parquet(
                                 af,
                                 lt
                             ),
-                            None => format!(
-                                "read_json_auto('{}')",
-                                fn_in.replace('\'', "\\'")
-                            ),
+                            None => format!("read_json_auto('{}')", fn_in.replace('\'', "\\'")),
                         };
                         format!(
                             "COPY (\n  SELECT *{}\n  FROM (\n    SELECT r.*\n    \
@@ -626,10 +649,9 @@ pub fn build_corpus_index(
     overwrite: bool,
     verbose: bool,
 ) -> Result<String> {
-    let corpus_path =
-        Path::new(corpus_dir)
-            .canonicalize()
-            .with_context(|| format!("canonicalize corpus_dir: {}", corpus_dir))?;
+    let corpus_path = Path::new(corpus_dir)
+        .canonicalize()
+        .with_context(|| format!("canonicalize corpus_dir: {}", corpus_dir))?;
 
     if !corpus_path.is_dir() {
         anyhow::bail!("corpus_dir is not a directory: {}", corpus_dir);
@@ -662,14 +684,21 @@ pub fn build_corpus_index(
         anyhow::bail!("No .parquet files found in {}", corpus_dir);
     }
 
-    let ml = if memory_limit.is_empty() { None } else { Some(memory_limit) };
+    let ml = if memory_limit.is_empty() {
+        None
+    } else {
+        Some(memory_limit)
+    };
 
     if verbose {
         eprintln!(
             "[build_corpus_index] Building index from: {}",
             corpus_path.display()
         );
-        eprintln!("[build_corpus_index]     Writing to: {}", index_file.display());
+        eprintln!(
+            "[build_corpus_index]     Writing to: {}",
+            index_file.display()
+        );
     }
 
     let total_start = std::time::Instant::now();
@@ -775,9 +804,11 @@ pub fn build_corpus_index(
     }
 
     let conn = Connection::open_in_memory().context("open DuckDB for stage 2")?;
-    conn.execute_batch("SET preserve_insertion_order = false;").ok();
+    conn.execute_batch("SET preserve_insertion_order = false;")
+        .ok();
     if let Some(m) = ml {
-        conn.execute_batch(&format!("SET memory_limit = '{}'", m)).ok();
+        conn.execute_batch(&format!("SET memory_limit = '{}'", m))
+            .ok();
     }
 
     // Use the glob pattern to read all shard files.
@@ -788,14 +819,13 @@ pub fn build_corpus_index(
         shard_glob,
         dq(&index_file)
     );
-    conn.execute_batch(&copy_sql).context("Stage 2 combine failed")?;
+    conn.execute_batch(&copy_sql)
+        .context("Stage 2 combine failed")?;
 
     std::fs::remove_dir_all(&temp_dir_path).ok();
 
     if verbose {
-        let file_size = std::fs::metadata(&index_file)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&index_file).map(|m| m.len()).unwrap_or(0);
         eprintln!(
             "[build_corpus_index] Done! Index size: {:.2} GB",
             file_size as f64 / 1_073_741_824.0
@@ -885,7 +915,10 @@ pub fn lookup_by_id(
         let _id: String = row.get(0)?;
         let parquet_file: String = row.get(1)?;
         let file_row_number: i64 = row.get(2)?;
-        file_map.entry(parquet_file).or_default().push(file_row_number);
+        file_map
+            .entry(parquet_file)
+            .or_default()
+            .push(file_row_number);
         match_count += 1;
     }
     drop(stmt);
@@ -1015,10 +1048,7 @@ mod tests {
     #[test]
     fn widen_complex_wins() {
         assert_eq!(
-            widen_types(&[
-                "VARCHAR".to_string(),
-                "STRUCT(id VARCHAR)".to_string()
-            ]),
+            widen_types(&["VARCHAR".to_string(), "STRUCT(id VARCHAR)".to_string()]),
             "STRUCT(id VARCHAR)"
         );
     }
@@ -1047,13 +1077,28 @@ mod tests {
     #[test]
     fn merge_schemas_basic() {
         let s1 = vec![
-            ColumnDef { name: "id".into(), col_type: "VARCHAR".into() },
-            ColumnDef { name: "year".into(), col_type: "INTEGER".into() },
+            ColumnDef {
+                name: "id".into(),
+                col_type: "VARCHAR".into(),
+            },
+            ColumnDef {
+                name: "year".into(),
+                col_type: "INTEGER".into(),
+            },
         ];
         let s2 = vec![
-            ColumnDef { name: "id".into(), col_type: "VARCHAR".into() },
-            ColumnDef { name: "year".into(), col_type: "BIGINT".into() },
-            ColumnDef { name: "title".into(), col_type: "VARCHAR".into() },
+            ColumnDef {
+                name: "id".into(),
+                col_type: "VARCHAR".into(),
+            },
+            ColumnDef {
+                name: "year".into(),
+                col_type: "BIGINT".into(),
+            },
+            ColumnDef {
+                name: "title".into(),
+                col_type: "VARCHAR".into(),
+            },
         ];
         let merged = merge_schemas(vec![s1, s2]);
         assert_eq!(merged.len(), 3);
