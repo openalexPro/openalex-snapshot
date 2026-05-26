@@ -521,6 +521,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#auto-repair-from-verify-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Auto-repair from verify report
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#profile-tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -529,6 +540,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Profile / tuning">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#custom-profiles-via-performanceyaml" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom profiles via performance.yaml
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overrides" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overrides
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -536,6 +575,17 @@
     <span class="md-ellipsis">
       
         Large-file handling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reading-the-run-log" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading the run log
       
     </span>
   </a>
@@ -566,34 +616,6 @@
     
   
     verify_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
   
 
     
@@ -1080,6 +1102,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#auto-repair-from-verify-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Auto-repair from verify report
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#profile-tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1088,6 +1121,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Profile / tuning">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#custom-profiles-via-performanceyaml" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom profiles via performance.yaml
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overrides" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overrides
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1095,6 +1156,17 @@
     <span class="md-ellipsis">
       
         Large-file handling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reading-the-run-log" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading the run log
       
     </span>
   </a>
@@ -1121,69 +1193,164 @@
 <h1 id="command-convert">Command: convert</h1>
 <p>Convert OpenAlex snapshot <code>.json.gz</code> files into parquet while preserving relative structure.</p>
 <h2 id="usage">Usage</h2>
-<pre><code class="language-bash">openalex-snapshot convert \
+<pre><code class="language-bash"># default profile (safe) — single-worker, max-memory; works on any host
+openalex-snapshot convert \
+  --root-dir /data \
+  --dataset works
+
+# stratified profile (recommended for 32+ GB hosts) — partitions files by gz size
+# and parallelises each size bucket with its own worker count / memory budget
+openalex-snapshot convert \
   --root-dir /data \
   --dataset works \
-  --profile balanced \
-  --workers 4
+  --profile stratified-36
 </code></pre>
 <h2 id="key-behavior">Key behavior</h2>
 <ul>
 <li>1 input <code>.gz</code> maps to 1 output <code>.parquet</code> (unless <code>--split-size</code> is set; see below)</li>
 <li>Resume-safe output skipping</li>
+<li><strong>Works enrichment</strong> — for the <code>works</code> dataset, two derived columns are written
+  alongside the source columns: <code>abstract</code> (plain text, reconstructed from
+  <code>abstract_inverted_index</code>) and <code>citation</code> (<code>"Author (year)"</code> / <code>"A &amp; B (year)"</code> /
+  <code>"A et al. (year)"</code>).  <code>abstract_inverted_index</code> is kept as-is in the output.</li>
+<li><strong>Auto-repair from the latest <code>verify_convert</code> report</strong> — see "Auto-repair" below.</li>
 <li>Verification is separate via <code>verify_convert</code></li>
 <li>Supports selected-file conversion via repeated <code>--input-file</code></li>
+<li>Per-stratum execution under stratified profiles — see "Profile / tuning" below</li>
 </ul>
+<h2 id="auto-repair-from-verify-report">Auto-repair from verify report</h2>
+<p>At startup, <code>convert</code> reads the most-recent <code>verify_convert</code> report under
+<code>&lt;root&gt;/openalex-snapshot_metadata/reports/</code>.  For any parquet that report flagged
+(phase <code>verify_metrics</code> or <code>convert_file</code>), the existing parquet is deleted so the
+normal <em>skip-if-exists</em> filter re-includes that file in the convert pass.</p>
+<p><strong>Net effect: running <code>convert</code> a second time fixes whatever <code>verify_convert</code> flagged.</strong>
+There is no separate <code>repair_convert</code> subcommand — convert is its own repair.</p>
+<p>Behaviour:</p>
+<ul>
+<li><strong>Default:</strong> enabled.  No flag needed.</li>
+<li><strong>Opt-out per-run:</strong> <code>--auto-repair=false</code>.</li>
+<li><strong>Opt-out in config:</strong> <code>convert.auto_repair: false</code> in <code>openalex-snapshot.yaml</code>.</li>
+<li><strong>Ignored when <code>--input-file</code> is given:</strong> if you explicitly name files, only those
+  are processed and the verify report is not consulted.  Most predictable for ad-hoc
+  work.</li>
+<li><strong>No-op when there's no verify report</strong> (or when the report has no <code>verify_metrics</code>
+  / <code>convert_file</code> failures for the current datasets).</li>
+</ul>
+<p>In a pipeline (<code>all</code>), the orchestrator loops <code>convert → verify_convert</code> up to
+<code>--retry N</code> times.  Each retry's convert call auto-repairs whatever the prior
+verify flagged.</p>
 <h2 id="profile-tuning">Profile / tuning</h2>
-<p><code>--profile</code> controls the <strong>global</strong> DuckDB memory budget shared across all in-process worker
-connections (derived from 80% of usable RAM × fraction, clamped to a min/max range).</p>
+<p><code>--profile</code> selects a built-in or user-defined performance profile.  Built-ins:</p>
 <table>
 <thead>
 <tr>
 <th>Profile</th>
-<th>Workers cap</th>
-<th>Memory fraction</th>
-<th>Memory range</th>
+<th>Kind</th>
+<th>Behaviour</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>auto</code></td>
-<td>(none)</td>
-<td>65% of usable RAM</td>
-<td>4 – 32 GiB</td>
+<td><code>safe</code> (default)</td>
+<td>Single-pass</td>
+<td>1 worker (clampable to 2), generous per-worker memory (45 % of usable RAM, clamped 8 – 24 GiB on single-worker mode).  Conservative and works on any host.</td>
 </tr>
 <tr>
-<td><code>balanced</code></td>
-<td>(none)</td>
-<td>65% of usable RAM</td>
-<td>4 – 32 GiB</td>
-</tr>
-<tr>
-<td><code>safe</code></td>
-<td>max 2</td>
-<td>15% of usable RAM</td>
-<td>1 –  8 GiB</td>
-</tr>
-<tr>
-<td><code>fast</code></td>
-<td>(none)</td>
-<td>80% of usable RAM</td>
-<td>8 – 48 GiB</td>
+<td><code>stratified-36</code></td>
+<td>Stratified</td>
+<td>Empirically tuned for ~36 GB RAM hosts.  Partitions the file list by gz size and runs one rayon parallel pass per non-empty stratum, largest-files-first.</td>
 </tr>
 </tbody>
 </table>
-<p><code>auto</code> is the default and behaves identically to <code>balanced</code>.</p>
-<p>Fallback when RAM cannot be detected: <code>safe</code>=2 GiB, <code>balanced</code>/<code>auto</code>=6 GiB, <code>fast</code>=12 GiB.</p>
-<p>Use <code>--max-memory-mb</code> to override the profile memory calculation entirely.
-Workers set via <code>--workers</code> or config are respected unless <code>safe</code> clamps them.</p>
+<p><code>stratified-36</code>'s strata (workers × per-worker memory):</p>
+<table>
+<thead>
+<tr>
+<th>gz size</th>
+<th>Workers</th>
+<th>Per-worker mem</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt;400 MB</td>
+<td>4</td>
+<td>4 800 MB</td>
+</tr>
+<tr>
+<td>400–600 MB</td>
+<td>3</td>
+<td>6 400 MB</td>
+</tr>
+<tr>
+<td>600–800 MB</td>
+<td>2</td>
+<td>9 600 MB</td>
+</tr>
+<tr>
+<td>800+ MB</td>
+<td>1</td>
+<td>13 000 MB</td>
+</tr>
+</tbody>
+</table>
+<p>For hosts with different RAM than 36 GB, write a custom <code>performance.yaml</code> (see below) or use <code>safe</code>.</p>
+<h3 id="custom-profiles-via-performanceyaml">Custom profiles via <code>performance.yaml</code></h3>
+<p>A sibling YAML file <code>openalex-snapshot.performance.yaml</code> (in the working directory, or via the <code>--performance-config &lt;path&gt;</code> global flag) defines additional named profiles.  User-defined names with the same name as a built-in override it.</p>
+<p><strong>Fastest path</strong> — scaffold a profile auto-derived from your host's RAM:</p>
+<pre><code class="language-bash">openalex-snapshot config --create-profiles
+# writes ./openalex-snapshot.performance.yaml with a `stratified-&lt;RAM_GB&gt;` profile,
+# plus commented examples for half- and double-RAM tiers.
+</code></pre>
+<p>To preview what would be written without creating the file:</p>
+<pre><code class="language-bash">openalex-snapshot config --create-profiles --stdout
+</code></pre>
+<p>To inspect what profiles are visible (built-ins + anything loaded from your <code>performance.yaml</code>):</p>
+<pre><code class="language-bash">openalex-snapshot config --list-profiles
+</code></pre>
+<p>The generated file's schema:</p>
+<pre><code class="language-yaml"># openalex-snapshot.performance.yaml
+profiles:
+  stratified-16:
+    description: &quot;Tuned for ~16 GB RAM&quot;
+    min_ram_gb: 12
+    kind: stratified
+    strata:
+      - max_file_mb: 400
+        workers: 2
+        per_worker_mb: 3000
+      - max_file_mb: 800
+        workers: 1
+        per_worker_mb: 5500
+      - workers: 1            # max_file_mb omitted = catch-all (no upper bound)
+        per_worker_mb: 6500
+</code></pre>
+<p>Then run <code>openalex-snapshot convert --profile stratified-16 …</code>.</p>
+<h3 id="overrides">Overrides</h3>
+<ul>
+<li><code>--max-memory-mb N</code> overrides every stratum's per-worker memory cap.</li>
+<li><code>--workers N</code> collapses a stratified profile into a single flat parallel pass with N workers and the largest stratum's memory.  Use only when you know all your files fit one bucket.</li>
+</ul>
 <h2 id="large-file-handling">Large-file handling</h2>
 <p>By default (<code>--split-size 0</code>) large files are processed directly by in-process DuckDB, which
-streams and spills to disk as needed within the global memory budget.</p>
+streams and spills to disk as needed within the per-stratum memory budget.  The spill
+directory is at <code>&lt;root&gt;/openalex-snapshot_metadata/duckdb_tmp/</code> (created automatically).</p>
 <p>Set <code>--split-size &lt;SIZE&gt;</code> (e.g. <code>256mb</code>, <code>512mb</code>) to pre-split gz files larger than that
-threshold into chunks before conversion. Each chunk produces a numbered parquet file
-(e.g. <code>part_0000_001.parquet</code>, <code>part_0000_002.parquet</code>). Use this only if you observe OOM
+threshold into chunks before conversion.  Each chunk produces a numbered parquet file
+(e.g. <code>part_0000_001.parquet</code>, <code>part_0000_002.parquet</code>).  Use this only if you observe OOM
 despite a generous profile, or when running on a machine with very limited RAM.</p>
+<h2 id="reading-the-run-log">Reading the run log</h2>
+<p>Each dataset prints two key lines:</p>
+<pre><code>[convert] dataset=works profile=stratified-36 strata=4 flat=false
+[convert] dataset=works stratum 1/4: files=54 workers=1 per_worker_mb=13000
+[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600
+...
+</code></pre>
+<ul>
+<li><code>flat=false</code> ⇒ stratified mode is active (file list partitioned across strata).</li>
+<li><code>flat=true</code> ⇒ a single parallel pass (Safe profile, or stratified collapsed by <code>--workers</code>).</li>
+<li>Strata are emitted <strong>largest-files-first</strong> so risky files surface failures early.</li>
+</ul>
 
 
 

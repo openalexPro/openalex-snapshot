@@ -575,34 +575,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../" class="md-nav__link">
         
   
@@ -1103,7 +1075,7 @@
 </code></pre>
 <h2 id="what-it-checks">What it checks</h2>
 <ul>
-<li>dependency binaries (<code>duckdb</code>, <code>aws</code>)</li>
+<li>dependency binaries (<code>aws</code> — <code>duckdb</code> is bundled and reported as ok)</li>
 <li>path writability for root/snapshot/parquet/metadata</li>
 <li>download disk requirement (remote manifest + safety margin)</li>
 <li>convert disk requirement (precise source inventory estimate)</li>
@@ -1114,7 +1086,7 @@
 <li><code>--strict</code> fail on warnings as well as failures</li>
 <li><code>--json</code> machine-readable output</li>
 <li><code>--precise</code> enable precise source inventory estimate</li>
-<li>shared runtime args: <code>--dataset</code>, <code>--profile</code>, <code>--workers</code>, <code>--max-memory-mb</code></li>
+<li>shared runtime args: <code>--dataset</code>, <code>--workers</code>, <code>--max-memory-mb</code></li>
 </ul>
 
 

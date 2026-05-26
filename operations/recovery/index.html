@@ -493,34 +493,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../commands/" class="md-nav__link">
         
   
@@ -956,10 +928,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#repair-failed-files" class="md-nav__link">
+  <a href="#repair-failed-files-built-into-convert" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Repair failed files
+        Repair failed files (built into convert)
       
     </span>
   </a>
@@ -1058,10 +1030,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#repair-failed-files" class="md-nav__link">
+  <a href="#repair-failed-files-built-into-convert" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Repair failed files
+        Repair failed files (built into convert)
       
     </span>
   </a>
@@ -1099,11 +1071,19 @@
 <h1 id="runbook-recovery-and-resume">Runbook: Recovery and Resume</h1>
 <h2 id="resume-convert">Resume convert</h2>
 <p>Re-run the same convert command; existing outputs are skipped.</p>
-<h2 id="repair-failed-files">Repair failed files</h2>
-<pre><code class="language-bash">openalex-snapshot repair_convert \
-  --root-dir /data \
-  --from-verify-report /data/openalex-snapshot_metadata/reports/verify_convert-&lt;ts&gt;.json
+<h2 id="repair-failed-files-built-into-convert">Repair failed files (built into convert)</h2>
+<p>If <code>verify_convert</code> reported failures, just re-run <code>convert</code>:</p>
+<pre><code class="language-bash">openalex-snapshot convert --root-dir /data
 </code></pre>
+<p>Convert reads the latest <code>verify_convert</code> report on startup and deletes any
+output parquet flagged as bad, so the normal skip-if-exists loop re-builds it.</p>
+<p>To skip auto-repair (process only files whose parquet is missing):</p>
+<pre><code class="language-bash">openalex-snapshot convert --root-dir /data --auto-repair=false
+</code></pre>
+<p>To force a single specific file regardless of the verify report:</p>
+<pre><code class="language-bash">openalex-snapshot convert --root-dir /data --input-file &lt;rel/path/to/file.gz&gt;
+</code></pre>
+<p>(<code>--input-file</code> always wins over auto-repair.)</p>
 <h2 id="diagnose-failures">Diagnose failures</h2>
 <ul>
 <li><code>openalex-snapshot report --root-dir /data --latest --full</code></li>

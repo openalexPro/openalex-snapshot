@@ -9,7 +9,7 @@
       
       
       
-        <link rel="prev" href="repair/">
+        <link rel="prev" href="verify/">
       
       
         <link rel="next" href="verify_index/">
@@ -492,34 +492,6 @@
                 
   
   
-  
-  
-    <li class="md-nav__item">
-      <a href="repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
     
   
   
@@ -605,10 +577,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#profile-tuning" class="md-nav__link">
+  <a href="#tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Profile / tuning
+        Tuning
       
     </span>
   </a>
@@ -1069,10 +1041,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#profile-tuning" class="md-nav__link">
+  <a href="#tuning" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Profile / tuning
+        Tuning
       
     </span>
   </a>
@@ -1103,8 +1075,7 @@ When running with <code>--dataset all</code>, existing per-dataset index files a
 <h2 id="usage">Usage</h2>
 <pre><code class="language-bash">openalex-snapshot index \
   --root-dir /data \
-  --dataset works \
-  --profile balanced
+  --dataset works
 </code></pre>
 <h2 id="output-columns">Output columns</h2>
 <ul>
@@ -1113,42 +1084,11 @@ When running with <code>--dataset all</code>, existing per-dataset index files a
 <li><code>parquet_file</code></li>
 <li><code>file_row_number</code></li>
 </ul>
-<h2 id="profile-tuning">Profile / tuning</h2>
-<p><code>--profile</code> controls the DuckDB memory budget per worker (derived from 80% of usable RAM,
-clamped to a range). Only <code>safe</code> also caps the worker count.</p>
-<table>
-<thead>
-<tr>
-<th>Profile</th>
-<th>Workers cap</th>
-<th>Memory fraction</th>
-<th>Memory range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>safe</code></td>
-<td>max 2</td>
-<td>15% of usable RAM</td>
-<td>1 – 8 GiB</td>
-</tr>
-<tr>
-<td><code>balanced</code></td>
-<td>(none)</td>
-<td>35% of usable RAM</td>
-<td>4 – 24 GiB</td>
-</tr>
-<tr>
-<td><code>fast</code></td>
-<td>(none)</td>
-<td>55% of usable RAM</td>
-<td>8 – 32 GiB</td>
-</tr>
-</tbody>
-</table>
-<p>Fallback when RAM cannot be detected: <code>safe</code>=2 GiB, <code>balanced</code>=6 GiB, <code>fast</code>=12 GiB.</p>
-<p>Use <code>--max-memory-mb</code> to override the profile memory calculation entirely.
-Workers set via <code>--workers</code> or config are respected unless <code>safe</code> clamps them.</p>
+<h2 id="tuning">Tuning</h2>
+<p><code>index</code> reads parquet files (already-converted output of <code>convert</code>), so its memory needs are modest compared to <code>convert</code>. The default tuning is fine for any host with ≥4 GB RAM. Use <code>--max-memory-mb &lt;N&gt;</code> and <code>--workers &lt;N&gt;</code> only if you need to constrain resources.</p>
+<blockquote>
+<p><strong>Note</strong>: the legacy <code>--profile safe|balanced|fast</code> flag is accepted on this command for backwards compatibility but doesn't drive stratified parallelism. The stratified profile system (<code>safe</code>, <code>stratified-36</code>, custom <code>stratified-N</code> from <code>openalex-snapshot.performance.yaml</code>) currently applies only to <code>convert</code> and <code>repair_convert</code>. See <a href="convert/#profile--tuning"><code>convert.md</code></a>.</p>
+</blockquote>
 
 
 

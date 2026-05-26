@@ -628,34 +628,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../commands/repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../commands/" class="md-nav__link">
         
   
@@ -1216,10 +1188,16 @@ cargo build --release
   --dataset all
 </code></pre>
 <h2 id="convert-snapshot-to-parquet">Convert snapshot to parquet</h2>
-<pre><code class="language-bash">./target/release/openalex-snapshot convert \
+<pre><code class="language-bash"># default profile (safe) — works on any host
+./target/release/openalex-snapshot convert \
+  --root-dir /Volumes/openalex \
+  --dataset works
+
+# faster on 32+ GB hosts (stratifies the file list by size)
+./target/release/openalex-snapshot convert \
   --root-dir /Volumes/openalex \
   --dataset works \
-  --profile balanced
+  --profile stratified-36
 </code></pre>
 <h2 id="verify-output">Verify output</h2>
 <pre><code class="language-bash">./target/release/openalex-snapshot verify_convert \

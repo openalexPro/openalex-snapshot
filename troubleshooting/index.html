@@ -491,34 +491,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../commands/repair/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    repair_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../commands/" class="md-nav__link">
         
   
@@ -1116,13 +1088,15 @@
 
 <h1 id="troubleshooting">Troubleshooting</h1>
 <h2 id="out-of-memory-in-convert">Out of memory in convert</h2>
-<p>Use:</p>
+<p><code>safe</code> is the default profile and should handle the largest files (≈1 GB compressed) on
+any host via DuckDB spill-to-disk. If you still observe OOM:</p>
 <ul>
-<li><code>--profile safe</code></li>
-<li><code>--workers 1</code></li>
-<li>explicit <code>--max-memory-mb</code></li>
+<li>Confirm you're on the default profile: drop <code>--profile &lt;name&gt;</code> to inherit <code>safe</code>.</li>
+<li>Lower the memory cap so DuckDB spills earlier: <code>--max-memory-mb 2048</code>.</li>
+<li>Pre-split very large gz files: <code>--split-size 256mb</code> (produces numbered parquets per chunk).</li>
+<li>Isolate the suspect file with <code>--input-file &lt;rel-path&gt;</code> and retry.</li>
 </ul>
-<p>If needed, convert datasets and files in smaller units.</p>
+<p>See <a href="../operations/low-memory/"><code>docs/operations/low-memory.md</code></a> for the full runbook.</p>
 <h2 id="verify-appears-to-slow-down-over-time">Verify appears to slow down over time</h2>
 <p>Expected when remaining files are larger and <code>id-hash</code> is enabled.
 Progress is item-based, not byte-based.</p>
