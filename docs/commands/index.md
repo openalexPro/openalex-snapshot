@@ -10,8 +10,7 @@ When running with `--dataset all`, existing per-dataset index files are skipped 
 ```bash
 openalex-snapshot index \
   --root-dir /data \
-  --dataset works \
-  --profile balanced
+  --dataset works
 ```
 
 ## Output columns
@@ -21,18 +20,8 @@ openalex-snapshot index \
 - `parquet_file`
 - `file_row_number`
 
-## Profile / tuning
+## Tuning
 
-`--profile` controls the DuckDB memory budget per worker (derived from 80% of usable RAM,
-clamped to a range). Only `safe` also caps the worker count.
+`index` reads parquet files (already-converted output of `convert`), so its memory needs are modest compared to `convert`. The default tuning is fine for any host with ≥4 GB RAM. Use `--max-memory-mb <N>` and `--workers <N>` only if you need to constrain resources.
 
-| Profile    | Workers cap | Memory fraction    | Memory range  |
-|------------|-------------|--------------------|---------------|
-| `safe`     | max 2       | 15% of usable RAM  | 1 – 8 GiB    |
-| `balanced` | (none)      | 35% of usable RAM  | 4 – 24 GiB   |
-| `fast`     | (none)      | 55% of usable RAM  | 8 – 32 GiB   |
-
-Fallback when RAM cannot be detected: `safe`=2 GiB, `balanced`=6 GiB, `fast`=12 GiB.
-
-Use `--max-memory-mb` to override the profile memory calculation entirely.
-Workers set via `--workers` or config are respected unless `safe` clamps them.
+> **Note**: the legacy `--profile safe|balanced|fast` flag is accepted on this command for backwards compatibility but doesn't drive stratified parallelism. The stratified profile system (`safe`, `stratified-36`, custom `stratified-N` from `openalex-snapshot.performance.yaml`) currently applies only to `convert` and `repair_convert`. See [`convert.md`](./convert.md#profile--tuning).

@@ -4,6 +4,107 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-23
+
+### Added
+
+- **`openalex-core` Phase B: profile system + SQL helpers extracted.**  The following
+  are now `pub` items in `openalex-core` rather than private CLI internals:
+  - **`profile` module** — `Stratum`, `ProfileKind`, `ProfileDef`, `ProfilesYaml`,
+    `ProfileRegistry`, `FilePair`, `StratumPlan`, `ConvertPlan`, `build_convert_plan`,
+    `validate_profile_def`, `derive_stratified_profile_for_ram`, `detect_total_memory_mb`,
+    and the two safe-mode memory-budget helpers.  The profile planner is now independently
+    testable and reusable without importing DuckDB or the CLI.
+  - **`sql` module** — `normalize_duckdb_type`, `sql_quote`, `parse_size_str`.
+  - 10 new unit tests in `openalex-core` cover all extracted items.
+  - `serde` and `serde_yaml` are now workspace-level dependency declarations.
+
+- **Cargo workspace skeleton.**  The repository is now a Cargo workspace with two members:
+  `openalex-core` (shared library crate) and `openalex-snapshot` (the CLI binary, now under
+  `openalex-snapshot/`).  The binary name, `cargo install` target, release artifacts, and
+  runtime behaviour are **unchanged**.  `openalex-core` starts with two pure SQL-string helpers
+  (`works_abstract_expr`, `works_citation_expr`) extracted from the CLI — the foundation for
+  future `extendr`-based R integration.
+
+- **Works enrichment in `convert`.**  Two derived columns are now written to every works parquet:
+  - `abstract` (VARCHAR) — plain-text abstract reconstructed from `abstract_inverted_index`
+    (positions sorted ascending, words joined with single spaces).
+  - `citation` (VARCHAR) — `"Author (year)"` / `"A & B (year)"` / `"A et al. (year)"`
+    derived from `authorships` + `publication_year`.  Null `publication_year` renders as
+    `"(n.d.)"`.  Null/empty `authorships` ⇒ null citation.
+  - `abstract_inverted_index` is **kept** in the output for callers that want the original
+    inverted form.
+  - Both columns are added only when the underlying source columns are present in the
+    inferred schema (so synthetic / minimal test fixtures convert cleanly).
+
+- **`openalex-core` Phase D: JSON→Parquet conversion pipeline in the shared library.**
+  A new `conversion` feature (deps: `duckdb` bundled + `rayon`) exposes
+  `conversion::snapshot_to_parquet`, `build_corpus_index`, and `lookup_by_id` as library
+  functions in `openalex-core`.  The R package (`openalexPro`) can call these directly via
+  `extendr` instead of shelling out to the CLI, giving R and the CLI a single shared
+  implementation.
+
+### Fixed
+
+- **`lookup_by_id`: output files now use zero-padded index names** (`part_00000.parquet`,
+  `part_00001.parquet`, …) instead of basename-derived names.  Date-partitioned corpora
+  contain many files with identical basenames (e.g. `updated_date=X/part_0000.parquet`);
+  using the basename caused rayon threads to collide on the same output path, so only the
+  first write succeeded and all others failed with "COPY failed".
+
+- **`lookup_by_id`: output batched to ~10,000 rows per file.**  Date-partitioned corpora
+  yield ~130 matching rows per source file, which previously produced ~30,000 tiny output
+  parquets for large extracts.  Entries are now grouped into batches of 10,000 rows and
+  written as a single `UNION ALL BY NAME` COPY, drastically reducing file count without
+  increasing peak memory.
+
+- **Schema cache no longer uppercases STRUCT field identifiers.**  `normalize_duckdb_type`
+  used to apply `to_uppercase()` to the entire type string, including struct field names.
+  DuckDB's `read_json(columns = …)` matches JSON keys to struct field names
+  case-sensitively, so a cached schema like `STRUCT(AUTHOR STRUCT(DISPLAY_NAME VARCHAR))`
+  silently filled every inner struct field with NULL when reading JSON with lowercase
+  keys (`{"author": {"display_name": ...}}`).  This affected every nested-struct column
+  in works (and other datasets): `authorships[*].author`, `apc_list.value`, `biblio.*`,
+  `best_oa_location.source`, …  The fix preserves identifier case while still uppercasing
+  type keywords (`BIGINT`, `VARCHAR`, `STRUCT`, …).  **Migration:** run
+  `convert --refresh-cache` once to regenerate the schema cache with corrected field-name
+  case; existing parquets containing NULL nested-struct fields will need a re-convert
+  (or rely on convert's auto-repair from a fresh `verify_convert` report).
+
+- **`convert` auto-repair from the latest `verify_convert` report.**  On startup `convert`
+  reads `<root>/openalex-snapshot_metadata/reports/verify_convert-*.json` (most recent),
+  deletes any output parquet that report flagged (`phase ∈ { verify_metrics, convert_file }`),
+  and lets the normal *skip-if-exists* filter re-include those files in the convert pass.
+  Net effect: running `convert` a second time fixes whatever `verify_convert` flagged —
+  no separate `repair_convert` subcommand needed.  Default on; opt out per-run with
+  `--auto-repair=false`, in config with `convert.auto_repair: false`, or by passing
+  `--input-file` (which always takes precedence over the verify report).
+- **Stratified profiles** for `convert`.  A new `ProfileRegistry` resolves `--profile <name>` against built-ins plus an optional user `openalex-snapshot.performance.yaml`.  Stratified profiles partition the file list by gz size and run one rayon parallel pass per non-empty stratum, each with its own worker count and DuckDB memory budget (largest-files-first execution order).  Built-in `stratified-36` provides empirically-tuned strata for 32+ GB hosts (4×4800 MB / 3×6400 MB / 2×9600 MB / 1×13000 MB, by gz-size buckets <400 / 400–600 / 600–800 / 800+ MB).
+- New global flag `--performance-config <path>` (auto-discovers `./openalex-snapshot.performance.yaml`).  Built-in profile names always work without this file.
+- New `config --create-profiles` flag scaffolds a starter `performance.yaml` auto-derived from the host's detected RAM.  The emitted profile is named `stratified-<RAM_GB>`, with workers + per-worker memory linearly scaled from the 36 GB baseline and capped so total memory never exceeds 55 % of system RAM (parallel) or 40 % (single-worker catch-all).
+- New `config --list-profiles` flag prints all built-in + user profiles with their strata as a table.
+- `convert` logs per-stratum execution lines, e.g. `[convert] dataset=works stratum 2/4: files=35 workers=2 per_worker_mb=9600`.
+
+### Changed
+
+- `all` now loops `convert → verify_convert` (instead of `convert → verify_convert → repair_convert`) up to `--retry N` times.  Each retry uses convert's new auto-repair to delete and re-build the parquets the prior verify flagged.  `--retry`'s default is unchanged (1 extra attempt).
+- **Default profile for `convert` is now `safe`** (was `auto`).  Safe runs single-worker with generous per-worker memory (45 % of usable RAM, clamped 8–24 GiB on workers=1) and reliably handles the largest works files via DuckDB spill-to-disk.
+- `--workers N` on a stratified profile collapses the plan into a single flat pass with the largest stratum's memory.  Predictable: explicit flags always override.
+- `ConvertArgs::profile` is now `String` (was the `Profile` enum).  Profile names are resolved at runtime against the registry; unknown names produce a clear error listing the available profiles.
+
+### Removed
+
+- **The `repair_convert` subcommand is gone.**  Its work folds into `convert`'s auto-repair path (see Added).  Configs containing a `repair_convert:` section or `all.enable_repair_convert: ...` will now fail `config --verify` with `unknown field`.  Migration: delete those entries.  Scripts calling `openalex-snapshot repair_convert ...` should be rewritten as `openalex-snapshot convert ...` (no extra flags needed — auto-repair runs by default).
+- The `--from-verify-report <path>` flag is gone with the subcommand.  Auto-repair always uses the latest report under `reports/`.
+- The `Profile` enum (`Auto` / `Balanced` / `Fast`) is gone.  `safe` remains as a named built-in profile (`ProfileKind::Safe`); the other names are no longer accepted.  Existing configs containing `profile: auto|balanced|fast` will fail `config --verify` and produce a clear "unknown profile" error at runtime — replace with `safe` or `stratified-36`.
+- The `--profile` flag has been removed from all non-Convert subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`).  These commands now use a fixed light tuning (workers = min(detected_cpus, 4), memory = 8 GiB) with `--workers` / `--max-memory-mb` overrides — they don't benefit from profile tuning the way `convert` does.
+- The `config --create fast` template mode is removed (the `fast` profile no longer exists).  Only `complete` and `safe` template modes remain.
+- Helper functions `resolve_tuning`, `resolve_tuning_with_total`, `auto_profile_memory_mb` are removed.  Two legacy unit tests covering them are gone.
+
+### Fixed
+
+- DuckDB `SET temp_directory` is now applied exactly once via a `OnceLock`, eliminating the warning `Cannot switch temporary directory after the current one has been used` that appeared on the second and subsequent datasets of any `all` run.  Spill-to-disk now works reliably across multi-dataset runs.
+
 ## [0.4.2] - 2026-05-11
 
 ### Fixed

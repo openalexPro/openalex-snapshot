@@ -9,7 +9,7 @@ Provide operational and development skills specific to `openalex-snapshot` behav
 ## Core operational flow
 
 1. `download` / `verify_download`
-2. `convert` / `verify_convert` / `repair_convert`
+2. `convert` (with built-in auto-repair) / `verify_convert`
 3. `index` / `verify_index`
 4. `extract`
 5. `schema` / `verify_schema`

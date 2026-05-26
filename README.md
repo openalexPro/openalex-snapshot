@@ -119,12 +119,16 @@ openalex-snapshot check --root-dir /Volumes/openalex --dataset all
 openalex-snapshot download --root-dir /Volumes/openalex
 openalex-snapshot verify_download --root-dir /Volumes/openalex
 
-# convert one dataset
+# convert one dataset (uses safe profile by default — works on any host)
+openalex-snapshot convert \
+  --root-dir /Volumes/openalex \
+  --dataset works
+
+# …or, on a 32+ GB host, use the empirically tuned stratified profile for a faster run:
 openalex-snapshot convert \
   --root-dir /Volumes/openalex \
   --dataset works \
-  --profile safe \
-  --workers 1
+  --profile stratified-36
 
 # verify conversion
 openalex-snapshot verify_convert \

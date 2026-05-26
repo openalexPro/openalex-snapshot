@@ -62,7 +62,7 @@ This document captures project invariants and decision records so human and AI c
   3. `defaults` section
   4. built-in defaults
 - `all` requires explicit `--config`.
-- Config templates support `complete` (default), `safe`, and `fast` generation modes.
+- Config templates support `complete` (default) and `safe` generation modes.
 
 ## Agent Contribution Rules
 

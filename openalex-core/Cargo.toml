@@ -1,0 +1,21 @@
+[package]
+name = "openalex-core"
+version = { workspace = true }
+edition = { workspace = true }
+description = "Core logic for OpenAlex snapshot conversion, shared between the CLI and the R package"
+
+[features]
+# Enables the full JSON→Parquet conversion pipeline (schema inference, index
+# build, ID lookup) using DuckDB and rayon.  Not enabled by the CLI crate
+# (which statically links its own DuckDB instance) but used by the openalexPro
+# R package via the extendr bridge.
+conversion = ["dep:duckdb", "dep:rayon"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Optional: only compiled when the `conversion` feature is enabled
+duckdb = { version = "1", features = ["bundled", "json", "parquet"], optional = true }
+rayon = { workspace = true, optional = true }
