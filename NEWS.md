@@ -4,6 +4,8 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-23
+
 ### Added
 
 - **`openalex-core` Phase B: profile system + SQL helpers extracted.**  The following
@@ -35,7 +37,26 @@ All notable changes to `openalex-snapshot` are documented in this file.
   - Both columns are added only when the underlying source columns are present in the
     inferred schema (so synthetic / minimal test fixtures convert cleanly).
 
+- **`openalex-core` Phase D: JSON→Parquet conversion pipeline in the shared library.**
+  A new `conversion` feature (deps: `duckdb` bundled + `rayon`) exposes
+  `conversion::snapshot_to_parquet`, `build_corpus_index`, and `lookup_by_id` as library
+  functions in `openalex-core`.  The R package (`openalexPro`) can call these directly via
+  `extendr` instead of shelling out to the CLI, giving R and the CLI a single shared
+  implementation.
+
 ### Fixed
+
+- **`lookup_by_id`: output files now use zero-padded index names** (`part_00000.parquet`,
+  `part_00001.parquet`, …) instead of basename-derived names.  Date-partitioned corpora
+  contain many files with identical basenames (e.g. `updated_date=X/part_0000.parquet`);
+  using the basename caused rayon threads to collide on the same output path, so only the
+  first write succeeded and all others failed with "COPY failed".
+
+- **`lookup_by_id`: output batched to ~10,000 rows per file.**  Date-partitioned corpora
+  yield ~130 matching rows per source file, which previously produced ~30,000 tiny output
+  parquets for large extracts.  Entries are now grouped into batches of 10,000 rows and
+  written as a single `UNION ALL BY NAME` COPY, drastically reducing file count without
+  increasing peak memory.
 
 - **Schema cache no longer uppercases STRUCT field identifiers.**  `normalize_duckdb_type`
   used to apply `to_uppercase()` to the entire type string, including struct field names.

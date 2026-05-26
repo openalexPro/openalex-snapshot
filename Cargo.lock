@@ -1412,6 +1412,8 @@ name = "openalex-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "duckdb",
+ "rayon",
  "serde",
  "serde_yaml",
 ]
