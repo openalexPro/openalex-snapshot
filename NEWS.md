@@ -105,6 +105,12 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 - DuckDB `SET temp_directory` is now applied exactly once via a `OnceLock`, eliminating the warning `Cannot switch temporary directory after the current one has been used` that appeared on the second and subsequent datasets of any `all` run.  Spill-to-disk now works reliably across multi-dataset runs.
 
+## [0.4.2] - 2026-05-11
+
+### Fixed
+
+- `convert` / `repair`: in-process DuckDB now correctly spills to disk when the memory limit is reached. Previously, `Connection::open_in_memory()` had no `temp_directory` and would OOM instead of spilling — producing the same failures as the old subprocess approach for large files. The spill directory (`<root>/openalex-snapshot_metadata/duckdb_tmp/`) is created automatically on the same filesystem as the parquet output.
+
 ## [0.4.1] - 2026-05-11
 
 ### Fixed
