@@ -1,0 +1,137 @@
+# Build pre-compiled static libraries for the openalexSnapshot R package and
+# attach them to the versioned GitHub Release.
+#
+# The R package's configure → tools/download_prebuilt.R downloads the
+# appropriate .a file for the runner platform, cutting R CMD check time from
+# ~50 min (full Rust+DuckDB source compile) to ~2 min.
+#
+# Triggers:
+#   - push of a v* tag  →  artifact is attached to that release
+#   - workflow_dispatch →  specify the tag manually (for re-builds)
+#
+# Targets built:
+#   x86_64-unknown-linux-gnu   (ubuntu-22.04 runner)
+#   aarch64-apple-darwin       (macos-latest / Apple Silicon)
+#   x86_64-apple-darwin        (macos-13 / Intel)
+#
+# Windows excluded: MinGW cross-compilation of bundled DuckDB not yet supported.
+
+name: Build prebuilt libs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build against (e.g. v0.5.0)'
+        required: true
+        default: 'v0.5.0'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: libopenalexSnapshot-x86_64-unknown-linux-gnu.a
+
+          - os: macos-latest       # Apple Silicon
+            target: aarch64-apple-darwin
+            artifact: libopenalexSnapshot-aarch64-apple-darwin.a
+            macosx_deployment_target: "11.0"
+
+          - os: macos-13           # Intel
+            target: x86_64-apple-darwin
+            artifact: libopenalexSnapshot-x86_64-apple-darwin.a
+            macosx_deployment_target: "10.13"
+
+    steps:
+      - name: Checkout openalex-snapshot (Rust core)
+        uses: actions/checkout@v4
+
+      - name: Checkout openalexSnapshot R package (for R binding source)
+        uses: actions/checkout@v4
+        with:
+          repository: rkrug/openalexSnapshot
+          path: r-pkg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: r-pkg/src/rust
+          key: prebuilt-${{ matrix.target }}
+
+      - name: Patch Cargo.toml — use local openalex-core instead of git dep
+        run: |
+          # Replace the git dependency with a local path pointing to the
+          # openalex-core crate in this checkout.
+          # Layout on runner:
+          #   ./ (openalex-snapshot workspace root)
+          #     openalex-core/
+          #     r-pkg/src/rust/Cargo.toml  ← patch this
+          # Relative path from r-pkg/src/rust/ up to openalex-core/ is ../../../openalex-core
+          python3 -c "
+          import re
+          path = 'r-pkg/src/rust/Cargo.toml'
+          with open(path) as f:
+              content = f.read()
+          content = re.sub(
+              r'git\s*=\s*\"[^\"]*openalex-snapshot[^\"]*\",\s*tag\s*=\s*\"[^\"]*\"',
+              'path = \"../../../openalex-core\"',
+              content
+          )
+          with open(path, 'w') as f:
+              f.write(content)
+          print('Patched Cargo.toml:')
+          "
+          grep openalex-core r-pkg/src/rust/Cargo.toml
+
+      - name: Build static library (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd r-pkg/src/rust
+          cargo build --release --lib --target ${{ matrix.target }}
+
+      - name: Build static library (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+        run: |
+          cd r-pkg/src/rust
+          cargo build --release --lib --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          cp r-pkg/src/rust/target/${{ matrix.target }}/release/libopenalexSnapshot.a \
+             ${{ matrix.artifact }}
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          name: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          body: |
+            Pre-compiled `libopenalexSnapshot.a` static libraries for each
+            supported platform.
+
+            Downloaded automatically by `openalexSnapshot`'s `configure` script
+            during `R CMD INSTALL` / `R CMD check`, avoiding a full Rust+DuckDB
+            source compile (~50 min → ~2 min).
+
+            Re-build by pushing a new `v*` tag or triggering *Build prebuilt libs*
+            manually.
+          files: ${{ matrix.artifact }}
