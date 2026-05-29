@@ -49,10 +49,6 @@ jobs:
             artifact: libopenalexSnapshot-aarch64-apple-darwin.a
             macosx_deployment_target: "11.0"
 
-          - os: macos-13           # Intel
-            target: x86_64-apple-darwin
-            artifact: libopenalexSnapshot-x86_64-apple-darwin.a
-            macosx_deployment_target: "10.13"
 
     steps:
       # Check out both repos side-by-side so the R binding source is NOT
