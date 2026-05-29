@@ -55,8 +55,16 @@ jobs:
             macosx_deployment_target: "10.13"
 
     steps:
+      # Check out both repos side-by-side so the R binding source is NOT
+      # nested inside the openalex-snapshot Cargo workspace (which would
+      # confuse Cargo with "package believes it's in a workspace when it's not").
+      # Layout:
+      #   rust-core/   ← openalex-snapshot (has workspace Cargo.toml)
+      #   r-pkg/       ← openalexSnapshot R binding source (sibling, not nested)
       - name: Checkout openalex-snapshot (Rust core)
         uses: actions/checkout@v4
+        with:
+          path: rust-core
 
       - name: Checkout openalexSnapshot R package (for R binding source)
         uses: actions/checkout@v4
@@ -78,12 +86,12 @@ jobs:
       - name: Patch Cargo.toml — use local openalex-core instead of git dep
         run: |
           # Replace the git dependency with a local path pointing to the
-          # openalex-core crate in this checkout.
-          # Layout on runner:
-          #   ./ (openalex-snapshot workspace root)
-          #     openalex-core/
-          #     r-pkg/src/rust/Cargo.toml  ← patch this
-          # Relative path from r-pkg/src/rust/ up to openalex-core/ is ../../../openalex-core
+          # openalex-core crate in the rust-core checkout.
+          # Layout (relative to GITHUB_WORKSPACE):
+          #   rust-core/openalex-core/   ← the crate
+          #   r-pkg/src/rust/Cargo.toml  ← patch this
+          # Relative path from r-pkg/src/rust/ up to rust-core/openalex-core/ is
+          # ../../../rust-core/openalex-core
           python3 -c "
           import re
           path = 'r-pkg/src/rust/Cargo.toml'
@@ -91,13 +99,13 @@ jobs:
               content = f.read()
           content = re.sub(
               r'git\s*=\s*\"[^\"]*openalex-snapshot[^\"]*\",\s*tag\s*=\s*\"[^\"]*\"',
-              'path = \"../../../openalex-core\"',
+              'path = \"../../../rust-core/openalex-core\"',
               content
           )
           with open(path, 'w') as f:
               f.write(content)
-          print('Patched Cargo.toml:')
           "
+          echo 'Patched Cargo.toml:'
           grep openalex-core r-pkg/src/rust/Cargo.toml
 
       - name: Build static library (Linux)
