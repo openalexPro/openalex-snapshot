@@ -1,8 +1,8 @@
 <!-- badges section begin -->
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19596862.svg)](https://doi.org/10.5281/zenodo.19596862)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/rkrug/openalex-snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/rkrug/openalex-snapshot/actions/workflows/ci.yml)
-[![GitHub release](https://img.shields.io/github/v/release/rkrug/openalex-snapshot)](https://github.com/rkrug/openalex-snapshot/releases/latest)
+[![CI](https://github.com/openalexPro/openalex-snapshot/actions/workflows/ci.yml/badge.svg)](https://github.com/openalexPro/openalex-snapshot/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/openalexPro/openalex-snapshot)](https://github.com/openalexPro/openalex-snapshot/releases/latest)
 <!-- badges section end -->
 
 # openalex-snapshot
@@ -45,7 +45,7 @@ Default root layout:
 ### 1. Build from source
 
 ```bash
-git clone https://github.com/rkrug/openalex-snapshot.git
+git clone https://github.com/openalexPro/openalex-snapshot.git
 cd openalex-snapshot
 cargo build --release
 ./target/release/openalex-snapshot --help
@@ -54,7 +54,7 @@ cargo build --release
 ### 2. Install with Cargo
 
 ```bash
-git clone https://github.com/rkrug/openalex-snapshot.git
+git clone https://github.com/openalexPro/openalex-snapshot.git
 cd openalex-snapshot
 cargo install --path .
 openalex-snapshot --help
