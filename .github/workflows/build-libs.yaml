@@ -65,7 +65,7 @@ jobs:
       - name: Checkout openalexSnapshot R package (for R binding source)
         uses: actions/checkout@v4
         with:
-          repository: rkrug/openalexSnapshot
+          repository: openalexPro/openalexSnapshot
           path: r-pkg
 
       # extendr-api build script requires R headers + libR to be present.
