@@ -1,20 +1,21 @@
 # Command: all
 
-Run the full pipeline from config with a bounded `verify_convert`/`repair_convert` retry loop.
+Run the full parquet-native pipeline from config.
 
 ## Usage
 
 ```bash
-openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
+openalex-snapshot all --config ./openalex-snapshot.yaml
 ```
 
 ## Flow
 
-1. `check` (if enabled)
-2. `download` (if enabled)
-3. `verify_download` (if enabled)
-4. `convert`
-5. `verify_convert`
-6. `repair_convert` (only when verify fails, up to `--retry`)
-7. `index`
-8. `verify_index`
+1. `download` (if enabled) — syncs the official parquet; auto-enriches `works` unless
+   `download.no_enrich: true`
+2. `verify_download` (if enabled) — manifest presence/size/row-count
+3. `index` (if enabled) — builds `<dataset>_id_idx.parquet` for each dataset (skips `*_aws`)
+4. `verify_index` (if enabled)
+
+The legacy JSON `convert` / `verify_convert` steps are **off by default**
+(`all.enable_convert` / `all.enable_verify_convert` default to `false`). They remain available
+for legacy `snapshot/` JSON trees but are deprecated.

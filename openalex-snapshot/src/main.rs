@@ -9,7 +9,7 @@ use openalex_core::profile::{
     ProfileRegistry,
 };
 use openalex_core::sql::{normalize_duckdb_type, parse_size_str, sql_quote};
-use openalex_core::{works_abstract_expr, works_citation_expr};
+use openalex_core::{works_abstract_expr, works_abstract_expr_from_json, works_citation_expr};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -37,15 +37,15 @@ Argument precedence (highest wins):
   3) config defaults section values
   4) built-in defaults
 
+OpenAlex now publishes the snapshot natively in parquet, so the pipeline is:
+  download -> verify_download -> (auto) enrich -> index -> extract
+
 This binary provides:
 - config: create or verify YAML configuration
-- all: run full config-driven pipeline
-- download: sync OpenAlex snapshot from S3-compatible source (AWS CLI wrapper)
-- verify_download: strict integrity validation for downloaded snapshot
-- convert: snapshot .json.gz -> parquet
-- verify_convert: structural and file-level data checks between snapshot and parquet
-- schema: inspect schema from source/cache/parquet, including arrow-r JSON
-- verify_schema: assert schema parity across schema sources
+- all: run full config-driven pipeline (download/verify_download/index/verify_index)
+- download: sync the official parquet snapshot from S3 (auto-enriches works)
+- verify_download: validate the parquet corpus against the published manifest
+- enrich: add abstract + citation columns to works (works_aws/ -> works/)
 - index: build *_id_idx.parquet lookup index (R build_corpus_index equivalent)
 - extract: extract rows by OpenAlex IDs using per-dataset indexes
 - verify_index: validate index integrity and coverage
@@ -54,30 +54,27 @@ This binary provides:
 - progress: monitor live status from reports/logs
 - skills: create AI skills starter pack under root_dir/skills
 - check: run dependency/path/disk/memory preflight checks
+- convert/verify_convert/schema/verify_schema: [DEPRECATED] legacy JSON-snapshot tools
 
-convert (detailed):
-  - reads <snapshot_dir>/data/<dataset>/**/*.gz
-  - writes <parquet_dir>/<dataset>/... with preserved relative structure
-  - infers unified dataset schema and uses cache
-  - verification is handled separately by verify_convert
+download (detailed):
+  - per-dataset sync: aws s3 sync s3://openalex/data/parquet/<ds>/ <root>/parquet/<ds>/
+  - works lands in works_aws/ and is auto-enriched into works/ (skip with --no-enrich)
+  - dataset list + disk preflight derive from s3://openalex/data/parquet/manifest.json
+  - transfer tuning applied via a temporary AWS config (no global ~/.aws change)
 
-verify_convert (detailed):
-  - checks .gz -> .parquet mapping and folder structure parity
-  - checks per-file row count parity
+verify_download (detailed):
+  - validates presence, size (content_length), and row count (record_count) per manifest file
+  - default uses footer metadata; --full does a row scan; --quick skips row counts
 
-schema (detailed):
-  - supports sources: auto|source|cache|parquet
-  - supports formats: table|json|yaml|arrow-r
-  - supports source-vs-source diff via --diff-with
-
-verify_schema (detailed):
-  - compares schema sources and exits non-zero on differences
-  - default comparison: source vs parquet
+enrich (detailed):
+  - reconstructs abstract from the JSON abstract_inverted_index and builds citation
+  - incremental + row-parity checked; raw works_aws/ is never modified
 
 index (detailed):
   - stage 1: per-file shard index build (resumable)
   - stage 2: shard combine into *_id_idx.parquet
   - outputs columns: id, id_block, parquet_file, file_row_number
+  - index --dataset all skips *_aws staging dirs
 
 extract (detailed):
   - reads IDs from CSV
@@ -85,37 +82,18 @@ extract (detailed):
   - resolves files via *_id_idx.parquet
   - writes one parquet output per dataset
 
-auto-repair (built into convert):
-  - on every run, convert reads the latest verify_convert report
-  - deletes any output parquet that verify flagged as bad
-  - the normal skip-if-exists filter then re-includes those files
-  - disable with `--auto-repair=false` (or per-config `convert.auto_repair: false`)
-  - ignored when --input-file is given (so ad-hoc single-file runs are predictable)
-
-download/verify_download (detailed):
-  - default sync command:
-    aws s3 sync --delete s3://openalex ./snapshot --no-sign-request
-  - disk preflight:
-    required free space = remote manifest size + 10%
-  - strict validation compares remote manifest vs local files
-  - validates file presence, size parity, and gzip integrity for .json.gz
-
 Examples:
-  openalex-snapshot convert --root-dir /data --dataset works
-  openalex-snapshot verify_convert --root-dir /data --dataset works --scope dataset --metadata-level both
-  openalex-snapshot schema --root-dir /data --dataset works --format arrow-r
-  openalex-snapshot verify_schema --root-dir /data --dataset works
-  openalex-snapshot index --root-dir /data --dataset works
+  openalex-snapshot download --root-dir /data
+  openalex-snapshot verify_download --root-dir /data
+  openalex-snapshot enrich --root-dir /data
+  openalex-snapshot index --root-dir /data --dataset all
   openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
   openalex-snapshot verify_index --root-dir /data --dataset works
   openalex-snapshot report --root-dir /data --latest
   openalex-snapshot prune-reports --root-dir /data
   openalex-snapshot skills --root-dir /data
   openalex-snapshot check --root-dir /data --dataset all
-  openalex-snapshot download --root-dir /data
-  openalex-snapshot verify_download --root-dir /data
-  openalex-snapshot convert --root-dir /data --dataset all
-  openalex-snapshot verify_convert --root-dir /data --dataset all --scope snapshot
+  openalex-snapshot all --config ./openalex-snapshot.yaml
   openalex-snapshot progress --root-dir /data
   openalex-snapshot config --create complete
   openalex-snapshot config --create safe
@@ -331,8 +309,28 @@ Profile / tuning:
   Set --max-memory-mb to override the profile memory calculation entirely.
 ";
 
+const ENRICH_LONG_ABOUT: &str = "\
+Enrich the downloaded works parquet with derived columns.
+
+Reads the raw official works from <root_dir>/parquet/works_aws/ and writes an
+enriched copy to <root_dir>/parquet/works/ that adds two columns:
+  abstract  — plain text reconstructed from the JSON abstract_inverted_index
+  citation  — \"Author (year)\" / \"A & B (year)\" / \"A et al. (year)\"
+
+Behavior:
+  - Mirrors the updated_date=.../part_*.parquet partition layout.
+  - Incremental: skips outputs newer than their source (use --overwrite to force).
+  - Row-parity self-check: enriched row count must equal the source row count.
+  - The raw works_aws/ is left untouched, so it stays manifest-verifiable and the
+    next snapshot's incremental `aws s3 sync` is unaffected.
+
+`download` runs this automatically for works unless --no-enrich is given.
+Only the 'works' dataset is supported (other datasets need no enrichment).
+";
+
 const CONVERT_LONG_ABOUT: &str = "\
-Convert OpenAlex snapshot JSON.GZ files into parquet files.
+[DEPRECATED — JSON pipeline] Convert OpenAlex snapshot JSON.GZ files into parquet files.
+OpenAlex now publishes parquet natively; use `download` (+ auto `enrich`) instead.
 
 Behavior:
 1) Discovers source files under <root_dir>/snapshot/data/<dataset>/**/*.gz
@@ -479,25 +477,27 @@ enum Commands {
         name = "verify_download"
     )]
     ValidateDownload(ValidateDownloadArgs),
-    #[command(about = "Convert snapshot .json.gz files to parquet", long_about = CONVERT_LONG_ABOUT)]
+    #[command(about = "[DEPRECATED] Convert legacy snapshot .json.gz files to parquet", long_about = CONVERT_LONG_ABOUT)]
     Convert(ConvertArgs),
     #[command(
-        about = "Verify structure and data parity between snapshot and parquet",
+        about = "[DEPRECATED] Verify parity between a legacy JSON snapshot and parquet",
         long_about = VERIFY_LONG_ABOUT,
         name = "verify_convert"
     )]
     Verify(VerifyArgs),
     #[command(
-        about = "Inspect schema from source/cache/parquet and compare schema variants",
+        about = "[DEPRECATED] Inspect schema from a legacy JSON source/cache/parquet",
         long_about = SCHEMA_LONG_ABOUT
     )]
     Schema(SchemaArgs),
-    #[command(about = "Verify schema parity across sources.", long_about = VERIFY_SCHEMA_LONG_ABOUT, name = "verify_schema")]
+    #[command(about = "[DEPRECATED] Verify schema parity across legacy sources.", long_about = VERIFY_SCHEMA_LONG_ABOUT, name = "verify_schema")]
     VerifySchema(VerifySchemaArgs),
     #[command(about = "Build a parquet lookup index for a parquet corpus.", long_about = INDEX_LONG_ABOUT)]
     Index(IndexArgs),
     #[command(about = "Extract rows by OpenAlex IDs using indexes.", long_about = EXTRACT_LONG_ABOUT)]
     Extract(ExtractArgs),
+    #[command(about = "Enrich works parquet with abstract + citation columns.", long_about = ENRICH_LONG_ABOUT)]
+    Enrich(EnrichArgs),
     #[command(
         about = "Verify index integrity for a parquet corpus.",
         long_about = VERIFY_INDEX_LONG_ABOUT,
@@ -948,6 +948,42 @@ struct IndexArgs {
 }
 
 #[derive(clap::Args, Debug, Clone)]
+#[command(long_about = ENRICH_LONG_ABOUT)]
+struct EnrichArgs {
+    #[arg(long, default_value = ".")]
+    #[arg(help = "Root directory containing parquet/ and openalex-snapshot_metadata/")]
+    root_dir: PathBuf,
+
+    #[arg(long, default_value = "works")]
+    #[arg(help = "Dataset to enrich (only 'works' is supported)")]
+    dataset: String,
+
+    #[arg(long, default_value_t = 0)]
+    #[arg(help = "Number of workers (0 = auto: cpus-2)")]
+    workers: usize,
+
+    #[arg(long)]
+    #[arg(help = "Per-worker memory cap override in MB")]
+    max_memory_mb: Option<usize>,
+
+    #[arg(long)]
+    #[arg(help = "Path to duckdb executable (unused; DuckDB is statically linked)")]
+    duckdb_bin: Option<PathBuf>,
+
+    #[arg(long, default_value_t = true)]
+    #[arg(help = "Show progress bars with rough ETA")]
+    progress: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Overwrite existing enriched files instead of skipping up-to-date ones")]
+    overwrite: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Explain planned actions and exit without executing")]
+    explain: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
 #[command(about = "Extract rows by OpenAlex IDs using indexes")]
 #[command(long_about = EXTRACT_LONG_ABOUT)]
 struct ExtractArgs {
@@ -994,6 +1030,9 @@ struct DownloadArgs {
     #[arg(skip = PathBuf::new())]
     snapshot_dir: PathBuf,
 
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
+
     #[arg(long, default_value = "s3://openalex")]
     #[arg(help = "Source S3 URI")]
     s3_uri: String,
@@ -1038,6 +1077,24 @@ struct DownloadArgs {
     #[arg(help = "Skip free disk space preflight checks")]
     skip_disk_check: bool,
 
+    #[arg(long, default_value_t = 10)]
+    #[arg(
+        help = "aws s3 max_concurrent_requests (applied via a temp AWS config, no global change)"
+    )]
+    max_concurrent_requests: usize,
+
+    #[arg(long, default_value_t = 50000)]
+    #[arg(help = "aws s3 max_queue_size (applied via a temp AWS config)")]
+    max_queue_size: usize,
+
+    #[arg(long, default_value = "32MB")]
+    #[arg(help = "aws s3 multipart_chunksize (applied via a temp AWS config)")]
+    multipart_chunksize: String,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Skip auto-enrich of works after download (raw works_aws/ only)")]
+    no_enrich: bool,
+
     #[arg(long, default_value_t = true)]
     #[arg(help = "Show progress bars with rough ETA")]
     progress: bool,
@@ -1063,6 +1120,9 @@ struct ValidateDownloadArgs {
 
     #[arg(skip = PathBuf::new())]
     snapshot_dir: PathBuf,
+
+    #[arg(skip = PathBuf::new())]
+    parquet_dir: PathBuf,
 
     #[arg(long, default_value = "s3://openalex")]
     #[arg(help = "Source S3 URI for remote manifest")]
@@ -1099,6 +1159,14 @@ struct ValidateDownloadArgs {
     #[arg(long, default_value_t = true)]
     #[arg(help = "Detect extra local files not present remotely")]
     check_extra: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Presence + size only; skip parquet row-count checks (fastest)")]
+    quick: bool,
+
+    #[arg(long, default_value_t = false)]
+    #[arg(help = "Full row scan instead of footer metadata (catches data-page corruption; slow)")]
+    full: bool,
 
     #[arg(long, default_value_t = 0)]
     #[arg(help = "Number of worker threads for local integrity checks (0 = auto: cpus-2)")]
@@ -1356,6 +1424,7 @@ struct AppConfig {
     schema: Option<SchemaConfig>,
     index: Option<IndexConfig>,
     extract: Option<ExtractConfig>,
+    enrich: Option<EnrichConfig>,
     download: Option<DownloadConfig>,
     verify_download: Option<ValidateDownloadConfig>,
     verify_index: Option<VerifyIndexConfig>,
@@ -1477,6 +1546,18 @@ struct ExtractConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EnrichConfig {
+    root_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    workers: Option<usize>,
+    max_memory_mb: Option<usize>,
+    duckdb_bin: Option<PathBuf>,
+    progress: Option<bool>,
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DownloadConfig {
     root_dir: Option<PathBuf>,
     s3_uri: Option<String>,
@@ -1492,6 +1573,10 @@ struct DownloadConfig {
     delete_files: Option<bool>,
     no_delete: Option<bool>,
     skip_disk_check: Option<bool>,
+    max_concurrent_requests: Option<usize>,
+    max_queue_size: Option<usize>,
+    multipart_chunksize: Option<String>,
+    no_enrich: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1510,6 +1595,8 @@ struct ValidateDownloadConfig {
     no_sign_request: Option<bool>,
     signed: Option<bool>,
     check_extra: Option<bool>,
+    quick: Option<bool>,
+    full: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1617,14 +1704,6 @@ struct ExtractInput {
     /// Full-URL form matching what the index stores, e.g. "https://openalex.org/W1234"
     canonical: String,
     dataset: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteObject {
-    key: String,
-    size: u64,
-    etag: String,
-    last_modified: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1818,6 +1897,11 @@ fn main() -> Result<()> {
             }
             run_extract(args)
         }
+        Commands::Enrich(mut args) => {
+            apply_enrich_config(&mut args, cfg.as_ref(), sub_matches);
+            try_migrate_metadata_root(&args.root_dir);
+            run_enrich(args)
+        }
         Commands::Download(mut args) => {
             fill_download_dirs(&mut args);
             apply_download_config(&mut args, cfg.as_ref(), sub_matches);
@@ -1898,10 +1982,12 @@ fn fill_shared_dirs(shared: &mut SharedArgs) {
 
 fn fill_download_dirs(args: &mut DownloadArgs) {
     args.snapshot_dir = args.root_dir.join("snapshot");
+    args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_validate_download_dirs(args: &mut ValidateDownloadArgs) {
     args.snapshot_dir = args.root_dir.join("snapshot");
+    args.parquet_dir = args.root_dir.join("parquet");
 }
 
 fn fill_report_dirs(args: &mut ReportArgs) {
@@ -2463,6 +2549,73 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
     }
 }
 
+fn apply_enrich_config(
+    args: &mut EnrichArgs,
+    cfg: Option<&AppConfig>,
+    matches: Option<&ArgMatches>,
+) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if let Some(d) = &cfg.defaults {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &d.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = d.workers {
+                args.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            args.max_memory_mb = d.max_memory_mb;
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = d.progress {
+                args.progress = v;
+            }
+        }
+    }
+    if let Some(c) = &cfg.enrich {
+        if !cli_explicit(matches, "root_dir") {
+            if let Some(v) = &c.root_dir {
+                args.root_dir = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "dataset") {
+            if let Some(v) = &c.dataset {
+                args.dataset = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "workers") {
+            if let Some(v) = c.workers {
+                args.workers = v;
+            }
+        }
+        if !cli_explicit(matches, "max_memory_mb") {
+            if let Some(v) = c.max_memory_mb {
+                args.max_memory_mb = Some(v);
+            }
+        }
+        if !cli_explicit(matches, "duckdb_bin") {
+            if let Some(v) = &c.duckdb_bin {
+                args.duckdb_bin = Some(v.clone());
+            }
+        }
+        if !cli_explicit(matches, "progress") {
+            if let Some(v) = c.progress {
+                args.progress = v;
+            }
+        }
+        if !cli_explicit(matches, "overwrite") {
+            if let Some(v) = c.overwrite {
+                args.overwrite = v;
+            }
+        }
+    }
+}
+
 fn apply_extract_config(
     args: &mut ExtractArgs,
     cfg: Option<&AppConfig>,
@@ -2631,6 +2784,26 @@ fn apply_download_config(
                 args.skip_disk_check = v;
             }
         }
+        if !cli_explicit(matches, "max_concurrent_requests") {
+            if let Some(v) = c.max_concurrent_requests {
+                args.max_concurrent_requests = v;
+            }
+        }
+        if !cli_explicit(matches, "max_queue_size") {
+            if let Some(v) = c.max_queue_size {
+                args.max_queue_size = v;
+            }
+        }
+        if !cli_explicit(matches, "multipart_chunksize") {
+            if let Some(v) = &c.multipart_chunksize {
+                args.multipart_chunksize = v.clone();
+            }
+        }
+        if !cli_explicit(matches, "no_enrich") {
+            if let Some(v) = c.no_enrich {
+                args.no_enrich = v;
+            }
+        }
     }
 }
 
@@ -2727,6 +2900,16 @@ fn apply_validate_download_config(
         if !cli_explicit(matches, "check_extra") {
             if let Some(v) = c.check_extra {
                 args.check_extra = v;
+            }
+        }
+        if !cli_explicit(matches, "quick") {
+            if let Some(v) = c.quick {
+                args.quick = v;
+            }
+        }
+        if !cli_explicit(matches, "full") {
+            if let Some(v) = c.full {
+                args.full = v;
             }
         }
     }
@@ -3172,10 +3355,11 @@ all:
   enable_download: true
   # allowed values: true | false
   enable_verify_download: true
+  # [DEPRECATED legacy JSON pipeline] default false in the parquet-native era
   # allowed values: true | false
-  enable_convert: true
+  enable_convert: false
   # allowed values: true | false
-  enable_verify_convert: true
+  enable_verify_convert: false
   # allowed values: true | false
   enable_index: true
   # allowed values: true | false
@@ -3219,13 +3403,25 @@ download:
   # allowed values: true | false
   no_delete: false
 
+  # Auto-enrich works after download (works_aws/ -> works/). Set true to skip.
+  # allowed values: true | false
+  no_enrich: false
+  # AWS S3 transfer tuning (applied via a temp AWS config; global ~/.aws untouched).
+  # allowed values: positive integer
+  max_concurrent_requests: 10
+  # allowed values: positive integer
+  max_queue_size: 50000
+  # allowed values: e.g. 8MB, 32MB, 64MB
+  multipart_chunksize: 32MB
+
   # Skip free disk space preflight check for download.
   # allowed values: true | false
   # skip_disk_check: false
 
 verify_download:
   # ---------------------------------------------------------------------------
-  # Verify downloaded snapshot against remote manifest + gzip integrity
+  # Verify downloaded parquet corpus against the published manifest.json
+  # (presence + size + row count). --quick = size-only, --full = row scan.
   # ---------------------------------------------------------------------------
   # Shared-default overrides supported here (optional, uncomment to override defaults):
   # root_dir: .
@@ -3983,29 +4179,27 @@ fn run_check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    if let Ok(remote) = fetch_remote_manifest(
-        &ValidateDownloadArgs {
-            root_dir: args.shared.root_dir.clone(),
-            snapshot_dir: args.shared.snapshot_dir.clone(),
-            s3_uri: args.s3_uri.clone(),
-            dataset: args.shared.dataset.clone(),
-            aws_bin: args.aws_bin.clone(),
-            endpoint_url: args.endpoint_url.clone(),
-            region: args.region.clone(),
-            profile_name: args.profile_name.clone(),
-            no_sign_request: args.no_sign_request,
-            signed: args.signed,
-            check_extra: true,
-            workers: args.shared.workers,
-            progress: false,
-            explain: false,
-            state_flush_every: 25,
-        },
-        false,
+    let check_parquet_dir = args.shared.root_dir.join("parquet");
+    if let Ok(manifest) = fetch_parquet_manifest(
+        &args.aws_bin,
+        &args.s3_uri,
+        &args.endpoint_url,
+        &args.region,
+        &args.profile_name,
+        args.no_sign_request && !args.signed,
     ) {
-        let remote_total_bytes: u64 = remote.iter().map(|o| o.size).sum();
+        let remote_total_bytes: u64 = if args.shared.dataset == "all" {
+            manifest.meta.content_length
+        } else {
+            manifest
+                .entities
+                .iter()
+                .find(|e| e.entity == args.shared.dataset)
+                .map(|e| e.content_length)
+                .unwrap_or(0)
+        };
         let required_bytes = remote_total_bytes.saturating_mul(11).saturating_div(10);
-        match available_disk_bytes(&args.shared.snapshot_dir) {
+        match available_disk_bytes(&check_parquet_dir) {
             Ok(free) if free >= required_bytes => findings.push(CheckFinding {
                 name: "download_disk".to_string(),
                 status: "ok".to_string(),
@@ -4038,7 +4232,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     phase: "check_download_disk".to_string(),
                     rel_path: None,
                     source_path: Some(args.s3_uri.clone()),
-                    output_path: Some(args.shared.snapshot_dir.to_string_lossy().to_string()),
+                    output_path: Some(check_parquet_dir.to_string_lossy().to_string()),
                     error_message: msg,
                     suggested_recovery: Some(
                         "Free up disk space, or set skip_disk_check: true under download: in your config, or pass --skip-disk-check to the download/all command".to_string(),
@@ -4667,13 +4861,13 @@ fn read_last_log_lines(path: &Path, n: usize) -> Vec<String> {
 }
 
 fn log_paths_for_report(
-    snapshot_dir: &Path,
+    _snapshot_dir: &Path,
     parquet_dir: &Path,
     report: &RunReport,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if report.command == "download" || report.command == "verify_download" {
-        out.push(download_log_path(snapshot_dir));
+        // Parquet-native download/verify no longer write a per-step .log file.
         return out;
     }
     for ds in &report.datasets {
@@ -4829,8 +5023,9 @@ fn resolve_all_settings(args: &AllArgs, cfg: &AppConfig) -> AllResolved {
         retry: c.retry.unwrap_or(args.retry),
         enable_download: c.enable_download.unwrap_or(true),
         enable_verify_download: c.enable_verify_download.unwrap_or(true),
-        enable_convert: c.enable_convert.unwrap_or(true),
-        enable_verify_convert: c.enable_verify_convert.unwrap_or(true),
+        // Legacy JSON pipeline: off by default in the parquet-native era.
+        enable_convert: c.enable_convert.unwrap_or(false),
+        enable_verify_convert: c.enable_verify_convert.unwrap_or(false),
         enable_index: c.enable_index.unwrap_or(true),
         enable_verify_index: c.enable_verify_index.unwrap_or(true),
         skip_disk_check,
@@ -4935,6 +5130,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig, performance_config: Option<&Path>) ->
         let mut da = DownloadArgs {
             root_dir: resolved.root_dir.clone(),
             snapshot_dir: PathBuf::new(),
+            parquet_dir: PathBuf::new(),
             s3_uri: "s3://openalex".to_string(),
             dataset: "all".to_string(),
             aws_bin: PathBuf::from("aws"),
@@ -4946,6 +5142,10 @@ fn run_all(args: AllArgs, cfg: &AppConfig, performance_config: Option<&Path>) ->
             delete_files: true,
             no_delete: false,
             skip_disk_check: resolved.skip_disk_check,
+            max_concurrent_requests: 10,
+            max_queue_size: 50000,
+            multipart_chunksize: "32MB".to_string(),
+            no_enrich: false,
             progress: true,
             explain: false,
             state_flush_every: 25,
@@ -4977,6 +5177,7 @@ fn run_all(args: AllArgs, cfg: &AppConfig, performance_config: Option<&Path>) ->
         let mut va = ValidateDownloadArgs {
             root_dir: resolved.root_dir.clone(),
             snapshot_dir: PathBuf::new(),
+            parquet_dir: PathBuf::new(),
             s3_uri: "s3://openalex".to_string(),
             dataset: "all".to_string(),
             aws_bin: PathBuf::from("aws"),
@@ -4986,6 +5187,8 @@ fn run_all(args: AllArgs, cfg: &AppConfig, performance_config: Option<&Path>) ->
             no_sign_request: true,
             signed: false,
             check_extra: true,
+            quick: false,
+            full: false,
             workers: 0,
             progress: true,
             explain: false,
@@ -5289,6 +5492,7 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
                 }
             })
             .filter(|s| !s.starts_with('.'))
+            .filter(|s| !s.ends_with("_aws"))
             .collect();
         datasets.sort();
         if datasets.is_empty() {
@@ -6315,6 +6519,9 @@ fn run_index(args: IndexArgs) -> Result<()> {
                 }
             })
             .filter(|s| !s.starts_with('.'))
+            // Skip raw `*_aws` staging dirs (e.g. works_aws) — the enriched canonical
+            // dataset (works) is indexed instead.
+            .filter(|s| !s.ends_with("_aws"))
             .collect();
         datasets.sort();
         if datasets.is_empty() {
@@ -6605,6 +6812,228 @@ fn run_index(args: IndexArgs) -> Result<()> {
     );
     if report.totals_failed > 0 {
         bail!("[index] failures detected: {}", report.totals_failed);
+    }
+    Ok(())
+}
+
+fn explain_enrich(args: &EnrichArgs, src_dir: &Path, out_dir: &Path, tuning: &Tuning) {
+    println!("--explain: enrich");
+    println!("dataset: {}", args.dataset);
+    println!("source: {}", src_dir.display());
+    println!("output: {}", out_dir.display());
+    println!("workers: {}", tuning.workers);
+    println!("memory_mb: {:?}", tuning.memory_mb);
+    println!("overwrite: {}", args.overwrite);
+}
+
+/// Enrich raw works (`parquet/works_aws/`) into `parquet/works/` with `abstract`
+/// + `citation` columns, mirroring the partition layout. Incremental + row-parity checked.
+fn run_enrich(args: EnrichArgs) -> Result<()> {
+    if args.dataset != "works" {
+        bail!(
+            "[enrich] only the 'works' dataset is supported (got '{}')",
+            args.dataset
+        );
+    }
+    let bin = duckdb_bin_from_option(&args.duckdb_bin);
+    let parquet_dir = args.root_dir.join("parquet");
+    let src_dir = parquet_dir.join("works_aws");
+    let out_dir = parquet_dir.join("works");
+    let tuning = light_tuning_with_override(args.workers, args.max_memory_mb);
+    if args.explain {
+        explain_enrich(&args, &src_dir, &out_dir, &tuning);
+        return Ok(());
+    }
+    if !src_dir.exists() {
+        bail!(
+            "[enrich] source corpus not found: {} (run download first)",
+            src_dir.display()
+        );
+    }
+    let _lock = acquire_lock(&parquet_dir, "enrich")?;
+    let _ = cleanup_command_reports(&parquet_dir, "enrich");
+
+    let mut report_args = BTreeMap::new();
+    report_args.insert(
+        "root_dir".to_string(),
+        args.root_dir.to_string_lossy().to_string(),
+    );
+    report_args.insert("dataset".to_string(), "works".to_string());
+    report_args.insert("workers".to_string(), tuning.workers.to_string());
+    let mut report = report_new("enrich", report_args);
+    let mut ds = DatasetReportSummary {
+        dataset: "works".to_string(),
+        ..Default::default()
+    };
+
+    let files = list_parquet_files(&src_dir)?;
+    if files.is_empty() {
+        bail!("[enrich] no parquet files under {}", src_dir.display());
+    }
+    ds.items_scanned = files.len() as u64;
+
+    // Decide which derived columns the source supports (once, from the first file).
+    let cols = describe_parquet_glob(&bin, &files[0].to_string_lossy(), tuning.memory_mb)?;
+    let mut select_extras = String::new();
+    if cols.contains_key("abstract_inverted_index") {
+        select_extras.push_str(&format!(
+            ", {} AS abstract",
+            works_abstract_expr_from_json()
+        ));
+    }
+    if cols.contains_key("authorships") && cols.contains_key("publication_year") {
+        select_extras.push_str(&format!(", {} AS citation", works_citation_expr()));
+    }
+    if select_extras.is_empty() {
+        bail!("[enrich] source works parquet has neither abstract_inverted_index nor authorships+publication_year");
+    }
+
+    let start = Instant::now();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(tuning.workers)
+        .build()
+        .context("failed to build rayon thread pool")?;
+    let pb = make_progress_bar(args.progress, files.len() as u64, "enrich");
+    let extras = select_extras.as_str();
+    let mem = tuning.memory_mb;
+    let overwrite = args.overwrite;
+
+    let outcomes: Vec<(bool, Option<FailureEntry>)> = pool.install(|| {
+        files
+            .par_iter()
+            .map(|pf| {
+                let rel = match pf.strip_prefix(&src_dir) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(e) => {
+                        pb.inc(1);
+                        return (
+                            false,
+                            Some(FailureEntry {
+                                dataset: "works".to_string(),
+                                phase: "enrich".to_string(),
+                                rel_path: None,
+                                source_path: Some(pf.to_string_lossy().to_string()),
+                                output_path: None,
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: None,
+                            }),
+                        );
+                    }
+                };
+                let out_file = out_dir.join(&rel);
+                if !overwrite && out_file.exists() {
+                    if let (Ok(om), Ok(sm)) = (fs::metadata(&out_file), fs::metadata(pf)) {
+                        let up_to_date = match (om.modified(), sm.modified()) {
+                            (Ok(o), Ok(s)) => o >= s,
+                            _ => true,
+                        };
+                        if up_to_date {
+                            pb.inc(1);
+                            return (true, None);
+                        }
+                    }
+                }
+                if let Some(parent) = out_file.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        pb.inc(1);
+                        return (
+                            false,
+                            Some(FailureEntry {
+                                dataset: "works".to_string(),
+                                phase: "enrich".to_string(),
+                                rel_path: Some(rel.to_string_lossy().to_string()),
+                                source_path: Some(pf.to_string_lossy().to_string()),
+                                output_path: Some(out_file.to_string_lossy().to_string()),
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: None,
+                            }),
+                        );
+                    }
+                }
+                let mut sql = String::new();
+                sql.push_str("SET preserve_insertion_order = false;");
+                sql.push_str("SET threads = 1;");
+                if let Some(mb) = mem {
+                    sql.push_str(&format!("SET memory_limit='{}MB';", mb));
+                }
+                sql.push_str(&format!(
+                    "COPY (SELECT *{} FROM read_parquet({})) TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
+                    extras,
+                    sql_quote(&pf.to_string_lossy()),
+                    sql_quote(&out_file.to_string_lossy())
+                ));
+                if let Err(e) = run_duckdb_sql(&bin, &sql) {
+                    pb.inc(1);
+                    return (
+                        false,
+                        Some(FailureEntry {
+                            dataset: "works".to_string(),
+                            phase: "enrich".to_string(),
+                            rel_path: Some(rel.to_string_lossy().to_string()),
+                            source_path: Some(pf.to_string_lossy().to_string()),
+                            output_path: Some(out_file.to_string_lossy().to_string()),
+                            error_message: format!("{e:#}"),
+                            suggested_recovery: Some("rerun enrich".to_string()),
+                        }),
+                    );
+                }
+                // Row-parity self-check: enriched row count must equal source row count.
+                let parity = match (parquet_rowcount_meta(pf), parquet_rowcount_meta(&out_file)) {
+                    (Ok(a), Ok(b)) if a == b => None,
+                    (Ok(a), Ok(b)) => Some(format!("rowcount mismatch src={a} enriched={b}")),
+                    (a, b) => Some(
+                        a.err()
+                            .or_else(|| b.err())
+                            .map(|e| format!("{e:#}"))
+                            .unwrap_or_else(|| "rowcount check failed".to_string()),
+                    ),
+                };
+                pb.inc(1);
+                match parity {
+                    None => (false, None),
+                    Some(msg) => {
+                        let _ = fs::remove_file(&out_file);
+                        (
+                            false,
+                            Some(FailureEntry {
+                                dataset: "works".to_string(),
+                                phase: "enrich_rowcount".to_string(),
+                                rel_path: Some(rel.to_string_lossy().to_string()),
+                                source_path: Some(pf.to_string_lossy().to_string()),
+                                output_path: Some(out_file.to_string_lossy().to_string()),
+                                error_message: msg,
+                                suggested_recovery: Some("rerun enrich".to_string()),
+                            }),
+                        )
+                    }
+                }
+            })
+            .collect()
+    });
+    pb.finish_with_message("enrich complete");
+    for (skipped, failure) in outcomes {
+        if skipped {
+            ds.skipped += 1;
+        }
+        if let Some(f) = failure {
+            ds.failed += 1;
+            report.failures.push(f);
+        }
+    }
+    ds.succeeded = ds.items_scanned.saturating_sub(ds.failed + ds.skipped);
+    eprintln!(
+        "[enrich] done in {:.1}s: ok={} skipped={} failed={} -> {}",
+        start.elapsed().as_secs_f64(),
+        ds.succeeded,
+        ds.skipped,
+        ds.failed,
+        out_dir.display()
+    );
+    report.datasets = vec![ds];
+    report_finalize(&mut report);
+    if report.totals_failed > 0 {
+        let _ = write_run_reports(&parquet_dir, &report);
+        bail!("[enrich] failures detected: {}", report.totals_failed);
     }
     Ok(())
 }
@@ -7682,82 +8111,88 @@ fn run_verify_schema(args: VerifySchemaArgs) -> Result<()> {
 
 fn run_download(args: DownloadArgs) -> Result<()> {
     ensure_aws_cli(&args.aws_bin)?;
-    fs::create_dir_all(&args.snapshot_dir)?;
+    fs::create_dir_all(&args.parquet_dir)?;
     if args.explain {
         explain_download(&args)?;
         return Ok(());
     }
-    let parquet_dir = args.root_dir.join("parquet");
-    let _lock = acquire_lock(&parquet_dir, "download")?;
-    let _ = archive_completed_run(&parquet_dir, &args.snapshot_dir);
+    let _lock = acquire_lock(&args.parquet_dir, "download")?;
     let _ = cleanup_download_reports(&args.snapshot_dir, "download");
-    let _ = cleanup_download_log(&args.snapshot_dir, "download");
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    let effective_delete = args.delete_files && !args.no_delete;
+
     let mut report_args = BTreeMap::new();
     report_args.insert(
-        "snapshot_dir".to_string(),
-        args.snapshot_dir.to_string_lossy().to_string(),
+        "parquet_dir".to_string(),
+        args.parquet_dir.to_string_lossy().to_string(),
     );
     report_args.insert("s3_uri".to_string(), args.s3_uri.clone());
     report_args.insert("dataset".to_string(), args.dataset.clone());
-    let effective_no_sign = args.no_sign_request && !args.signed;
-    let effective_delete = args.delete_files && !args.no_delete;
     report_args.insert("no_sign_request".to_string(), effective_no_sign.to_string());
     report_args.insert("delete_files".to_string(), effective_delete.to_string());
-    report_args.insert(
-        "state_flush_every".to_string(),
-        args.state_flush_every.to_string(),
-    );
+    report_args.insert("no_enrich".to_string(), args.no_enrich.to_string());
     let mut report = report_new("download", report_args);
 
-    let preflight_validate_args = ValidateDownloadArgs {
-        root_dir: args.root_dir.clone(),
-        snapshot_dir: args.snapshot_dir.clone(),
-        s3_uri: args.s3_uri.clone(),
-        dataset: args.dataset.clone(),
-        aws_bin: args.aws_bin.clone(),
-        endpoint_url: args.endpoint_url.clone(),
-        region: args.region.clone(),
-        profile_name: args.profile_name.clone(),
-        no_sign_request: effective_no_sign,
-        signed: args.signed,
-        check_extra: effective_delete,
-        workers: 0,
-        progress: false,
-        explain: false,
-        state_flush_every: args.state_flush_every,
-    };
-    let remote_manifest = match fetch_remote_manifest(&preflight_validate_args, false) {
-        Ok(v) => v,
+    // Fetch the official parquet manifest (drives the dataset list + disk preflight).
+    let manifest = match fetch_parquet_manifest(
+        &args.aws_bin,
+        &args.s3_uri,
+        &args.endpoint_url,
+        &args.region,
+        &args.profile_name,
+        effective_no_sign,
+    ) {
+        Ok(m) => m,
         Err(e) => {
             report.failures.push(FailureEntry {
                 dataset: args.dataset.clone(),
                 phase: "download_manifest_fetch".to_string(),
                 rel_path: None,
                 source_path: Some(args.s3_uri.clone()),
-                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                output_path: Some(args.parquet_dir.to_string_lossy().to_string()),
                 error_message: format!("{e:#}"),
                 suggested_recovery: Some("check aws CLI/network/endpoint settings".to_string()),
             });
             report_finalize(&mut report);
-            let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
-            eprintln!(
-                "[download] summary scanned={} ok={} failed={} reports={}",
-                report.totals_items_scanned,
-                report.totals_succeeded,
-                report.totals_failed,
-                report_paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            bail!("[download] remote manifest fetch failed");
+            let _ = write_download_reports(&args.snapshot_dir, &report);
+            bail!("[download] parquet manifest fetch failed");
         }
     };
+    // Persist the fetched manifest once (single audit artifact).
+    {
+        let dir = download_metadata_root(&args.snapshot_dir);
+        let _ = fs::create_dir_all(&dir);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::json!({
+            "date": manifest.date,
+            "format": manifest.format,
+            "record_count": manifest.meta.record_count,
+            "content_length": manifest.meta.content_length,
+            "entities": manifest.entities.iter().map(|e| e.entity.clone()).collect::<Vec<_>>(),
+        })) {
+            let _ = fs::write(dir.join("manifest.json"), bytes);
+        }
+    }
+
+    let datasets: Vec<String> = if args.dataset == "all" {
+        manifest.entities.iter().map(|e| e.entity.clone()).collect()
+    } else {
+        vec![args.dataset.clone()]
+    };
+
+    // Disk preflight from the manifest content_length (+10% buffer).
     if !args.skip_disk_check {
-        let remote_total_bytes: u64 = remote_manifest.iter().map(|o| o.size).sum();
+        let remote_total_bytes: u64 = if args.dataset == "all" {
+            manifest.meta.content_length
+        } else {
+            manifest
+                .entities
+                .iter()
+                .find(|e| e.entity == args.dataset)
+                .map(|e| e.content_length)
+                .unwrap_or(0)
+        };
         let required_bytes = remote_total_bytes.saturating_mul(11).saturating_div(10);
-        let free_bytes = available_disk_bytes(&args.snapshot_dir)?;
+        let free_bytes = available_disk_bytes(&args.parquet_dir)?;
         eprintln!(
             "[download] disk preflight available={} GiB required={} GiB (remote={} GiB +10%)",
             bytes_to_gib(free_bytes),
@@ -7770,7 +8205,7 @@ fn run_download(args: DownloadArgs) -> Result<()> {
                 phase: "download_disk_space".to_string(),
                 rel_path: None,
                 source_path: Some(args.s3_uri.clone()),
-                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                output_path: Some(args.parquet_dir.to_string_lossy().to_string()),
                 error_message: format!(
                     "insufficient free disk space: available={} GiB required={} GiB",
                     bytes_to_gib(free_bytes),
@@ -7781,21 +8216,10 @@ fn run_download(args: DownloadArgs) -> Result<()> {
                 ),
             });
             report_finalize(&mut report);
-            let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
-            eprintln!(
-                "[download] summary scanned={} ok={} failed={} reports={}",
-                report.totals_items_scanned,
-                report.totals_succeeded,
-                report.totals_failed,
-                report_paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let _ = write_download_reports(&args.snapshot_dir, &report);
             bail!(
                 "[download] Not enough disk space.\n  Location : {}\n  Available: {} GiB\n  Required : {} GiB (remote {} GiB + 10% buffer)\n\nTo proceed anyway, either:\n  - Set skip_disk_check: true under the download: section in your config file\n  - Pass --skip-disk-check when running the download or all command",
-                args.snapshot_dir.display(),
+                args.parquet_dir.display(),
                 bytes_to_gib(free_bytes),
                 bytes_to_gib(required_bytes),
                 bytes_to_gib(remote_total_bytes)
@@ -7803,56 +8227,105 @@ fn run_download(args: DownloadArgs) -> Result<()> {
         }
     }
 
-    let sync = aws_sync_command(&args)?;
-    if let Err(e) = run_aws(&args.aws_bin, &sync) {
-        report.failures.push(FailureEntry {
-            dataset: args.dataset.clone(),
-            phase: "download_sync".to_string(),
-            rel_path: None,
-            source_path: Some(args.s3_uri.clone()),
-            output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
-            error_message: format!("{e:#}"),
-            suggested_recovery: Some("check aws CLI/network/endpoint settings".to_string()),
-        });
-        report_finalize(&mut report);
-        let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
-        eprintln!(
-            "[download] summary scanned={} ok={} failed={} reports={}",
-            report.totals_items_scanned,
-            report.totals_succeeded,
-            report.totals_failed,
-            report_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        bail!("[download] sync failed");
-    }
-    append_download_log(&args.snapshot_dir, "download", "sync complete")?;
+    // Apply S3 tuning via a temp AWS config (no global ~/.aws change).
+    let aws_config = write_temp_aws_config(&args)?;
+    let env = vec![("AWS_CONFIG_FILE", aws_config.to_string_lossy().to_string())];
 
-    report.datasets.push(DatasetReportSummary {
-        dataset: args.dataset.clone(),
-        items_scanned: 1,
-        succeeded: 1,
-        failed: 0,
-        skipped: 0,
-    });
+    // Per-dataset sync (continue-and-report).
+    for ds in &datasets {
+        let dst = args.parquet_dir.join(local_dir_for(ds));
+        if let Err(e) = fs::create_dir_all(&dst) {
+            report.failures.push(FailureEntry {
+                dataset: ds.clone(),
+                phase: "download_mkdir".to_string(),
+                rel_path: None,
+                source_path: None,
+                output_path: Some(dst.to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some("check permissions / disk".to_string()),
+            });
+            continue;
+        }
+        let sync = aws_sync_command(&args, ds)?;
+        eprintln!("[download] syncing {ds} -> {}", dst.display());
+        match run_aws_env(&args.aws_bin, &sync, &env) {
+            Ok(_) => report.datasets.push(DatasetReportSummary {
+                dataset: ds.clone(),
+                items_scanned: 1,
+                succeeded: 1,
+                failed: 0,
+                skipped: 0,
+            }),
+            Err(e) => {
+                report.datasets.push(DatasetReportSummary {
+                    dataset: ds.clone(),
+                    items_scanned: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    skipped: 0,
+                });
+                report.failures.push(FailureEntry {
+                    dataset: ds.clone(),
+                    phase: "download_sync".to_string(),
+                    rel_path: None,
+                    source_path: Some(format!(
+                        "{}/data/parquet/{}/",
+                        args.s3_uri.trim_end_matches('/'),
+                        ds
+                    )),
+                    output_path: Some(dst.to_string_lossy().to_string()),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some("check aws CLI/network/endpoint settings".to_string()),
+                });
+            }
+        }
+    }
+
+    // Auto-enrich works (unless skipped). Only if the works sync succeeded.
+    let works_ok = report
+        .datasets
+        .iter()
+        .any(|d| d.dataset == "works" && d.failed == 0);
+    if !args.no_enrich && datasets.iter().any(|d| d == "works") && works_ok {
+        let ea = EnrichArgs {
+            root_dir: args.root_dir.clone(),
+            dataset: "works".to_string(),
+            workers: 0,
+            max_memory_mb: None,
+            duckdb_bin: None,
+            progress: args.progress,
+            overwrite: false,
+            explain: false,
+        };
+        if let Err(e) = run_enrich(ea) {
+            report.failures.push(FailureEntry {
+                dataset: "works".to_string(),
+                phase: "download_enrich".to_string(),
+                rel_path: None,
+                source_path: Some(
+                    args.parquet_dir
+                        .join("works_aws")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                output_path: Some(args.parquet_dir.join("works").to_string_lossy().to_string()),
+                error_message: format!("{e:#}"),
+                suggested_recovery: Some(
+                    "inspect the latest enrich report and rerun `enrich`".to_string(),
+                ),
+            });
+        }
+    }
 
     report_finalize(&mut report);
-    let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
     eprintln!(
-        "[download] summary scanned={} ok={} failed={} reports={}",
-        report.totals_items_scanned,
+        "[download] summary datasets={} ok={} failed={}",
+        report.datasets.len(),
         report.totals_succeeded,
-        report.totals_failed,
-        report_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        report.totals_failed
     );
     if report.totals_failed > 0 {
+        let _ = write_download_reports(&args.snapshot_dir, &report);
         bail!("[download] failures detected: {}", report.totals_failed);
     }
     Ok(())
@@ -7860,218 +8333,260 @@ fn run_download(args: DownloadArgs) -> Result<()> {
 
 fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
     ensure_aws_cli(&args.aws_bin)?;
-    fs::create_dir_all(&args.snapshot_dir)?;
+    fs::create_dir_all(&args.parquet_dir)?;
     let tuning = light_tuning_with_override(args.workers, None);
     if args.explain {
         explain_validate_download(&args, &tuning);
         return Ok(());
     }
     let _ = cleanup_download_reports(&args.snapshot_dir, "verify_download");
-    let _ = cleanup_download_log(&args.snapshot_dir, "verify_download");
-    let _ = cleanup_download_manifests(&args.snapshot_dir);
+    let effective_no_sign = args.no_sign_request && !args.signed;
+    let mode = if args.quick {
+        "quick"
+    } else if args.full {
+        "full"
+    } else {
+        "meta"
+    };
 
     let mut report_args = BTreeMap::new();
     report_args.insert(
-        "snapshot_dir".to_string(),
-        args.snapshot_dir.to_string_lossy().to_string(),
+        "parquet_dir".to_string(),
+        args.parquet_dir.to_string_lossy().to_string(),
     );
     report_args.insert("s3_uri".to_string(), args.s3_uri.clone());
     report_args.insert("dataset".to_string(), args.dataset.clone());
     report_args.insert("check_extra".to_string(), args.check_extra.to_string());
+    report_args.insert("mode".to_string(), mode.to_string());
     report_args.insert("workers".to_string(), tuning.workers.to_string());
-    report_args.insert(
-        "state_flush_every".to_string(),
-        args.state_flush_every.to_string(),
-    );
     let mut report = report_new("verify_download", report_args);
 
-    let remote = match fetch_remote_manifest(&args, args.progress) {
-        Ok(v) => v,
+    let manifest = match fetch_parquet_manifest(
+        &args.aws_bin,
+        &args.s3_uri,
+        &args.endpoint_url,
+        &args.region,
+        &args.profile_name,
+        effective_no_sign,
+    ) {
+        Ok(m) => m,
         Err(e) => {
             report.failures.push(FailureEntry {
                 dataset: args.dataset.clone(),
                 phase: "validate_manifest_fetch".to_string(),
                 rel_path: None,
                 source_path: Some(args.s3_uri.clone()),
-                output_path: Some(args.snapshot_dir.to_string_lossy().to_string()),
+                output_path: Some(args.parquet_dir.to_string_lossy().to_string()),
                 error_message: format!("{e:#}"),
                 suggested_recovery: Some("check aws CLI credentials/network/endpoint".to_string()),
             });
             report_finalize(&mut report);
             let _ = write_download_reports(&args.snapshot_dir, &report);
-            bail!("[verify_download] remote manifest fetch failed");
+            bail!("[verify_download] parquet manifest fetch failed");
         }
     };
-    write_manifest_jsonl(
-        &download_manifests_dir(&args.snapshot_dir)
-            .join(format!("remote_manifest-{}.jsonl", report.started_at_unix)),
-        &remote,
-    )?;
 
-    let local = build_local_manifest(&args.snapshot_dir, &args.dataset)?;
-    write_manifest_jsonl(
-        &download_manifests_dir(&args.snapshot_dir)
-            .join(format!("local_manifest-{}.jsonl", report.started_at_unix)),
-        &local,
-    )?;
+    let entities: Vec<&ManifestEntity> = if args.dataset == "all" {
+        manifest.entities.iter().collect()
+    } else {
+        manifest
+            .entities
+            .iter()
+            .filter(|e| e.entity == args.dataset)
+            .collect()
+    };
+    if entities.is_empty() {
+        bail!(
+            "[verify_download] dataset '{}' not found in manifest",
+            args.dataset
+        );
+    }
 
     let mut ds_map: BTreeMap<String, DatasetReportSummary> = BTreeMap::new();
-    let remote_map: BTreeMap<String, &RemoteObject> =
-        remote.iter().map(|o| (o.key.clone(), o)).collect();
-    let local_map: BTreeMap<String, &RemoteObject> =
-        local.iter().map(|o| (o.key.clone(), o)).collect();
-    let flush_every = args.state_flush_every.max(1);
+    let mut expected_by_ds: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+    // Files that passed presence+size, for the row-count pass: (dataset, local, expected_record_count)
+    let mut present_files: Vec<(String, PathBuf, u64)> = Vec::new();
 
-    let compare_pb = make_progress_bar(args.progress, remote_map.len() as u64, "validate-compare");
-    for (idx, (key, ro)) in remote_map.iter().enumerate() {
-        let ds_name = dataset_from_key(key);
+    // Presence + size against the manifest.
+    let total_files: u64 = entities.iter().map(|e| e.files.len() as u64).sum();
+    let pb = make_progress_bar(args.progress, total_files, "validate-presence");
+    for ent in &entities {
         let ds = ds_map
-            .entry(ds_name.clone())
+            .entry(ent.entity.clone())
             .or_insert_with(|| DatasetReportSummary {
-                dataset: ds_name.clone(),
+                dataset: ent.entity.clone(),
                 ..Default::default()
             });
-        ds.items_scanned += 1;
-        let lp = args.snapshot_dir.join(key);
-        match local_map.get(key) {
-            None => {
-                ds.failed += 1;
-                report.failures.push(FailureEntry {
-                    dataset: ds_name,
-                    phase: "validate_file_presence".to_string(),
-                    rel_path: Some(key.clone()),
-                    source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), key)),
-                    output_path: Some(lp.to_string_lossy().to_string()),
-                    error_message: "missing local file".to_string(),
-                    suggested_recovery: Some("rerun download".to_string()),
-                });
-            }
-            Some(lo) => {
-                if lo.size != ro.size {
+        for f in &ent.files {
+            ds.items_scanned += 1;
+            let local = match manifest_url_to_local(&args.parquet_dir, &f.url) {
+                Some(p) => p,
+                None => {
                     ds.failed += 1;
                     report.failures.push(FailureEntry {
-                        dataset: ds_name,
-                        phase: "validate_file_size".to_string(),
-                        rel_path: Some(key.clone()),
-                        source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), key)),
-                        output_path: Some(lp.to_string_lossy().to_string()),
-                        error_message: format!(
-                            "size mismatch local={} remote={}",
-                            lo.size, ro.size
-                        ),
+                        dataset: ent.entity.clone(),
+                        phase: "validate_manifest_url".to_string(),
+                        rel_path: None,
+                        source_path: Some(f.url.clone()),
+                        output_path: None,
+                        error_message: "could not derive local path from manifest url".to_string(),
+                        suggested_recovery: None,
+                    });
+                    pb.inc(1);
+                    continue;
+                }
+            };
+            expected_by_ds
+                .entry(ent.entity.clone())
+                .or_default()
+                .insert(local.clone());
+            match fs::metadata(&local) {
+                Err(_) => {
+                    ds.failed += 1;
+                    report.failures.push(FailureEntry {
+                        dataset: ent.entity.clone(),
+                        phase: "validate_file_presence".to_string(),
+                        rel_path: Some(local.to_string_lossy().to_string()),
+                        source_path: Some(f.url.clone()),
+                        output_path: Some(local.to_string_lossy().to_string()),
+                        error_message: "missing local file".to_string(),
                         suggested_recovery: Some("rerun download".to_string()),
                     });
-                } else {
-                    ds.succeeded += 1;
                 }
-            }
-        }
-        if (idx + 1) % flush_every == 0 {
-            report.datasets = ds_map.values().cloned().collect();
-            report_finalize(&mut report);
-            let _ = write_download_reports(&args.snapshot_dir, &report);
-        }
-        compare_pb.inc(1);
-    }
-    compare_pb.finish_with_message("validate-compare complete");
-
-    if args.check_extra {
-        let extra_pb = make_progress_bar(args.progress, local_map.len() as u64, "validate-extra");
-        for key in local_map.keys() {
-            if !remote_map.contains_key(key) {
-                let ds_name = dataset_from_key(key);
-                let ds = ds_map
-                    .entry(ds_name.clone())
-                    .or_insert_with(|| DatasetReportSummary {
-                        dataset: ds_name.clone(),
-                        ..Default::default()
+                Ok(m) if !m.is_file() => {
+                    ds.failed += 1;
+                    report.failures.push(FailureEntry {
+                        dataset: ent.entity.clone(),
+                        phase: "validate_file_presence".to_string(),
+                        rel_path: Some(local.to_string_lossy().to_string()),
+                        source_path: Some(f.url.clone()),
+                        output_path: Some(local.to_string_lossy().to_string()),
+                        error_message: "expected a file".to_string(),
+                        suggested_recovery: Some("rerun download".to_string()),
                     });
-                ds.failed += 1;
-                report.failures.push(FailureEntry {
-                    dataset: ds_name,
-                    phase: "validate_file_presence".to_string(),
-                    rel_path: Some(key.clone()),
-                    source_path: None,
-                    output_path: Some(args.snapshot_dir.join(key).to_string_lossy().to_string()),
-                    error_message: "unexpected local file".to_string(),
-                    suggested_recovery: Some("rerun download with --delete".to_string()),
-                });
-            }
-            extra_pb.inc(1);
-        }
-        extra_pb.finish_with_message("validate-extra complete");
-    }
-
-    let gz_files = list_scoped_gz_files(&args.snapshot_dir, &args.dataset)?;
-    let pb = make_progress_bar(args.progress, gz_files.len() as u64, "validate-gzip");
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(tuning.workers)
-        .build()
-        .context("failed to build rayon thread pool")?;
-    let failures: Vec<Option<FailureEntry>> = pool.install(|| {
-        gz_files
-            .par_iter()
-            .map(|p| {
-                let out = gzip_integrity_ok(p);
-                pb.inc(1);
-                if out.is_ok() {
-                    None
-                } else {
-                    let rel = p
-                        .strip_prefix(&args.snapshot_dir)
-                        .map(|x| x.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| p.to_string_lossy().to_string());
-                    Some(FailureEntry {
-                        dataset: dataset_from_key(&rel),
-                        phase: "validate_gzip_integrity".to_string(),
-                        rel_path: Some(rel.clone()),
-                        source_path: Some(format!("{}/{}", args.s3_uri.trim_end_matches('/'), rel)),
-                        output_path: Some(p.to_string_lossy().to_string()),
-                        error_message: format!(
-                            "{:#}",
-                            out.err().unwrap_or_else(|| anyhow!("gzip check failed"))
-                        ),
-                        suggested_recovery: Some("rerun download for this file".to_string()),
-                    })
                 }
-            })
-            .collect()
-    });
-    pb.finish_with_message("validate-gzip complete");
-    for f in failures.into_iter().flatten() {
-        let ds = ds_map
-            .entry(f.dataset.clone())
-            .or_insert_with(|| DatasetReportSummary {
-                dataset: f.dataset.clone(),
-                ..Default::default()
-            });
-        ds.failed += 1;
-        report.failures.push(f);
+                Ok(m) => {
+                    if m.len() != f.meta.content_length {
+                        ds.failed += 1;
+                        report.failures.push(FailureEntry {
+                            dataset: ent.entity.clone(),
+                            phase: "validate_file_size".to_string(),
+                            rel_path: Some(local.to_string_lossy().to_string()),
+                            source_path: Some(f.url.clone()),
+                            output_path: Some(local.to_string_lossy().to_string()),
+                            error_message: format!(
+                                "size mismatch local={} manifest={}",
+                                m.len(),
+                                f.meta.content_length
+                            ),
+                            suggested_recovery: Some("rerun download".to_string()),
+                        });
+                    } else {
+                        present_files.push((
+                            ent.entity.clone(),
+                            local.clone(),
+                            f.meta.record_count,
+                        ));
+                    }
+                }
+            }
+            pb.inc(1);
+        }
+    }
+    pb.finish_with_message("validate-presence complete");
+
+    // Row-count integrity (footer metadata by default; full scan with --full).
+    if !args.quick {
+        let pb = make_progress_bar(
+            args.progress,
+            present_files.len() as u64,
+            "validate-rowcount",
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tuning.workers)
+            .build()
+            .context("failed to build rayon thread pool")?;
+        let full = args.full;
+        let mem = tuning.memory_mb;
+        let results: Vec<Option<FailureEntry>> = pool.install(|| {
+            present_files
+                .par_iter()
+                .map(|(ds, local, expected_rc)| {
+                    let got = if full {
+                        duckdb_count_parquet(Path::new("duckdb"), local, mem)
+                    } else {
+                        parquet_rowcount_meta(local)
+                    };
+                    pb.inc(1);
+                    match got {
+                        Ok(n) if n == *expected_rc => None,
+                        Ok(n) => Some(FailureEntry {
+                            dataset: ds.clone(),
+                            phase: "validate_parquet_rowcount".to_string(),
+                            rel_path: Some(local.to_string_lossy().to_string()),
+                            source_path: None,
+                            output_path: Some(local.to_string_lossy().to_string()),
+                            error_message: format!(
+                                "rowcount mismatch local={n} manifest={expected_rc}"
+                            ),
+                            suggested_recovery: Some("rerun download for this file".to_string()),
+                        }),
+                        Err(e) => Some(FailureEntry {
+                            dataset: ds.clone(),
+                            phase: "validate_parquet_rowcount".to_string(),
+                            rel_path: Some(local.to_string_lossy().to_string()),
+                            source_path: None,
+                            output_path: Some(local.to_string_lossy().to_string()),
+                            error_message: format!("{e:#}"),
+                            suggested_recovery: Some("rerun download for this file".to_string()),
+                        }),
+                    }
+                })
+                .collect()
+        });
+        pb.finish_with_message("validate-rowcount complete");
+        for f in results.into_iter().flatten() {
+            if let Some(ds) = ds_map.get_mut(&f.dataset) {
+                ds.failed += 1;
+            }
+            report.failures.push(f);
+        }
     }
 
+    // Detect unexpected local files (not in the manifest).
+    if args.check_extra {
+        for (ds_name, expected) in &expected_by_ds {
+            let dir = args.parquet_dir.join(local_dir_for(ds_name));
+            for f in list_parquet_files(&dir).unwrap_or_default() {
+                if !expected.contains(&f) {
+                    if let Some(ds) = ds_map.get_mut(ds_name) {
+                        ds.failed += 1;
+                    }
+                    report.failures.push(FailureEntry {
+                        dataset: ds_name.clone(),
+                        phase: "validate_file_presence".to_string(),
+                        rel_path: Some(f.to_string_lossy().to_string()),
+                        source_path: None,
+                        output_path: Some(f.to_string_lossy().to_string()),
+                        error_message: "unexpected local file".to_string(),
+                        suggested_recovery: Some("rerun download with --delete".to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    for ds in ds_map.values_mut() {
+        ds.succeeded = ds.items_scanned.saturating_sub(ds.failed);
+    }
     report.datasets = ds_map.values().cloned().collect();
     report_finalize(&mut report);
-    let report_paths = write_download_reports(&args.snapshot_dir, &report)?;
-    append_download_log(
-        &args.snapshot_dir,
-        "verify_download",
-        &format!(
-            "done scanned={} failed={}",
-            report.totals_items_scanned, report.totals_failed
-        ),
-    )?;
     eprintln!(
-        "[verify_download] summary scanned={} ok={} failed={} reports={}",
-        report.totals_items_scanned,
-        report.totals_succeeded,
-        report.totals_failed,
-        report_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "[verify_download] summary scanned={} ok={} failed={} mode={}",
+        report.totals_items_scanned, report.totals_succeeded, report.totals_failed, mode
     );
     if report.totals_failed > 0 {
+        let _ = write_download_reports(&args.snapshot_dir, &report);
         bail!(
             "[verify_download] failures detected: {}",
             report.totals_failed
@@ -8640,20 +9155,6 @@ fn ensure_aws_cli(bin: &Path) -> Result<()> {
     }
 }
 
-fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
-    let u = uri
-        .strip_prefix("s3://")
-        .ok_or_else(|| anyhow!("invalid s3 uri: {uri}"))?;
-    let mut parts = u.splitn(2, '/');
-    let bucket = parts
-        .next()
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("invalid s3 uri bucket: {uri}"))?;
-    let prefix = parts.next().unwrap_or("").trim_matches('/').to_string();
-    Ok((bucket, prefix))
-}
-
 fn aws_common_flags_from(
     endpoint_url: &Option<String>,
     region: &Option<String>,
@@ -8679,31 +9180,132 @@ fn aws_common_flags_from(
     out
 }
 
-fn aws_sync_command(args: &DownloadArgs) -> Result<Vec<String>> {
+/// Local subdirectory name (under `<root>/parquet/`) for a remote dataset.
+/// `works` is staged raw into `works_aws/` so the enriched corpus can own the
+/// canonical `works/` name; every other dataset uses its own name unchanged.
+fn local_dir_for(dataset: &str) -> &str {
+    if dataset == "works" {
+        "works_aws"
+    } else {
+        dataset
+    }
+}
+
+// --- Official OpenAlex parquet manifest (`s3://openalex/data/parquet/manifest.json`) ---
+
+#[derive(Debug, Clone, Deserialize)]
+struct ParquetManifest {
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    meta: ManifestMeta,
+    entities: Vec<ManifestEntity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestMeta {
+    record_count: u64,
+    content_length: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestEntity {
+    entity: String,
+    content_length: u64,
+    files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestFile {
+    url: String,
+    meta: ManifestFileMeta,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestFileMeta {
+    content_length: u64,
+    record_count: u64,
+}
+
+/// Fetch and parse the top-level parquet manifest via `aws s3 cp <uri> -`.
+fn fetch_parquet_manifest(
+    aws_bin: &Path,
+    s3_uri: &str,
+    endpoint_url: &Option<String>,
+    region: &Option<String>,
+    profile_name: &Option<String>,
+    no_sign_request: bool,
+) -> Result<ParquetManifest> {
+    let uri = format!(
+        "{}/data/parquet/manifest.json",
+        s3_uri.trim_end_matches('/')
+    );
+    let mut cmd = vec!["s3".to_string(), "cp".to_string(), uri, "-".to_string()];
+    cmd.extend(aws_common_flags_from(
+        endpoint_url,
+        region,
+        profile_name,
+        no_sign_request,
+    ));
+    let out = run_aws(aws_bin, &cmd)?;
+    let manifest: ParquetManifest =
+        serde_json::from_str(&out).context("failed to parse parquet manifest.json")?;
+    Ok(manifest)
+}
+
+/// Map a manifest file URL (`s3://<bucket>/data/parquet/<entity>/updated_date=.../part.parquet`)
+/// to its local path under `<parquet_dir>/<local_dir_for(entity)>/updated_date=.../part.parquet`.
+fn manifest_url_to_local(parquet_dir: &Path, url: &str) -> Option<PathBuf> {
+    let marker = "/data/parquet/";
+    let idx = url.find(marker)?;
+    let rel = &url[idx + marker.len()..]; // "<entity>/updated_date=.../part.parquet"
+    let mut parts = rel.splitn(2, '/');
+    let entity = parts.next()?;
+    let rest = parts.next().unwrap_or("");
+    let mut p = parquet_dir.join(local_dir_for(entity));
+    if !rest.is_empty() {
+        p = p.join(rest);
+    }
+    Some(p)
+}
+
+/// Row count of a single parquet file from its footer metadata (no column scan).
+fn parquet_rowcount_meta(path: &Path) -> Result<u64> {
+    let sql = with_session_settings(
+        &format!(
+            "SELECT CAST(SUM(num_rows) AS BIGINT) AS n FROM parquet_file_metadata({})",
+            sql_quote(&path.to_string_lossy())
+        ),
+        None,
+        Some(1),
+    );
+    let row = query_one_row(Path::new("duckdb"), &sql)?;
+    parse_u64(row.get("n"))
+}
+
+/// Build a per-dataset `aws s3 sync` command:
+///   src = {s3_uri}/data/parquet/{dataset}/   (remote dataset name)
+///   dst = {root}/parquet/{local_dir_for(dataset)}/
+/// Per-dataset destinations keep enriched `works/`, other datasets, and the
+/// `*_id_idx.parquet` files (all one level up) safe from `--delete`.
+fn aws_sync_command(args: &DownloadArgs, dataset: &str) -> Result<Vec<String>> {
     let mut cmd = vec!["s3".to_string(), "sync".to_string()];
     let effective_delete = args.delete_files && !args.no_delete;
     let effective_no_sign = args.no_sign_request && !args.signed;
     if effective_delete {
         cmd.push("--delete".to_string());
     }
-    let src = if args.dataset == "all" {
-        args.s3_uri.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/data/{}/",
-            args.s3_uri.trim_end_matches('/'),
-            args.dataset
-        )
-    };
-    let dst = if args.dataset == "all" {
-        args.snapshot_dir.to_string_lossy().to_string()
-    } else {
-        args.snapshot_dir
-            .join("data")
-            .join(&args.dataset)
-            .to_string_lossy()
-            .to_string()
-    };
+    let src = format!(
+        "{}/data/parquet/{}/",
+        args.s3_uri.trim_end_matches('/'),
+        dataset
+    );
+    let dst = args
+        .parquet_dir
+        .join(local_dir_for(dataset))
+        .to_string_lossy()
+        .to_string();
     cmd.push(src);
     cmd.push(dst);
     cmd.extend(aws_common_flags_from(
@@ -8715,9 +9317,34 @@ fn aws_sync_command(args: &DownloadArgs) -> Result<Vec<String>> {
     Ok(cmd)
 }
 
+/// Write a temporary AWS config file applying the S3 transfer tuning, returning its path.
+/// These settings (`max_concurrent_requests`, `max_queue_size`, `multipart_chunksize`) have
+/// no CLI-flag/env equivalent, so a config file is the only way to apply them without
+/// mutating the user's global `~/.aws/config`. Used via `AWS_CONFIG_FILE` on the sync command.
+fn write_temp_aws_config(args: &DownloadArgs) -> Result<PathBuf> {
+    let dir = download_metadata_root(&args.snapshot_dir);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("aws_tuning.config");
+    let body = format!(
+        "[default]\ns3 =\n    max_concurrent_requests = {}\n    max_queue_size = {}\n    multipart_chunksize = {}\n",
+        args.max_concurrent_requests, args.max_queue_size, args.multipart_chunksize
+    );
+    fs::write(&path, body.as_bytes())
+        .with_context(|| format!("failed to write temp aws config {}", path.display()))?;
+    Ok(path)
+}
+
 fn run_aws(bin: &Path, args: &[String]) -> Result<String> {
-    let out = Command::new(bin)
-        .args(args)
+    run_aws_env(bin, args, &[])
+}
+
+fn run_aws_env(bin: &Path, args: &[String], env: &[(&str, String)]) -> Result<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .with_context(|| format!("failed to run aws {} {}", bin.display(), args.join(" ")))?;
     if !out.status.success() {
@@ -8738,33 +9365,12 @@ fn download_metadata_root(snapshot_dir: &Path) -> PathBuf {
     root.join("openalex-snapshot_metadata").join("download")
 }
 
-fn download_manifests_dir(snapshot_dir: &Path) -> PathBuf {
-    download_metadata_root(snapshot_dir).join("manifests")
-}
-
 fn download_reports_dir(snapshot_dir: &Path) -> PathBuf {
     let root = snapshot_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     root.join("openalex-snapshot_metadata").join("reports")
-}
-
-fn download_log_path(snapshot_dir: &Path) -> PathBuf {
-    download_metadata_root(snapshot_dir).join("download.log")
-}
-
-fn append_download_log(snapshot_dir: &Path, command: &str, msg: &str) -> Result<()> {
-    let path = download_log_path(snapshot_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(f, "{} [{}] {}", now_unix(), command, msg)?;
-    Ok(())
 }
 
 fn write_download_reports(snapshot_dir: &Path, report: &RunReport) -> Result<Vec<PathBuf>> {
@@ -8795,275 +9401,57 @@ fn cleanup_download_reports(snapshot_dir: &Path, command: &str) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_download_log(snapshot_dir: &Path, _command: &str) -> Result<()> {
-    let p = download_log_path(snapshot_dir);
-    if p.exists() {
-        let _ = fs::remove_file(p);
-    }
-    Ok(())
-}
-
-fn cleanup_download_manifests(snapshot_dir: &Path) -> Result<()> {
-    let dir = download_manifests_dir(snapshot_dir);
-    if !dir.exists() {
-        return Ok(());
-    }
-    for ent in fs::read_dir(&dir)? {
-        let ent = ent?;
-        if !ent.path().is_file() {
-            continue;
-        }
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if (name.starts_with("remote_manifest-") || name.starts_with("local_manifest-"))
-            && name.ends_with(".jsonl")
-        {
-            let _ = fs::remove_file(ent.path());
-        }
-    }
-    Ok(())
-}
-
-fn write_manifest_jsonl(path: &Path, items: &[RemoteObject]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut out = String::new();
-    for it in items {
-        out.push_str(&serde_json::to_string(it)?);
-        out.push('\n');
-    }
-    fs::write(path, out.as_bytes())?;
-    Ok(())
-}
-
-fn dataset_prefix(dataset: &str) -> String {
-    if dataset == "all" {
-        "".to_string()
-    } else {
-        format!("data/{}/", dataset)
-    }
-}
-
-fn dataset_from_key(key: &str) -> String {
-    let k = key.trim_start_matches('/');
-    let mut parts = k.split('/');
-    if parts.next() == Some("data") {
-        parts.next().unwrap_or("unknown").to_string()
-    } else {
-        "snapshot".to_string()
-    }
-}
-
-fn fetch_remote_manifest(args: &ValidateDownloadArgs, progress: bool) -> Result<Vec<RemoteObject>> {
-    let effective_no_sign = args.no_sign_request && !args.signed;
-    let (bucket, base_prefix) = parse_s3_uri(&args.s3_uri)?;
-    let ds_prefix = dataset_prefix(&args.dataset);
-    let prefix = if base_prefix.is_empty() {
-        ds_prefix
-    } else if ds_prefix.is_empty() {
-        format!("{}/", base_prefix.trim_end_matches('/'))
-    } else {
-        format!("{}/{ds_prefix}", base_prefix.trim_end_matches('/'))
-    };
-
-    let mut all = Vec::new();
-    let manifest_pb = if progress {
-        let pb = ProgressBar::new_spinner();
-        pb.set_prefix("validate-manifest");
-        pb.set_message("fetching remote manifest pages");
-        pb.enable_steady_tick(std::time::Duration::from_millis(120));
-        Some(pb)
-    } else {
-        None
-    };
-    let mut token: Option<String> = None;
-    let mut pages: u64 = 0;
-    loop {
-        let mut cmd = vec![
-            "s3api".to_string(),
-            "list-objects-v2".to_string(),
-            "--bucket".to_string(),
-            bucket.clone(),
-            "--prefix".to_string(),
-            prefix.clone(),
-            "--output".to_string(),
-            "json".to_string(),
-        ];
-        if let Some(t) = &token {
-            cmd.push("--continuation-token".to_string());
-            cmd.push(t.clone());
-        }
-        cmd.extend(aws_common_flags_from(
-            &args.endpoint_url,
-            &args.region,
-            &args.profile_name,
-            effective_no_sign,
-        ));
-        let out = run_aws(&args.aws_bin, &cmd)?;
-        let v: serde_json::Value =
-            serde_json::from_str(&out).context("invalid aws list-objects-v2 JSON")?;
-        pages += 1;
-        if let Some(pb) = &manifest_pb {
-            pb.set_message(format!("pages={} objects={}", pages, all.len()));
-        }
-        if let Some(arr) = v.get("Contents").and_then(|x| x.as_array()) {
-            for item in arr {
-                let key = item
-                    .get("Key")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if key.is_empty() {
-                    continue;
-                }
-                let size = item.get("Size").and_then(|x| x.as_u64()).unwrap_or(0);
-                let etag = item
-                    .get("ETag")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let last_modified = item
-                    .get("LastModified")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                all.push(RemoteObject {
-                    key,
-                    size,
-                    etag,
-                    last_modified,
-                });
-            }
-            if let Some(pb) = &manifest_pb {
-                pb.set_message(format!("pages={} objects={}", pages, all.len()));
-            }
-        }
-        let truncated = v
-            .get("IsTruncated")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        if truncated {
-            token = v
-                .get("NextContinuationToken")
-                .and_then(|x| x.as_str())
-                .map(str::to_string);
-            if token.is_none() {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if let Some(pb) = manifest_pb {
-        pb.finish_with_message(format!(
-            "validate-manifest pages={} objects={}",
-            pages,
-            all.len()
-        ));
-    }
-    all.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(all)
-}
-
-fn build_local_manifest(snapshot_dir: &Path, dataset: &str) -> Result<Vec<RemoteObject>> {
-    let mut out = Vec::new();
-    let root = if dataset == "all" {
-        snapshot_dir.to_path_buf()
-    } else {
-        snapshot_dir.join("data").join(dataset)
-    };
-    if !root.exists() {
-        return Ok(out);
-    }
-    for e in WalkDir::new(&root).into_iter().filter_map(|x| x.ok()) {
-        if !e.file_type().is_file() {
-            continue;
-        }
-        let p = e.path();
-        if p.components()
-            .any(|c| c.as_os_str() == ".openalex_download_metadata")
-        {
-            continue;
-        }
-        let rel = p
-            .strip_prefix(snapshot_dir)
-            .map(|x| x.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
-        let m = fs::metadata(p)?;
-        let last_modified = m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_default();
-        out.push(RemoteObject {
-            key: rel,
-            size: m.len(),
-            etag: "".to_string(),
-            last_modified,
-        });
-    }
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(out)
-}
-
-fn list_scoped_gz_files(snapshot_dir: &Path, dataset: &str) -> Result<Vec<PathBuf>> {
-    let root = if dataset == "all" {
-        snapshot_dir.join("data")
-    } else {
-        snapshot_dir.join("data").join(dataset)
-    };
-    let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
-    }
-    for e in WalkDir::new(&root).into_iter().filter_map(|x| x.ok()) {
-        if e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("gz") {
-            out.push(e.path().to_path_buf());
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn gzip_integrity_ok(path: &Path) -> Result<()> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let f = fs::File::open(path)?;
-    let mut d = GzDecoder::new(f);
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = d.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
 fn explain_download(args: &DownloadArgs) -> Result<()> {
-    let cmd = aws_sync_command(args)?;
     let effective_no_sign = args.no_sign_request && !args.signed;
     let effective_delete = args.delete_files && !args.no_delete;
-    println!("--explain: download");
+    println!("--explain: download (parquet-native)");
     println!("aws_bin: {}", args.aws_bin.display());
-    println!("snapshot_dir: {}", args.snapshot_dir.display());
+    println!("parquet_dir: {}", args.parquet_dir.display());
     println!("dataset: {}", args.dataset);
     println!("no_sign_request: {}", effective_no_sign);
     println!("delete_files: {}", effective_delete);
-    println!("sync_command: {} {}", args.aws_bin.display(), cmd.join(" "));
+    println!("auto_enrich (works): {}", !args.no_enrich);
+    println!(
+        "manifest: {}/data/parquet/manifest.json",
+        args.s3_uri.trim_end_matches('/')
+    );
+    println!(
+        "tuning: max_concurrent_requests={} max_queue_size={} multipart_chunksize={} (via temp AWS_CONFIG_FILE)",
+        args.max_concurrent_requests, args.max_queue_size, args.multipart_chunksize
+    );
+    let example_ds = if args.dataset == "all" {
+        "works".to_string()
+    } else {
+        args.dataset.clone()
+    };
+    let cmd = aws_sync_command(args, &example_ds)?;
+    println!(
+        "sync_command (per dataset, e.g. {example_ds}): {} {}",
+        args.aws_bin.display(),
+        cmd.join(" ")
+    );
     println!("verify: not part of download; run verify_download separately");
     Ok(())
 }
 
 fn explain_validate_download(args: &ValidateDownloadArgs, tuning: &Tuning) {
-    println!("--explain: validate-download");
+    let mode = if args.quick {
+        "quick (presence+size)"
+    } else if args.full {
+        "full (row scan)"
+    } else {
+        "meta (footer rowcount)"
+    };
+    println!("--explain: verify_download (manifest-driven)");
     println!("aws_bin: {}", args.aws_bin.display());
-    println!("snapshot_dir: {}", args.snapshot_dir.display());
-    println!("s3_uri: {}", args.s3_uri);
+    println!("parquet_dir: {}", args.parquet_dir.display());
+    println!(
+        "manifest: {}/data/parquet/manifest.json",
+        args.s3_uri.trim_end_matches('/')
+    );
     println!("dataset: {}", args.dataset);
     println!("check_extra: {}", args.check_extra);
+    println!("mode: {}", mode);
     println!("workers: {}", tuning.workers);
 }
 
@@ -9437,7 +9825,7 @@ fn check_lock(parquet_dir: &Path) -> Option<LockInfo> {
     }
 }
 
-fn archive_completed_run(parquet_dir: &Path, snapshot_dir: &Path) -> Result<()> {
+fn archive_completed_run(parquet_dir: &Path, _snapshot_dir: &Path) -> Result<()> {
     let meta_root = metadata_root(parquet_dir);
     let archived_root = archived_root_dir(parquet_dir);
     let timestamp = now_unix();
@@ -9463,15 +9851,6 @@ fn archive_completed_run(parquet_dir: &Path, snapshot_dir: &Path) -> Result<()> 
                 }
             }
         }
-    }
-
-    // Move download log
-    let dl_log = download_log_path(snapshot_dir);
-    if dl_log.exists() {
-        let dest = archive_base.join("download").join("download.log");
-        fs::create_dir_all(dest.parent().unwrap())?;
-        fs::rename(&dl_log, &dest)?;
-        moved_any = true;
     }
 
     // Move dataset logs — schemata/ is intentionally excluded: it is a persistent

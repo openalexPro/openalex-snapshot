@@ -1,5 +1,8 @@
 # Quickstart
 
+OpenAlex now publishes the snapshot natively in parquet, so the flow is:
+**download → verify_download → (auto) enrich → index → extract**.
+
 ## Build
 
 ```bash
@@ -16,41 +19,40 @@ cargo build --release
   --dataset all
 ```
 
-## Convert snapshot to parquet
+## Download the parquet snapshot
+
+Syncs the official parquet per-dataset into `<root>/parquet/` and auto-enriches `works`
+(`works_aws/` → `works/`, adding `abstract` + `citation`). Pass `--no-enrich` to skip.
 
 ```bash
-# default profile (safe) — works on any host
-./target/release/openalex-snapshot convert \
-  --root-dir /Volumes/openalex \
-  --dataset works
-
-# faster on 32+ GB hosts (stratifies the file list by size)
-./target/release/openalex-snapshot convert \
-  --root-dir /Volumes/openalex \
-  --dataset works \
-  --profile stratified-36
+./target/release/openalex-snapshot download --root-dir /Volumes/openalex
 ```
 
-## Verify output
+## Verify the download
+
+Checks every file against the published `manifest.json` (presence + size + row count).
 
 ```bash
-./target/release/openalex-snapshot verify_convert \
-  --root-dir /Volumes/openalex \
-  --dataset works \
-  --scope dataset \
-  --metadata-level both
+./target/release/openalex-snapshot verify_download --root-dir /Volumes/openalex
+# fast size-only:  --quick      full row scan:  --full
 ```
 
-## Build and verify index
+## Enrich works (only if you used --no-enrich)
+
+```bash
+./target/release/openalex-snapshot enrich --root-dir /Volumes/openalex
+```
+
+## Build and verify indexes
 
 ```bash
 ./target/release/openalex-snapshot index \
   --root-dir /Volumes/openalex \
-  --dataset works
+  --dataset all          # builds an index per dataset; skips the raw works_aws/ staging dir
 
 ./target/release/openalex-snapshot verify_index \
   --root-dir /Volumes/openalex \
-  --dataset works
+  --dataset all
 ```
 
 ## Extract by IDs
@@ -62,17 +64,11 @@ cargo build --release
   --output /Volumes/openalex/extract.parquet
 ```
 
-## Download and verify snapshot
+## Or run the whole pipeline from config
 
 ```bash
-./target/release/openalex-snapshot download --root-dir /Volumes/openalex
-./target/release/openalex-snapshot verify_download --root-dir /Volumes/openalex
+./target/release/openalex-snapshot all --config ./openalex-snapshot.yaml
 ```
 
-## Repair failed files from verify report
-
-```bash
-./target/release/openalex-snapshot repair_convert \
-  --root-dir /Volumes/openalex \
-  --from-verify-report /Volumes/openalex/openalex-snapshot_metadata/reports/verify_convert-123456.json
-```
+> The `convert` / `verify_convert` / `schema` / `verify_schema` commands are deprecated — they
+> operated on the old JSON.GZ snapshot and remain only for legacy `snapshot/` trees.

@@ -26,10 +26,23 @@ The binary is built with `cargo build --release -p openalex-snapshot`; the relea
 
 The entire CLI is a single binary implemented in `openalex-snapshot/src/main.rs`. There are no additional library crates or submodules beyond `openalex-core`.
 
+**Parquet-native pipeline (current)** — OpenAlex now publishes the snapshot natively in parquet
+(`s3://openalex/data/parquet/`), so the active pipeline is **download → verify_download → enrich →
+index → extract** with no JSON→parquet conversion. `download` syncs the official parquet per-dataset
+into `<root>/parquet/`, `verify_download` validates it against the published `manifest.json`, and
+`enrich` adds `abstract`/`citation` to works. The `convert` / `verify_convert` / `schema` /
+`verify_schema` commands are **deprecated** (kept compiling for legacy `snapshot/` JSON trees;
+their docs/man pages were removed). Much of the "Conversion/Schema/Profile/auto-repair" detail
+below describes that deprecated path.
+
 **Path model** — all runtime paths derive from a single `--root-dir`:
-- `<root>/snapshot/` — downloaded snapshot (JSON.GZ files)
-- `<root>/parquet/` — converted parquet output
-- `<root>/openalex-snapshot_metadata/` — reports, logs, schema caches, verify state
+- `<root>/parquet/` — the parquet corpus. `download` syncs each dataset into `parquet/<dataset>/`;
+  the raw works lands in `parquet/works_aws/` (stable `aws s3 sync` target) and `enrich` writes the
+  canonical enriched `parquet/works/`. `index --dataset all` skips `*_aws` staging dirs.
+- `<root>/snapshot/` — **legacy** JSON.GZ snapshot (only used by the deprecated convert/schema path).
+- `<root>/openalex-snapshot_metadata/` — lockfile, the fetched `download/manifest.json`, and a JSON
+  report per command written only on failure (per-step logs / schema caches / archived runs are no
+  longer produced by the active pipeline).
 
 **Argument precedence** (highest wins):
 1. Explicit CLI flags

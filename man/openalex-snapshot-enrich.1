@@ -1,0 +1,19 @@
+.TH openalex-snapshot-enrich 1
+.SH NAME
+openalex-snapshot-enrich \- add abstract + citation columns to works parquet
+.SH SYNOPSIS
+.B openalex-snapshot enrich
+[OPTIONS]
+.SH DESCRIPTION
+Reads raw works from <root>/parquet/works_aws/ and writes an enriched copy to
+<root>/parquet/works/ that adds two columns: abstract (reconstructed from the JSON
+abstract_inverted_index) and citation. Incremental and row-parity checked; the raw
+works_aws/ is left untouched. Run automatically by `download` unless --no-enrich.
+.SH OPTIONS
+.TP
+.B --overwrite
+Rebuild enriched files instead of skipping up-to-date ones.
+.SH EXAMPLE
+openalex-snapshot enrich --root-dir /data
+.SH SEE ALSO
+openalex-snapshot-download(1), openalex-snapshot-index(1), openalex-snapshot-extract(1)

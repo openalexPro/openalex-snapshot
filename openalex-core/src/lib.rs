@@ -47,6 +47,29 @@ pub fn works_abstract_expr() -> &'static str {
      ) END"
 }
 
+/// Like [`works_abstract_expr`] but for the official OpenAlex parquet release,
+/// where `abstract_inverted_index` ships as a **VARCHAR JSON string**
+/// (`{"word":[pos,…],…}`) rather than a native `MAP`.  Parses the JSON to a
+/// `MAP(VARCHAR, BIGINT[])` first, then reconstructs the text identically.
+/// Returns NULL when the source is NULL.
+pub fn works_abstract_expr_from_json() -> &'static str {
+    "CASE WHEN abstract_inverted_index IS NULL THEN NULL \
+     ELSE array_to_string( \
+         list_transform( \
+             list_sort( \
+                 flatten( \
+                     apply( \
+                         map_entries(CAST(CAST(abstract_inverted_index AS JSON) AS MAP(VARCHAR, BIGINT[]))), \
+                         x -> apply(x.value, p -> {pos: p, word: x.key}) \
+                     ) \
+                 ) \
+             ), \
+             e -> e.word \
+         ), \
+         ' ' \
+     ) END"
+}
+
 /// SQL expression that builds a `"Author (year)"` / `"A & B (year)"` /
 /// `"A et al. (year)"` citation from `authorships` and `publication_year`.
 /// Null year ⇒ `"(n.d.)"`.  Null or empty `authorships` ⇒ NULL.
@@ -76,6 +99,15 @@ mod tests {
     fn abstract_expr_is_non_empty() {
         let expr = works_abstract_expr();
         assert!(expr.contains("abstract_inverted_index"));
+        assert!(expr.contains("array_to_string"));
+    }
+
+    #[test]
+    fn abstract_expr_from_json_parses_json() {
+        let expr = works_abstract_expr_from_json();
+        assert!(expr.contains("abstract_inverted_index"));
+        assert!(expr.contains("AS JSON"));
+        assert!(expr.contains("MAP(VARCHAR, BIGINT[])"));
         assert!(expr.contains("array_to_string"));
     }
 

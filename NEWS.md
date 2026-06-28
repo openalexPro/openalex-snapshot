@@ -4,6 +4,43 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+### Changed — parquet-native pipeline
+
+OpenAlex now publishes the snapshot **natively in parquet** (`s3://openalex/data/parquet/`),
+so the tool is now a parquet-native pipeline: **download → verify_download → enrich → index →
+extract**. The JSON→parquet `convert` step is obsolete.
+
+- **`download` rewritten for parquet.** Syncs `s3://openalex/data/parquet/<dataset>/`
+  **per-dataset** into `<root>/parquet/`. Works lands in `parquet/works_aws/` (the stable
+  `aws s3 sync` target) and is **auto-enriched** into the canonical `parquet/works/` (opt out
+  with `--no-enrich`). The dataset list and disk preflight come from the published
+  `manifest.json`. New transfer-tuning flags (`--max-concurrent-requests` [default 10],
+  `--max-queue-size`, `--multipart-chunksize`) are applied via a temporary `AWS_CONFIG_FILE`
+  so your global `~/.aws/config` is never touched.
+
+- **`verify_download` rewritten to use `manifest.json`.** Validates per-file presence, size
+  (`content_length`), and row count (`record_count`) — a stronger check than the old gzip
+  integrity test. Default reads footer metadata (`parquet_file_metadata`); `--full` does a row
+  scan; `--quick` skips row counts.
+
+- **New `enrich` subcommand** (and `works_abstract_expr_from_json` in `openalex-core`). Builds
+  `parquet/works/` from `parquet/works_aws/`, adding `abstract` (reconstructed from the JSON
+  `abstract_inverted_index`) and `citation`. Incremental and row-parity checked; the raw
+  `works_aws/` is never modified, so it stays manifest-verifiable and incremental sync is
+  unaffected. `index --dataset all` skips `*_aws` staging dirs; `extract` routes `W` IDs to
+  `works/`.
+
+- **`all` no longer converts by default.** `all.enable_convert` / `all.enable_verify_convert`
+  now default to `false`; the pipeline is `download → verify_download → index → verify_index`.
+
+- **`convert` / `verify_convert` / `schema` / `verify_schema` are deprecated.** The code is kept
+  (marked deprecated in `--help`) for legacy `snapshot/` JSON trees, but their docs and man pages
+  have been removed.
+
+- **Slimmer metadata/logging.** Per-step `.log` files, manifest JSONL snapshots, and schema
+  caches are no longer written by the active pipeline; reports are written only when a command
+  has failures.
+
 ## [0.5.0] - 2026-05-23
 
 ### Added

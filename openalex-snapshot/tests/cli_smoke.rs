@@ -25,10 +25,19 @@ fn write_gz_ndjson(path: &std::path::Path, lines: &[&str]) {
 
 #[cfg(unix)]
 fn make_mock_aws(path: &std::path::Path) {
+    // Mock aws for the parquet-native flow: supports `s3 cp <uri> -` (cat a file
+    // from MOCK_S3_ROOT to stdout, used for manifest.json) and `s3 sync` (cp -R).
     let script = r#"#!/bin/sh
 set -eu
 if [ "${1:-}" = "--version" ]; then
   echo "aws-cli/2.0.0"
+  exit 0
+fi
+if [ "${1:-}" = "s3" ] && [ "${2:-}" = "cp" ]; then
+  src="${3:-}"
+  root="${MOCK_S3_ROOT:-}"
+  key="${src#s3://mock-openalex/}"
+  cat "$root/$key"
   exit 0
 fi
 if [ "${1:-}" = "s3" ] && [ "${2:-}" = "sync" ]; then
@@ -49,39 +58,6 @@ if [ "${1:-}" = "s3" ] && [ "${2:-}" = "sync" ]; then
   if [ -d "$from" ]; then
     cp -R "$from"/. "$dst"/
   fi
-  exit 0
-fi
-if [ "${1:-}" = "s3api" ] && [ "${2:-}" = "list-objects-v2" ]; then
-  root="${MOCK_S3_ROOT:-}"
-  prefix=""
-  next=""
-  prev=""
-  for a in "$@"; do
-    if [ "$prev" = "--prefix" ]; then prefix="$a"; fi
-    if [ "$prev" = "--continuation-token" ]; then next="$a"; fi
-    prev="$a"
-  done
-  if [ -n "$next" ]; then
-    echo '{"IsTruncated":false,"Contents":[]}'
-    exit 0
-  fi
-  p="$root/$prefix"
-  if [ ! -d "$p" ]; then
-    echo '{"IsTruncated":false,"Contents":[]}'
-    exit 0
-  fi
-  tmp="$(mktemp)"
-  (cd "$root" && find "$prefix" -type f | sort) > "$tmp"
-  printf '{"IsTruncated":false,"Contents":['
-  first=1
-  while IFS= read -r f; do
-    sz=$(wc -c < "$root/$f" | tr -d ' ')
-    [ $first -eq 0 ] && printf ','
-    first=0
-    printf '{"Key":"%s","Size":%s,"ETag":"\\"mock\\"","LastModified":"1970-01-01T00:00:00Z"}' "$f" "$sz"
-  done < "$tmp"
-  printf ']}'
-  rm -f "$tmp"
   exit 0
 fi
 echo "unsupported aws mock call" >&2
@@ -862,21 +838,57 @@ fn convert_no_auto_repair_skips_flagged_parquet() {
 
 #[test]
 #[cfg(unix)]
-fn download_and_validate_download_with_mock_aws() {
+fn download_and_validate_download_parquet_with_mock_aws() {
+    if !has_duckdb() {
+        return;
+    }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let s3 = root.join("mock-s3");
-    let snapshot = root.join("snapshot");
-    fs::create_dir_all(s3.join("data/authors/part_000")).unwrap();
-    write_gz_ndjson(
-        &s3.join("data/authors/part_000/part1.gz"),
-        &[r#"{"id":"https://openalex.org/A1","display_name":"A"}"#],
-    );
+    // Remote parquet layout: data/parquet/authors/updated_date=.../part_0000.parquet
+    let remote_ds = s3.join("data/parquet/authors/updated_date=2020-01-01");
+    fs::create_dir_all(&remote_ds).unwrap();
+    let remote_file = remote_ds.join("part_0000.parquet");
+    let status = Command::new("duckdb")
+        .args([
+            "-c",
+            &format!(
+                "COPY (SELECT * FROM (VALUES ('https://openalex.org/A1','Alice'), ('https://openalex.org/A2','Bob')) AS t(id, display_name)) TO '{}' (FORMAT PARQUET);",
+                remote_file.to_string_lossy().replace('\'', "''")
+            ),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let size = fs::metadata(&remote_file).unwrap().len();
+
+    // Top-level manifest.json describing that one file.
+    let manifest = json!({
+        "date": "2020-01-01",
+        "format": "parquet",
+        "meta": { "record_count": 2, "content_length": size },
+        "entities": [ {
+            "entity": "authors",
+            "content_length": size,
+            "files": [ {
+                "url": "s3://mock-openalex/data/parquet/authors/updated_date=2020-01-01/part_0000.parquet",
+                "meta": { "content_length": size, "record_count": 2 }
+            } ]
+        } ]
+    });
+    fs::write(
+        s3.join("data/parquet/manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let aws_bin = root.join("aws-mock.sh");
     make_mock_aws(&aws_bin);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
 
+    let local_file = root.join("parquet/authors/updated_date=2020-01-01/part_0000.parquet");
+
+    // download
     let status = Command::new(&exe)
         .args([
             "download",
@@ -893,11 +905,9 @@ fn download_and_validate_download_with_mock_aws() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(snapshot.join("data/authors/part_000/part1.gz").exists());
-    assert!(root.join("openalex-snapshot_metadata/reports").exists());
+    assert!(local_file.exists(), "downloaded parquet should exist");
 
-    // Corrupt local gzip and verify strict validation fails.
-    fs::write(snapshot.join("data/authors/part_000/part1.gz"), b"bad").unwrap();
+    // verify_download passes (presence + size + footer rowcount).
     let status = Command::new(&exe)
         .args([
             "verify_download",
@@ -913,7 +923,143 @@ fn download_and_validate_download_with_mock_aws() {
         .env("MOCK_S3_ROOT", s3.to_str().unwrap())
         .status()
         .unwrap();
-    assert!(!status.success());
+    assert!(
+        status.success(),
+        "verify_download should pass on a clean copy"
+    );
+    // A successful command writes no report file (slim logging).
+    let reports = root.join("openalex-snapshot_metadata/reports");
+    let has_vd_report = reports.exists()
+        && fs::read_dir(&reports)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("verify_download-")
+            });
+    assert!(
+        !has_vd_report,
+        "successful verify_download should not write a report"
+    );
+
+    // Corrupt local file size -> verify must fail and a report IS written.
+    let mut bytes = fs::read(&local_file).unwrap();
+    bytes.extend_from_slice(b"junk");
+    fs::write(&local_file, &bytes).unwrap();
+    let status = Command::new(&exe)
+        .args([
+            "verify_download",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--s3-uri",
+            "s3://mock-openalex",
+            "--dataset",
+            "authors",
+            "--aws-bin",
+            aws_bin.to_str().unwrap(),
+        ])
+        .env("MOCK_S3_ROOT", s3.to_str().unwrap())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "verify_download should fail on size mismatch"
+    );
+    let has_vd_report = fs::read_dir(&reports)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("verify_download-")
+        });
+    assert!(
+        has_vd_report,
+        "failing verify_download should write a report"
+    );
+}
+
+#[test]
+fn enrich_works_and_index_skips_works_aws() {
+    if !has_duckdb() {
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let raw_dir = root.join("parquet/works_aws/updated_date=2020-01-01");
+    fs::create_dir_all(&raw_dir).unwrap();
+    let raw_file = raw_dir.join("part_0000.parquet");
+    // Raw works with a JSON-string abstract_inverted_index (as in the official release).
+    let status = Command::new("duckdb")
+        .args([
+            "-c",
+            &format!(
+                "COPY (SELECT * FROM (VALUES \
+                   ('https://openalex.org/W1', '{{\"Hello\":[0],\"world\":[1]}}'), \
+                   ('https://openalex.org/W2', NULL) \
+                 ) AS t(id, abstract_inverted_index)) TO '{}' (FORMAT PARQUET);",
+                raw_file.to_string_lossy().replace('\'', "''")
+            ),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_openalex-snapshot"));
+
+    // enrich works_aws -> works
+    let status = Command::new(&exe)
+        .args(["enrich", "--root-dir", root.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let enriched = root.join("parquet/works/updated_date=2020-01-01/part_0000.parquet");
+    assert!(enriched.exists(), "enriched works file should exist");
+
+    // abstract reconstructed; row parity preserved.
+    let out = Command::new("duckdb")
+        .args([
+            "-csv",
+            "-c",
+            &format!(
+                "SELECT (SELECT abstract FROM read_parquet('{f}') WHERE id='https://openalex.org/W1') AS a, (SELECT COUNT(*) FROM read_parquet('{f}')) AS n;",
+                f = enriched.to_string_lossy().replace('\'', "''")
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("Hello world"),
+        "abstract should be reconstructed: {s}"
+    );
+    assert!(
+        s.contains(",2") || s.trim_end().ends_with("2"),
+        "row parity (2 rows): {s}"
+    );
+
+    // index --dataset all must index works but skip works_aws.
+    let status = Command::new(&exe)
+        .args([
+            "index",
+            "--root-dir",
+            root.to_str().unwrap(),
+            "--dataset",
+            "all",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        root.join("parquet/works_id_idx.parquet").exists(),
+        "works index should be built"
+    );
+    assert!(
+        !root.join("parquet/works_aws_id_idx.parquet").exists(),
+        "works_aws must be skipped by index --dataset all"
+    );
 }
 
 #[test]
