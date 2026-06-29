@@ -255,7 +255,7 @@ const CHECK_LONG_ABOUT: &str = "\
 Run environment and capacity preflight checks.
 
 Checks:
-  - required binaries (aws for download; duckdb is bundled — no external binary needed)
+  - required binaries (aws for download; parquet I/O is pure Rust, no duckdb needed)
   - root/snapshot/parquet/metadata path writability
   - download disk estimate from remote manifest (+10%)
   - convert disk estimate from source inventory (precise)
@@ -301,17 +301,9 @@ Defaults:
   existing index: skip (use --overwrite to rebuild)
   --index-file is ignored with --dataset all
 
-Profile / tuning:
-  Profile controls the DuckDB memory budget per worker (80% of RAM × fraction,
-  clamped to a min/max). Workers is only capped by 'safe'.
-
-  profile    workers cap   memory fraction   memory range
-  safe       max 2         15% of usable     1 – 8 GiB
-  balanced   (none)        35% of usable     4 – 24 GiB
-  fast       (none)        55% of usable     8 – 32 GiB
-
-  Fallback when RAM cannot be detected: safe=2 GiB, balanced=6 GiB, fast=12 GiB.
-  Set --max-memory-mb to override the profile memory calculation entirely.
+Tuning:
+  Pure-Rust parquet I/O; reads only the `id` column per file. Memory needs are
+  modest — use --workers / --max-memory-mb only to constrain resource use.
 ";
 
 const ENRICH_LONG_ABOUT: &str = "\
@@ -518,7 +510,7 @@ struct SharedArgs {
 //
 // A profile is either Safe (single conservative configuration) or Stratified
 // (a sequence of strata partitioning the file list by gz size; each stratum
-// runs as its own rayon parallel pass with its own worker count and DuckDB
+// runs as its own rayon parallel pass with its own worker count and per-worker
 // memory limit).  Profile definitions are loaded from `builtin_profiles()`
 // and optionally merged with a user-supplied `performance.yaml`.
 // ---------------------------------------------------------------------------
@@ -2543,21 +2535,7 @@ defaults:
   dataset: all
 
   # Shared runtime defaults — leave commented to use built-in auto mode.
-  # allowed values: any valid executable path
-  # Profile controls DuckDB memory budget and worker count.
-  # safe (default) — single-pass, single worker, generous per-worker memory
-  #   (45% of usable RAM, clamped 8-24 GiB).  Reliable on any host; uses DuckDB
-  #   spill-to-disk for files larger than the memory budget.
-  # stratified-36 — multi-pass; partitions files by gz size and runs one rayon
-  #   pass per non-empty stratum (4-/3-/2-/1-workers on <400/400-600/600-800/800+ MB).
-  #   Empirically tuned for ~36 GB RAM hosts.
-  # Custom profiles for other RAM tiers go in a sibling `openalex-snapshot.performance.yaml`
-  # (auto-discovered) — see `docs/commands/convert.md` for the schema.
-  # allowed values: safe | stratified-36 | <user-defined>
-  # profile: safe
-  # Workers: 0 (default) = auto-detect per profile. `--workers N` on a stratified
-  # profile collapses it into a single flat pass.
-  # Override only if you want to pin a specific value.
+  # Workers: 0 (default) = auto-detect (min(cpus, 4)). Override to pin a value.
   # allowed values: integer >= 0 (0 = auto)
   # workers: 0
   # allowed values: integer >= 1
@@ -3200,13 +3178,6 @@ fn run_check(args: CheckArgs) -> Result<()> {
     let mut warns = 0usize;
     let mut fails = 0usize;
 
-    // DuckDB is statically linked via the bundled crate — no external binary required.
-    findings.push(CheckFinding {
-        name: "duckdb".to_string(),
-        status: "ok".to_string(),
-        details: "bundled (statically linked — no external binary required)".to_string(),
-        recommendation: None,
-    });
     match ensure_aws_cli(&args.aws_bin) {
         Ok(()) => findings.push(CheckFinding {
             name: "aws".to_string(),
