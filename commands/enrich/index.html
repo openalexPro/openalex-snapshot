@@ -9,10 +9,10 @@
       
       
       
-        <link rel="prev" href="../../commands/skills/">
+        <link rel="prev" href="../verify_download/">
       
       
-        <link rel="next" href="../cache-precompute/">
+        <link rel="next" href="../">
       
       
         
@@ -23,7 +23,7 @@
     
     
       
-        <title>Low memory - openalex-snapshot</title>
+        <title>enrich - openalex-snapshot</title>
       
     
     
@@ -64,7 +64,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#runbook-low-memory-conversion" class="md-skip">
+        <a href="#command-enrich" class="md-skip">
           Skip to content
         </a>
       
@@ -100,7 +100,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Low memory
+              enrich
             
           </span>
         </div>
@@ -247,18 +247,20 @@
       
   
   
+    
   
   
+  
     
     
     
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
         
           
           <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
@@ -279,7 +281,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -297,7 +299,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/check/" class="md-nav__link">
+      <a href="../check/" class="md-nav__link">
         
   
   
@@ -325,7 +327,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/config/" class="md-nav__link">
+      <a href="../config/" class="md-nav__link">
         
   
   
@@ -353,7 +355,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/all/" class="md-nav__link">
+      <a href="../all/" class="md-nav__link">
         
   
   
@@ -381,7 +383,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/download/" class="md-nav__link">
+      <a href="../download/" class="md-nav__link">
         
   
   
@@ -409,7 +411,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/verify_download/" class="md-nav__link">
+      <a href="../verify_download/" class="md-nav__link">
         
   
   
@@ -434,17 +436,44 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../commands/convert/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    enrich
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
+    enrich
   
 
     
@@ -453,6 +482,70 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#derived-columns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Derived columns
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Behavior
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reading-enriched-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading enriched works
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -465,35 +558,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/" class="md-nav__link">
+      <a href="../" class="md-nav__link">
         
   
   
@@ -521,7 +586,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/verify_index/" class="md-nav__link">
+      <a href="../verify_index/" class="md-nav__link">
         
   
   
@@ -549,7 +614,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/extract/" class="md-nav__link">
+      <a href="../extract/" class="md-nav__link">
         
   
   
@@ -577,63 +642,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/report/" class="md-nav__link">
+      <a href="../report/" class="md-nav__link">
         
   
   
@@ -661,7 +670,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/prune-reports/" class="md-nav__link">
+      <a href="../prune-reports/" class="md-nav__link">
         
   
   
@@ -689,7 +698,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/progress/" class="md-nav__link">
+      <a href="../progress/" class="md-nav__link">
         
   
   
@@ -717,7 +726,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/skills/" class="md-nav__link">
+      <a href="../skills/" class="md-nav__link">
         
   
   
@@ -749,20 +758,18 @@
       
   
   
-    
   
   
-  
     
     
     
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
         
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
@@ -783,7 +790,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -798,124 +805,10 @@
                 
   
   
-    
-  
-  
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#when-safe-is-not-enough" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        When safe is not enough
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
   
   
     <li class="md-nav__item">
-      <a href="../cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../recovery/" class="md-nav__link">
+      <a href="../../operations/recovery/" class="md-nav__link">
         
   
   
@@ -997,10 +890,43 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#when-safe-is-not-enough" class="md-nav__link">
+  <a href="#derived-columns" class="md-nav__link">
     <span class="md-ellipsis">
       
-        When safe is not enough
+        Derived columns
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Behavior
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reading-enriched-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading enriched works
       
     </span>
   </a>
@@ -1024,40 +950,42 @@
 
 
 
-<h1 id="runbook-low-memory-conversion">Runbook: Low-Memory Conversion</h1>
-<p><code>safe</code> is the <strong>default</strong> profile and is the right answer for low-memory hosts.  No flags
-needed beyond <code>--root-dir</code> and <code>--dataset</code>:</p>
-<pre><code class="language-bash">openalex-snapshot convert \
-  --root-dir /data \
-  --dataset works
+<h1 id="command-enrich">Command: enrich</h1>
+<p>Enrich the raw works parquet with two derived columns, writing a separate enriched copy and
+leaving the downloaded data untouched:</p>
+<ul>
+<li><code>&lt;root&gt;/parquet/works_aws/</code> — raw official works (input; manifest-verifiable)</li>
+<li><code>&lt;root&gt;/parquet/works/</code> — enriched output (raw columns <strong>+ <code>abstract</code> + <code>citation</code></strong>)</li>
+</ul>
+<p><code>download</code> runs this automatically for <code>works</code> unless <code>--no-enrich</code> is given; the standalone
+command is for re-runs and repair.</p>
+<h2 id="derived-columns">Derived columns</h2>
+<ul>
+<li><strong><code>abstract</code></strong> — plain text reconstructed from the JSON <code>abstract_inverted_index</code>
+  (positions sorted ascending, words joined with single spaces).</li>
+<li><strong><code>citation</code></strong> — <code>"Author (year)"</code> / <code>"A &amp; B (year)"</code> / <code>"A et al. (year)"</code> from
+  <code>authorships</code> + <code>publication_year</code>; null year renders as <code>(n.d.)</code>; null/empty authorships ⇒ null.</li>
+</ul>
+<p>Each column is only added when its source column exists in the parquet.</p>
+<h2 id="usage">Usage</h2>
+<pre><code class="language-bash">openalex-snapshot enrich --root-dir /data
+# rebuild everything (ignore the incremental skip):
+openalex-snapshot enrich --root-dir /data --overwrite
 </code></pre>
-<p>If you need to constrain memory further (e.g. on an 8 GB box, or to leave headroom for
-other processes):</p>
-<pre><code class="language-bash">openalex-snapshot convert \
-  --root-dir /data \
-  --dataset works \
-  --max-memory-mb 4096
-</code></pre>
-<p>Notes:
-- <code>safe</code> runs <strong>one worker at a time</strong> with a generous per-worker memory cap (45 % of
-  usable RAM, clamped to 8–24 GiB on single-worker mode).  This is sufficient to convert
-  the largest works files (~1 GB compressed → ~15 GB uncompressed JSON) on any host with
-  spill-to-disk enabled (which is automatic via the DuckDB <code>temp_directory</code> setting).
-- <code>--max-memory-mb N</code> overrides the profile's per-worker memory cap.
-- Use repeated <code>--input-file &lt;rel-path&gt;</code> to isolate and retry specific problematic files.
-- Spill-to-disk writes intermediate data to
-  <code>&lt;root&gt;/openalex-snapshot_metadata/duckdb_tmp/</code>.  Ensure that filesystem has free
-  space comparable to your largest decompressed input (10–20 GB is generous for works).</p>
-<h2 id="when-safe-is-not-enough">When <code>safe</code> is not enough</h2>
-<p>If you observe OOM even under <code>safe</code>:</p>
-<ol>
-<li><strong>Reduce concurrency</strong>: <code>--workers 1</code> is already the safe default; nothing to tighten.</li>
-<li><strong>Lower memory cap</strong>: <code>--max-memory-mb 2048</code> forces a smaller DuckDB budget so it
-   spills earlier (slower but safer).</li>
-<li><strong>Pre-split large gz files</strong>: <code>--split-size 256mb</code> decomposes large inputs into
-   chunks before conversion, producing numbered parquets (<code>part_0000_001.parquet</code>,
-   <code>part_0000_002.parquet</code>, …).</li>
-</ol>
+<h2 id="behavior">Behavior</h2>
+<ul>
+<li>Mirrors the <code>updated_date=.../part_*.parquet</code> partition layout.</li>
+<li><strong>Incremental</strong>: skips outputs newer than their source; re-running after an incremental
+  download only rewrites changed partitions.</li>
+<li><strong>Row-parity self-check</strong>: the enriched row count must equal the source row count, or the
+  file is treated as a failure and removed.</li>
+<li>The raw <code>works_aws/</code> is never modified, so it stays byte-identical to OpenAlex and the next
+  snapshot's incremental <code>aws s3 sync</code> is unaffected.</li>
+<li>Only the <code>works</code> dataset is supported (other datasets need no enrichment).</li>
+</ul>
+<h2 id="reading-enriched-works">Reading enriched works</h2>
+<p><code>index --dataset all</code> skips <code>*_aws</code> staging dirs and indexes the canonical <code>works/</code>; <code>extract</code>
+routes <code>W</code> IDs to <code>works/</code>, so extracted rows include <code>abstract</code> + <code>citation</code>.</p>
 
 
 

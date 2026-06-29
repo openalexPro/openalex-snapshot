@@ -508,42 +508,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../convert/" class="md-nav__link">
+      <a href="../enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -628,62 +600,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -870,62 +786,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../operations/recovery/" class="md-nav__link">
         
   
@@ -1047,21 +907,20 @@
 
 
 <h1 id="command-all">Command: all</h1>
-<p>Run the full pipeline from config with a bounded <code>verify_convert</code>/<code>repair_convert</code> retry loop.</p>
+<p>Run the full parquet-native pipeline from config.</p>
 <h2 id="usage">Usage</h2>
-<pre><code class="language-bash">openalex-snapshot all --config ./openalex-snapshot.yaml --retry 2
+<pre><code class="language-bash">openalex-snapshot all --config ./openalex-snapshot.yaml
 </code></pre>
 <h2 id="flow">Flow</h2>
 <ol>
-<li><code>check</code> (if enabled)</li>
-<li><code>download</code> (if enabled)</li>
-<li><code>verify_download</code> (if enabled)</li>
-<li><code>convert</code></li>
-<li><code>verify_convert</code></li>
-<li><code>repair_convert</code> (only when verify fails, up to <code>--retry</code>)</li>
-<li><code>index</code></li>
-<li><code>verify_index</code></li>
+<li><code>download</code> (if enabled) — syncs the official parquet; auto-enriches <code>works</code> unless
+   <code>download.no_enrich: true</code></li>
+<li><code>verify_download</code> (if enabled) — manifest presence/size/row-count</li>
+<li><code>index</code> (if enabled) — builds <code>&lt;dataset&gt;_id_idx.parquet</code> for each dataset (skips <code>*_aws</code>)</li>
+<li><code>verify_index</code> (if enabled)</li>
 </ol>
+<p>Each stage can be toggled in the <code>all:</code> config section
+(<code>enable_download</code>, <code>enable_verify_download</code>, <code>enable_index</code>, <code>enable_verify_index</code>).</p>
 
 
 

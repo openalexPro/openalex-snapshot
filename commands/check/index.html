@@ -519,42 +519,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../convert/" class="md-nav__link">
+      <a href="../enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -639,62 +611,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -881,62 +797,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../operations/recovery/" class="md-nav__link">
         
   
@@ -1075,11 +935,9 @@
 </code></pre>
 <h2 id="what-it-checks">What it checks</h2>
 <ul>
-<li>dependency binaries (<code>aws</code> — <code>duckdb</code> is bundled and reported as ok)</li>
-<li>path writability for root/snapshot/parquet/metadata</li>
-<li>download disk requirement (remote manifest + safety margin)</li>
-<li>convert disk requirement (precise source inventory estimate)</li>
-<li>memory/tuning risk based on profile/workers/memory settings</li>
+<li>dependency binaries (<code>aws</code>; DuckDB is no longer required — parquet I/O is pure Rust)</li>
+<li>path writability for root/parquet/metadata</li>
+<li>download disk requirement (parquet <code>manifest.json</code> size + safety margin)</li>
 </ul>
 <h2 id="options">Options</h2>
 <ul>

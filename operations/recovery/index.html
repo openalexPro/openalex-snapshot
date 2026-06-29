@@ -9,7 +9,7 @@
       
       
       
-        <link rel="prev" href="../cache-precompute/">
+        <link rel="prev" href="../../commands/skills/">
       
       
         <link rel="next" href="../../troubleshooting/">
@@ -437,42 +437,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/convert/" class="md-nav__link">
+      <a href="../../commands/enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -557,62 +529,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../commands/verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -798,62 +714,6 @@
                 
   
   
-  
-  
-    <li class="md-nav__item">
-      <a href="../low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
     
   
   
@@ -917,10 +777,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#resume-convert" class="md-nav__link">
+  <a href="#resume-a-download" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resume convert
+        Resume a download
       
     </span>
   </a>
@@ -928,10 +788,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#repair-failed-files-built-into-convert" class="md-nav__link">
+  <a href="#re-enrich-works" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Repair failed files (built into convert)
+        Re-enrich works
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rebuild-an-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rebuild an index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#re-check-integrity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Re-check integrity
       
     </span>
   </a>
@@ -1019,10 +901,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#resume-convert" class="md-nav__link">
+  <a href="#resume-a-download" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resume convert
+        Resume a download
       
     </span>
   </a>
@@ -1030,10 +912,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#repair-failed-files-built-into-convert" class="md-nav__link">
+  <a href="#re-enrich-works" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Repair failed files (built into convert)
+        Re-enrich works
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rebuild-an-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rebuild an index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#re-check-integrity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Re-check integrity
       
     </span>
   </a>
@@ -1069,22 +973,33 @@
 
 
 <h1 id="runbook-recovery-and-resume">Runbook: Recovery and Resume</h1>
-<h2 id="resume-convert">Resume convert</h2>
-<p>Re-run the same convert command; existing outputs are skipped.</p>
-<h2 id="repair-failed-files-built-into-convert">Repair failed files (built into convert)</h2>
-<p>If <code>verify_convert</code> reported failures, just re-run <code>convert</code>:</p>
-<pre><code class="language-bash">openalex-snapshot convert --root-dir /data
+<p>The parquet-native pipeline is resumable at every stage — just re-run the command.</p>
+<h2 id="resume-a-download">Resume a download</h2>
+<p><code>aws s3 sync</code> is incremental: re-running <code>download</code> only transfers files that are missing or
+changed. Auto-enrichment of works also resumes (see below).</p>
+<pre><code class="language-bash">openalex-snapshot download --root-dir /data
 </code></pre>
-<p>Convert reads the latest <code>verify_convert</code> report on startup and deletes any
-output parquet flagged as bad, so the normal skip-if-exists loop re-builds it.</p>
-<p>To skip auto-repair (process only files whose parquet is missing):</p>
-<pre><code class="language-bash">openalex-snapshot convert --root-dir /data --auto-repair=false
+<h2 id="re-enrich-works">Re-enrich works</h2>
+<p><code>enrich</code> is incremental: it skips enriched files that are newer than their source and only
+rebuilds changed partitions. Force a full rebuild with <code>--overwrite</code>.</p>
+<pre><code class="language-bash">openalex-snapshot enrich --root-dir /data
+openalex-snapshot enrich --root-dir /data --overwrite   # rebuild everything
 </code></pre>
-<p>To force a single specific file regardless of the verify report:</p>
-<pre><code class="language-bash">openalex-snapshot convert --root-dir /data --input-file &lt;rel/path/to/file.gz&gt;
+<p>If <code>parquet/works/</code> is gone but <code>parquet/works_aws/</code> is intact, just re-run <code>enrich</code>. If
+<code>parquet/works_aws/</code> was deleted to save space, re-run <code>download</code> (works is re-fetched, then
+re-enriched).</p>
+<h2 id="rebuild-an-index">Rebuild an index</h2>
+<p>Per-file shard index building is resumable; <code>--overwrite</code> forces a clean rebuild.</p>
+<pre><code class="language-bash">openalex-snapshot index --root-dir /data --dataset all
+openalex-snapshot index --root-dir /data --dataset works --overwrite
 </code></pre>
-<p>(<code>--input-file</code> always wins over auto-repair.)</p>
+<h2 id="re-check-integrity">Re-check integrity</h2>
+<pre><code class="language-bash">openalex-snapshot verify_download --root-dir /data        # vs the published manifest
+openalex-snapshot verify_index   --root-dir /data --dataset all
+</code></pre>
 <h2 id="diagnose-failures">Diagnose failures</h2>
+<p>A JSON report is written under <code>openalex-snapshot_metadata/reports/</code> only when a command has
+failures:</p>
 <ul>
 <li><code>openalex-snapshot report --root-dir /data --latest --full</code></li>
 <li><code>openalex-snapshot progress --root-dir /data --once</code></li>

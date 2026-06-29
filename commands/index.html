@@ -9,7 +9,7 @@
       
       
       
-        <link rel="prev" href="verify/">
+        <link rel="prev" href="enrich/">
       
       
         <link rel="next" href="verify_index/">
@@ -439,42 +439,14 @@
   
   
     <li class="md-nav__item">
-      <a href="convert/" class="md-nav__link">
+      <a href="enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -639,62 +611,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -881,62 +797,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../operations/recovery/" class="md-nav__link">
         
   
@@ -1071,7 +931,7 @@
 <h1 id="command-index">Command: index</h1>
 <p>Build a parquet lookup index equivalent to R <code>build_corpus_index()</code>.</p>
 <p>Default dataset is <code>all</code> (build indexes for all datasets). Use <code>--dataset &lt;name&gt;</code> to limit to one dataset.
-When running with <code>--dataset all</code>, existing per-dataset index files are skipped and missing ones are built. If <code>--index-file</code> is supplied, it is ignored in <code>all</code> mode.</p>
+When running with <code>--dataset all</code>, existing per-dataset index files are skipped and missing ones are built, and the raw <code>*_aws</code> staging dirs (e.g. <code>works_aws</code>) are skipped in favour of the canonical dataset (<code>works</code>). If <code>--index-file</code> is supplied, it is ignored in <code>all</code> mode.</p>
 <h2 id="usage">Usage</h2>
 <pre><code class="language-bash">openalex-snapshot index \
   --root-dir /data \
@@ -1085,10 +945,7 @@ When running with <code>--dataset all</code>, existing per-dataset index files a
 <li><code>file_row_number</code></li>
 </ul>
 <h2 id="tuning">Tuning</h2>
-<p><code>index</code> reads parquet files (already-converted output of <code>convert</code>), so its memory needs are modest compared to <code>convert</code>. The default tuning is fine for any host with ≥4 GB RAM. Use <code>--max-memory-mb &lt;N&gt;</code> and <code>--workers &lt;N&gt;</code> only if you need to constrain resources.</p>
-<blockquote>
-<p><strong>Note</strong>: the legacy <code>--profile safe|balanced|fast</code> flag is accepted on this command for backwards compatibility but doesn't drive stratified parallelism. The stratified profile system (<code>safe</code>, <code>stratified-36</code>, custom <code>stratified-N</code> from <code>openalex-snapshot.performance.yaml</code>) currently applies only to <code>convert</code> and <code>repair_convert</code>. See <a href="convert/#profile--tuning"><code>convert.md</code></a>.</p>
-</blockquote>
+<p><code>index</code> reads the downloaded parquet corpus one file at a time, so its memory needs are modest — the default tuning is fine for any host with ≥4 GB RAM. Use <code>--max-memory-mb &lt;N&gt;</code> and <code>--workers &lt;N&gt;</code> only if you need to constrain resources.</p>
 
 
 

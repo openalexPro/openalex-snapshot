@@ -453,6 +453,28 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#transfer-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transfer tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -497,42 +519,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../convert/" class="md-nav__link">
+      <a href="../enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -617,62 +611,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -859,62 +797,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../operations/recovery/" class="md-nav__link">
         
   
@@ -1007,6 +889,28 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#transfer-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transfer tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1025,14 +929,61 @@
 
 
 <h1 id="command-download">Command: download</h1>
-<p>Sync OpenAlex snapshot from S3 via AWS CLI.</p>
-<p>Validation is a separate step via <code>verify_download</code>.</p>
+<p>Download the OpenAlex snapshot, which is now published <strong>natively in parquet</strong> at
+<code>s3://openalex/data/parquet/</code>. No conversion is needed.</p>
+<p>Each dataset is synced <strong>per-dataset</strong> so <code>aws s3 sync --delete</code> only ever manages its own
+directory:</p>
+<ul>
+<li><code>works</code> → <code>&lt;root&gt;/parquet/works_aws/</code> (raw, the stable sync target)</li>
+<li>every other dataset → <code>&lt;root&gt;/parquet/&lt;dataset&gt;/</code></li>
+</ul>
+<p>After a successful <code>works</code> sync, <code>download</code> <strong>auto-runs <code>enrich</code></strong> to produce the canonical
+enriched <code>&lt;root&gt;/parquet/works/</code> (raw columns + <code>abstract</code> + <code>citation</code>). Pass <code>--no-enrich</code>
+to skip enrichment (raw <code>works_aws/</code> only).</p>
 <h2 id="usage">Usage</h2>
 <pre><code class="language-bash">openalex-snapshot download --root-dir /data
+# raw-only (skip enrichment):
+openalex-snapshot download --root-dir /data --no-enrich
+# one dataset:
+openalex-snapshot download --root-dir /data --dataset authors
 </code></pre>
-<p>Default sync intent:</p>
-<pre><code class="language-bash">aws s3 sync --delete s3://openalex /data/openalex-snapshot --no-sign-request
+<p>Per-dataset sync intent:</p>
+<pre><code class="language-bash">aws s3 sync --delete s3://openalex/data/parquet/&lt;dataset&gt;/ /data/parquet/&lt;dataset&gt;/ --no-sign-request
 </code></pre>
+<h2 id="transfer-tuning">Transfer tuning</h2>
+<p>These are applied via a temporary <code>AWS_CONFIG_FILE</code> for the sync only — your global
+<code>~/.aws/config</code> is never modified:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--max-concurrent-requests</code></td>
+<td><code>10</code></td>
+</tr>
+<tr>
+<td><code>--max-queue-size</code></td>
+<td><code>50000</code></td>
+</tr>
+<tr>
+<td><code>--multipart-chunksize</code></td>
+<td><code>32MB</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>The dataset list and disk-space preflight come from the published
+  <code>s3://openalex/data/parquet/manifest.json</code>.</li>
+<li>Validation is a separate step — run <code>verify_download</code>.</li>
+<li>Space: delete <code>parquet/works_aws/</code> to reclaim raw space (the next snapshot will re-download
+  works in full, then re-enrich), or delete <code>parquet/works/</code> (re-enrich anytime from
+  <code>works_aws/</code>).</li>
+</ul>
 
 
 

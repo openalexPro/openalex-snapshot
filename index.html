@@ -445,42 +445,14 @@
   
   
     <li class="md-nav__item">
-      <a href="commands/convert/" class="md-nav__link">
+      <a href="commands/enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="commands/verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -565,62 +537,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="commands/schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="commands/verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -807,62 +723,6 @@
   
   
     <li class="md-nav__item">
-      <a href="operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="operations/recovery/" class="md-nav__link">
         
   
@@ -960,6 +820,8 @@
 <a href="https://github.com/rkrug/openalex-snapshot/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/rkrug/openalex-snapshot" /></a></p>
 <p>This folder contains internet-facing documentation for <code>openalex-snapshot</code>.</p>
 <p>Argument precedence (highest wins): CLI arguments &gt; config subcommand section &gt; config <code>defaults</code> section &gt; built-in defaults.</p>
+<p>OpenAlex now publishes the snapshot natively in parquet, so <code>openalex-snapshot</code> is a
+parquet-native pipeline: <strong>download → verify_download → (auto) enrich → index → extract</strong>.</p>
 <p>Recommended page order:</p>
 <ol>
 <li><code>quickstart.md</code></li>
@@ -968,14 +830,10 @@
 <li><code>commands/all.md</code></li>
 <li><code>commands/download.md</code></li>
 <li><code>commands/verify_download.md</code></li>
-<li><code>commands/convert.md</code></li>
-<li><code>commands/verify.md</code></li>
-<li><code>commands/repair.md</code></li>
+<li><code>commands/enrich.md</code></li>
 <li><code>commands/index.md</code></li>
 <li><code>commands/verify_index.md</code></li>
 <li><code>commands/extract.md</code></li>
-<li><code>commands/schema.md</code></li>
-<li><code>commands/verify_schema.md</code></li>
 <li><code>commands/report.md</code></li>
 <li><code>commands/prune-reports.md</code></li>
 <li><code>commands/progress.md</code></li>

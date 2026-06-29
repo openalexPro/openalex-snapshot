@@ -9,7 +9,7 @@
       
       
       
-        <link rel="prev" href="../verify_schema/">
+        <link rel="prev" href="../extract/">
       
       
         <link rel="next" href="../prune-reports/">
@@ -439,42 +439,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../convert/" class="md-nav__link">
+      <a href="../enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -559,62 +531,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -881,62 +797,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../operations/recovery/" class="md-nav__link">
         
   
@@ -1069,29 +929,24 @@
 
 
 <h1 id="command-report">Command: report</h1>
-<p>Show run reports written under <code>openalex-snapshot_metadata</code>.</p>
+<p>Show run reports written under <code>openalex-snapshot_metadata/reports/</code>. A report is written only
+when a command has failures.</p>
 <h2 id="usage">Usage</h2>
 <pre><code class="language-bash"># show latest reports with per-dataset breakdown (default)
-openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+openalex-snapshot report --root-dir /data --latest
 
 # show only aggregate totals (suppress per-dataset rows)
-openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
+openalex-snapshot report --root-dir /data --latest --summary
 
 # show full JSON details
-openalex-snapshot --config ./openalex-snapshot.yaml report --latest --full
-
-# list available archived run timestamps
-openalex-snapshot report --root-dir /data --list
-
-# show a specific archived run
-openalex-snapshot report --root-dir /data --archived 1715000000 --latest
+openalex-snapshot report --root-dir /data --latest --full
 
 # filter by command
-openalex-snapshot report --root-dir /data --command verify_convert --latest
+openalex-snapshot report --root-dir /data --command verify_download --latest
 </code></pre>
 <h2 id="default-output">Default output</h2>
 <p>Each report is shown as a header line followed by a per-dataset table:</p>
-<pre><code>=== convert [2026-05-09 00:28:53  40m18s  ok]  convert-1778260662.json
+<pre><code>=== verify_download [2026-06-27 00:28:53  3s  ok]  verify_download-1782660000.json
   dataset                scanned       ok   failed  skipped
   ------------------------------------------------------
   authors                    546      546        0        0
@@ -1102,10 +957,8 @@ openalex-snapshot report --root-dir /data --command verify_convert --latest
 <ul>
 <li><code>--config</code> is a <strong>global</strong> flag and must precede the subcommand:
   <code>openalex-snapshot --config ./openalex-snapshot.yaml report</code></li>
-<li><code>--summary</code> prints only aggregate totals (old behavior); suppresses per-dataset rows</li>
-<li><code>--list</code> shows timestamps available under <code>openalex-snapshot_metadata/archived/</code></li>
-<li><code>--archived &lt;timestamp&gt;</code> reads <code>openalex-snapshot_metadata/archived/&lt;timestamp&gt;/reports/</code></li>
-<li><code>--command &lt;name&gt;</code> filters by command (e.g. <code>verify_convert</code>, <code>repair_convert</code>)</li>
+<li><code>--summary</code> prints only aggregate totals; suppresses per-dataset rows</li>
+<li><code>--command &lt;name&gt;</code> filters by command (e.g. <code>download</code>, <code>verify_download</code>, <code>index</code>)</li>
 <li><code>--full</code> prints full JSON details</li>
 </ul>
 

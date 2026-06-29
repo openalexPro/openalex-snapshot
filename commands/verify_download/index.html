@@ -12,7 +12,7 @@
         <link rel="prev" href="../download/">
       
       
-        <link rel="next" href="../convert/">
+        <link rel="next" href="../enrich/">
       
       
         
@@ -492,6 +492,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Output
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -508,42 +519,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../convert/" class="md-nav__link">
+      <a href="../enrich/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    convert
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_convert
+    enrich
   
 
     
@@ -628,62 +611,6 @@
     
   
     extract
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    schema
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../verify_schema/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    verify_schema
   
 
     
@@ -870,62 +797,6 @@
   
   
     <li class="md-nav__item">
-      <a href="../../operations/low-memory/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Low memory
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../operations/cache-precompute/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Cache precompute
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
       <a href="../../operations/recovery/" class="md-nav__link">
         
   
@@ -1029,6 +900,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Output
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1047,18 +929,30 @@
 
 
 <h1 id="command-verify_download">Command: verify_download</h1>
-<p>Strictly validate downloaded snapshot integrity.</p>
+<p>Validate the downloaded parquet corpus against the official
+<code>s3://openalex/data/parquet/manifest.json</code>.</p>
 <h2 id="usage">Usage</h2>
 <pre><code class="language-bash">openalex-snapshot verify_download --root-dir /data
+# size-only (fastest):
+openalex-snapshot verify_download --root-dir /data --quick
+# full row scan (catches data-page corruption):
+openalex-snapshot verify_download --root-dir /data --full
 </code></pre>
 <h2 id="checks">Checks</h2>
+<p>For every file listed in the manifest:</p>
 <ul>
-<li>remote manifest parity</li>
-<li>missing files</li>
-<li>size mismatches</li>
-<li>optional extra local files</li>
-<li>gzip integrity for <code>.json.gz</code></li>
+<li><strong>presence</strong> — the local file exists (works files are checked under <code>works_aws/</code>)</li>
+<li><strong>size</strong> — local byte size equals the manifest <code>content_length</code></li>
+<li><strong>row count</strong> — parquet row count equals the manifest <code>record_count</code></li>
+<li>default (<code>meta</code>): footer metadata only (<code>parquet_file_metadata</code>) — cheap</li>
+<li><code>--full</code>: actual <code>COUNT(*)</code> scan — slower, catches corrupt data pages</li>
+<li><code>--quick</code>: skip the row-count check entirely</li>
+<li><strong>extra files</strong> (<code>--check-extra</code>, on by default) — flag local <code>.parquet</code> files not in the manifest</li>
 </ul>
+<p>The enriched <code>works/</code> directory is validated by <code>enrich</code>'s own row-parity self-check, not here.</p>
+<h2 id="output">Output</h2>
+<p>A JSON report is written only when failures are detected; a clean run prints a one-line
+summary and exits 0.</p>
 
 
 
