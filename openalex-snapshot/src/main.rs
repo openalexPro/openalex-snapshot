@@ -511,10 +511,6 @@ struct SharedArgs {
     #[arg(long, default_value_t = 0)]
     #[arg(help = "Number of worker threads (0 = auto: cpus-2 for auto profile, 4 otherwise)")]
     workers: usize,
-
-    #[arg(long)]
-    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
-    duckdb_bin: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -604,10 +600,6 @@ struct IndexArgs {
     #[arg(help = "Per-worker memory cap override in MB (same semantics as convert)")]
     max_memory_mb: Option<usize>,
 
-    #[arg(long)]
-    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
-    duckdb_bin: Option<PathBuf>,
-
     #[arg(long, default_value_t = true)]
     #[arg(help = "Show stage progress bars with rough ETA")]
     progress: bool,
@@ -643,10 +635,6 @@ struct EnrichArgs {
     #[arg(long)]
     #[arg(help = "Per-worker memory cap override in MB")]
     max_memory_mb: Option<usize>,
-
-    #[arg(long)]
-    #[arg(help = "Path to duckdb executable (unused; DuckDB is statically linked)")]
-    duckdb_bin: Option<PathBuf>,
 
     #[arg(long, default_value_t = true)]
     #[arg(help = "Show progress bars with rough ETA")]
@@ -888,10 +876,6 @@ struct VerifyIndexArgs {
     #[arg(long)]
     #[arg(help = "Per-worker memory cap override in MB")]
     max_memory_mb: Option<usize>,
-
-    #[arg(long)]
-    #[arg(help = "Path to duckdb executable (default: duckdb in PATH)")]
-    duckdb_bin: Option<PathBuf>,
 
     #[arg(long, default_value_t = true)]
     #[arg(help = "Show progress bars with rough ETA")]
@@ -1139,7 +1123,6 @@ struct ConfigDefaults {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
     workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     // Legacy convert profile selector — parsed for back-compat but no longer acted on.
     #[allow(dead_code)]
     profile: Option<String>,
@@ -1213,7 +1196,6 @@ struct IndexConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
     workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
@@ -1227,7 +1209,6 @@ struct ExtractConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
     workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     state_flush_every: Option<usize>,
@@ -1242,7 +1223,6 @@ struct EnrichConfig {
     dataset: Option<String>,
     workers: Option<usize>,
     max_memory_mb: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     progress: Option<bool>,
     overwrite: Option<bool>,
 }
@@ -1296,7 +1276,6 @@ struct VerifyIndexConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
     workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     max_memory_mb: Option<usize>,
     progress: Option<bool>,
     index_file: Option<PathBuf>,
@@ -1340,7 +1319,6 @@ struct CheckConfig {
     root_dir: Option<PathBuf>,
     dataset: Option<String>,
     workers: Option<usize>,
-    duckdb_bin: Option<PathBuf>,
     aws_bin: Option<PathBuf>,
     s3_uri: Option<String>,
     endpoint_url: Option<String>,
@@ -1758,11 +1736,6 @@ fn apply_shared_defaults(
             shared.workers = v;
         }
     }
-    if !cli_explicit(matches, "duckdb_bin") {
-        if let Some(v) = &d.duckdb_bin {
-            shared.duckdb_bin = Some(v.clone());
-        }
-    }
 }
 
 fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Option<&ArgMatches>) {
@@ -1783,11 +1756,6 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "workers") {
             if let Some(v) = d.workers {
                 args.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &d.duckdb_bin {
-                args.duckdb_bin = Some(v.clone());
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -1818,11 +1786,6 @@ fn apply_index_config(args: &mut IndexArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.duckdb_bin = Some(v.clone());
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -1900,11 +1863,6 @@ fn apply_enrich_config(
                 args.max_memory_mb = Some(v);
             }
         }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.duckdb_bin = Some(v.clone());
-            }
-        }
         if !cli_explicit(matches, "progress") {
             if let Some(v) = c.progress {
                 args.progress = v;
@@ -1956,11 +1914,6 @@ fn apply_extract_config(
         if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.shared.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.shared.duckdb_bin = Some(v.clone());
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -2241,11 +2194,6 @@ fn apply_verify_index_config(
                 args.workers = v;
             }
         }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &d.duckdb_bin {
-                args.duckdb_bin = Some(v.clone());
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             args.max_memory_mb = d.max_memory_mb;
         }
@@ -2269,11 +2217,6 @@ fn apply_verify_index_config(
         if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.duckdb_bin = Some(v.clone());
             }
         }
         if !cli_explicit(matches, "max_memory_mb") {
@@ -2424,11 +2367,6 @@ fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>, matches: Op
                 args.shared.workers = v;
             }
         }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &d.duckdb_bin {
-                args.shared.duckdb_bin = Some(v.clone());
-            }
-        }
         if !cli_explicit(matches, "max_memory_mb") {
             if let Some(v) = d.max_memory_mb {
                 args.max_memory_mb = Some(v);
@@ -2449,11 +2387,6 @@ fn apply_check_config(args: &mut CheckArgs, cfg: Option<&AppConfig>, matches: Op
         if !cli_explicit(matches, "workers") {
             if let Some(v) = c.workers {
                 args.shared.workers = v;
-            }
-        }
-        if !cli_explicit(matches, "duckdb_bin") {
-            if let Some(v) = &c.duckdb_bin {
-                args.shared.duckdb_bin = Some(v.clone());
             }
         }
         if !cli_explicit(matches, "aws_bin") {
@@ -2611,7 +2544,6 @@ defaults:
 
   # Shared runtime defaults — leave commented to use built-in auto mode.
   # allowed values: any valid executable path
-  # duckdb_bin: /usr/local/bin/duckdb
   # Profile controls DuckDB memory budget and worker count.
   # safe (default) — single-pass, single worker, generous per-worker memory
   #   (45% of usable RAM, clamped 8-24 GiB).  Reliable on any host; uses DuckDB
@@ -2740,7 +2672,6 @@ index:
   # root_dir: .
   # dataset: all
   # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -2763,7 +2694,6 @@ verify_index:
   # root_dir: .
   # dataset: all
   # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
   # max_memory_mb: 8192
   # progress: true
 
@@ -2780,7 +2710,6 @@ extract:
   # root_dir: .
   # dataset: all
   # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
   # max_memory_mb: 8192
   # progress: true
   # state_flush_every: 25
@@ -3244,7 +3173,6 @@ fn run_check(args: CheckArgs) -> Result<()> {
         println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
         println!("parquet_dir: {}", args.shared.parquet_dir.display());
         println!("dataset: {}", args.shared.dataset);
-        println!("duckdb_bin: {}", duckdb_bin(&args.shared).display());
         println!("aws_bin: {}", args.aws_bin.display());
         println!("s3_uri: {}", args.s3_uri);
         println!("strict: {}", args.strict);
@@ -4374,7 +4302,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             index_file: None,
             workers: 0,
             max_memory_mb: None,
-            duckdb_bin: None,
             progress: true,
             overwrite: false,
             explain: false,
@@ -4404,7 +4331,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig) -> Result<()> {
             index_file: None,
             workers: 0,
             max_memory_mb: None,
-            duckdb_bin: None,
             progress: true,
             explain: false,
         };
@@ -6209,7 +6135,6 @@ fn run_download(args: DownloadArgs) -> Result<()> {
             dataset: "works".to_string(),
             workers: 0,
             max_memory_mb: None,
-            duckdb_bin: None,
             progress: args.progress,
             overwrite: false,
             explain: false,
@@ -6526,14 +6451,6 @@ fn explain_extract(args: &ExtractArgs, tuning: &Tuning) {
     println!("ids csv: {}", args.ids.display());
     println!("output base: {}", args.output.display());
     println!("workers: {}", tuning.workers);
-}
-
-fn duckdb_bin(shared: &SharedArgs) -> PathBuf {
-    duckdb_bin_from_option(&shared.duckdb_bin)
-}
-
-fn duckdb_bin_from_option(p: &Option<PathBuf>) -> PathBuf {
-    p.clone().unwrap_or_else(|| PathBuf::from("duckdb"))
 }
 
 /// Tuning for parquet-side commands (verify, schema, index, extract, verify_index,
