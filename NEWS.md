@@ -2,7 +2,7 @@
 
 All notable changes to `openalex-snapshot` are documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-06-29
 
 ### Changed — pipeline logic moved into the `openalex-core` library
 
