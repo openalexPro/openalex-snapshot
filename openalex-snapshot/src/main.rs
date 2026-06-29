@@ -59,7 +59,6 @@ This binary provides:
 - progress: monitor live status from reports/logs
 - skills: create AI skills starter pack under root_dir/skills
 - check: run dependency/path/disk/memory preflight checks
-- convert/verify_convert/schema/verify_schema: [DEPRECATED] legacy JSON-snapshot tools
 
 download (detailed):
   - per-dataset sync: aws s3 sync s3://openalex/data/parquet/<ds>/ <root>/parquet/<ds>/
@@ -272,16 +271,12 @@ Run the end-to-end pipeline from config.
 Behavior:
   - Requires explicit --config (no auto-discovery fallback)
   - Runs enabled stages from config in pipeline order
-  - Applies bounded verify/repair loop controlled by --retry
 
 Default stage order:
-  1) download
+  1) download         (auto-enriches works -> parquet/works/)
   2) verify_download
-  3) convert  ──┐
-  4) verify_convert ┴── looped up to --retry times: convert auto-repairs any
-                       parquet flagged by the latest verify_convert report.
-  5) index
-  6) verify_index
+  3) index
+  4) verify_index
 ";
 
 const INDEX_LONG_ABOUT: &str = "\
@@ -416,9 +411,9 @@ struct AllArgs {
     )]
     root_dir: PathBuf,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, hide = true)]
     #[arg(
-        help = "Max number of extra `convert` retries when verify_convert reports failures (convert auto-repairs flagged parquets on each retry)"
+        help = "[deprecated, no-op] accepted for back-compat; the convert retry loop was removed"
     )]
     retry: usize,
 
@@ -7159,18 +7154,18 @@ These skills help AI coding agents operate and develop `openalex-snapshot` safel
 
 ## Program Summary
 
-`openalex-snapshot` is a root-dir-first CLI for OpenAlex snapshot workflows:
+OpenAlex publishes the snapshot natively in parquet, so `openalex-snapshot` is a root-dir-first,
+parquet-native CLI:
 
-1. `download` / `verify_download`
-2. `convert` (with built-in auto-repair from verify report) / `verify_convert`
+1. `download` / `verify_download` (download auto-runs `enrich` for works)
+2. `enrich` (works_aws/ -> works/, adds abstract + citation)
 3. `index` / `verify_index`
 4. `extract`
-5. `schema` / `verify_schema`
-6. reporting and progress (`report`, `prune-reports`, `progress`)
+5. reporting and progress (`report`, `prune-reports`, `progress`)
 
 Runtime requirements:
 - `aws` CLI for download/verify_download paths only
-- No external `duckdb` binary needed — DuckDB is statically linked in the binary
+- No DuckDB — all parquet I/O uses the pure-Rust `arrow`/`parquet` crates
 
 Argument precedence to apply in all commands:
 1. explicit CLI flags
@@ -7207,7 +7202,7 @@ Run subcommands with correct root-dir model and predictable outputs.
 ## Required Inputs
 - `root_dir`
 - target `dataset` or `all`
-- resource settings (`profile`, `workers`, `max-memory-mb`) when needed
+- resource settings (`workers`, `max-memory-mb`) when constraining resource use
 
 ## Command Pattern
 - Always prefer `--root-dir` or a `--config` file.
@@ -7222,51 +7217,47 @@ Run subcommands with correct root-dir model and predictable outputs.
 # Preflight check
 openalex-snapshot check --root-dir <root> --dataset all
 
-# Convert one dataset — default `safe` profile (single-worker, max memory) works on any host
-openalex-snapshot convert --root-dir <root> --dataset works
+# Download the parquet snapshot (auto-enriches works -> parquet/works/)
+openalex-snapshot download --root-dir <root>
 
-# Faster on 32+ GB hosts: empirically tuned stratified profile partitions files by gz size
-openalex-snapshot convert --root-dir <root> --dataset works --profile stratified-36
+# Verify the download against the published manifest (presence + size + row count)
+openalex-snapshot verify_download --root-dir <root>          # --quick (size only) / --full (row scan)
 
-# Verify one dataset
-openalex-snapshot verify_convert --root-dir <root> --dataset works --scope dataset --metadata-level both
+# (Re-)enrich works on demand: works_aws/ -> works/ (abstract + citation)
+openalex-snapshot enrich --root-dir <root>
 
-# Show latest reports with per-dataset breakdown
-openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+# Build indexes for all datasets (skips the raw *_aws staging dirs)
+openalex-snapshot index --root-dir <root> --dataset all
 
-# Show aggregate totals only
-openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
+# Verify index integrity
+openalex-snapshot verify_index --root-dir <root> --dataset all
 
-# Extract by IDs
+# Extract by IDs (writes one parquet per resolved dataset)
 openalex-snapshot extract --root-dir <root> --ids <ids.csv> --output <extract.parquet>
 
-# Repair failed files: just run convert again — it auto-repairs anything flagged
-# by the latest verify_convert report.
-openalex-snapshot convert --root-dir <root> --dataset works
+# Or run the whole pipeline from config
+openalex-snapshot all --config ./openalex-snapshot.yaml
 
-# Scaffold a custom performance.yaml auto-derived from this host's RAM
-openalex-snapshot config --create-profiles
-
-# Show all known profiles (built-ins + user-defined)
-openalex-snapshot config --list-profiles
+# Show latest reports / aggregate totals
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest
+openalex-snapshot --config ./openalex-snapshot.yaml report --latest --summary
 ```
 
 ## Failure Handling
-- On non-zero exit, inspect latest report: `report --latest --full`.
+- A JSON report is written only when a command has failures: `report --latest --full`.
 - Datasets with failures are marked `!` in the default report view.
-- For verify-driven reconversion: just re-run `convert` (auto-repair is on by default).
+- Re-running any command is safe and incremental (download sync, enrich, index all resume).
 
 ## Decision rules
-- Default profile is `safe` for `convert`: single worker, generous per-worker memory (~45% of usable RAM, clamped 8–24 GiB on single-worker mode).  Works on any host; the most reliable choice for the worst-case files.
-- On a 32+ GB host, use `--profile stratified-36` for a faster run: it partitions the file list by gz size (4-/3-/2-/1-worker buckets) and runs one rayon pass per bucket.
-- Custom RAM tiers (e.g. 16 GB, 64 GB) need a user-supplied `openalex-snapshot.performance.yaml` — see [`docs/commands/convert.md`](../../docs/commands/convert.md#custom-profiles-via-profilesyaml).
-- To isolate a single problematic file: repeated `--input-file` on `convert`.
-- Prefer `verify_convert --scope file` for quick spot checks; `--scope dataset|snapshot` for full checks.
+- `download` auto-runs `enrich`; pass `--no-enrich` for a raw-only sync.
+- Reading works (`index`/`extract`, `W` IDs) uses `parquet/works/` (enriched); `index --dataset all`
+  skips the raw `parquet/works_aws/` staging dir.
 - Run `index` before `extract`; extraction requires `<dataset>_id_idx.parquet`.
+- Use `--workers` / `--max-memory-mb` only to constrain resources (parquet I/O is light).
 
 ## Done Criteria
 - Command exits 0.
-- Expected report written to `openalex-snapshot_metadata/reports/`.
+- A report is written under `openalex-snapshot_metadata/reports/` only if there were failures.
 "#
             .to_string(),
         ),
@@ -7279,36 +7270,33 @@ Execute the recommended end-to-end flow safely.
 
 ## Full flow
 1. `check`
-2. `download`
+2. `download`  (auto-enriches works -> parquet/works/)
 3. `verify_download`
-4. `convert`            ──┐ looped by `all` up to --retry times:
-5. `verify_convert`  ──┘ convert auto-repairs anything verify flagged
-6. `index`
-7. `verify_index`
-8. `extract`
+4. `enrich`  (only if you downloaded with --no-enrich)
+5. `index`
+6. `verify_index`
+7. `extract`
 
 ## Auto orchestration (recommended)
 ```bash
-openalex-snapshot all --config <path> --retry 2
+openalex-snapshot all --config <path>
 ```
-Runs all enabled stages in order with a bounded convert/verify loop.
-Edit `all:` section in the config to disable stages you don't need (e.g. `enable_download: false`).
+Runs download -> verify_download -> index -> verify_index in order.
+Edit the `all:` section in the config to disable stages you don't need (e.g. `enable_download: false`).
 
-## Local snapshot already present (skip download)
+## Corpus already present (skip download)
 ```bash
-openalex-snapshot convert --root-dir <root> --dataset all
-openalex-snapshot verify_convert --root-dir <root> --scope snapshot
+openalex-snapshot enrich --root-dir <root>            # if only parquet/works_aws/ exists
 openalex-snapshot index --root-dir <root> --dataset all
-openalex-snapshot verify_index --root-dir <root>
+openalex-snapshot verify_index --root-dir <root> --dataset all
 ```
 
 ## Decision Rules
-- Default profile is `safe`: single worker, generous memory, works on any host.  Use this for unattended runs and unfamiliar hardware.
-- On a 32+ GB host where speed matters, set `profile: stratified-36` under `defaults:` in the config (or pass `--profile stratified-36` to `convert`).  It partitions files by gz size and parallelises each bucket.
-- For other RAM tiers, supply a user-defined profile in `openalex-snapshot.performance.yaml` (sibling to the main config or via `--performance-config`).
+- `download` auto-runs `enrich`; the canonical works corpus is `parquet/works/` (enriched),
+  with the raw official copy preserved in `parquet/works_aws/` for clean incremental re-sync.
 - Use `--dataset <name>` to rerun a single dataset without touching others.
-- Check `report --latest` after each stage to confirm success before proceeding.
-- Keep reports: they drive convert's auto-repair and provide audit trails.
+- Every stage is resumable — re-running is safe and incremental.
+- Check `report --latest` (written only on failure) and `--full` for root cause.
 "#
             .to_string(),
         ),
@@ -7321,30 +7309,30 @@ Triage failures using metadata and reports.
 
 ## Steps
 1. `openalex-snapshot --config <cfg> report --latest` — scan per-dataset table for `!` rows
+   (a report is written only when a command had failures)
 2. `openalex-snapshot --config <cfg> report --latest --full` — full JSON for root cause
 3. `progress --once` — check if a run is still live
 4. Run targeted command with `--explain` to preview what it would do
-5. Rerun the failed dataset with `convert` — auto-repair (default) re-does whatever the latest verify flagged
+5. Re-run the failed command — download/enrich/index all resume incrementally
 
 ## Common Traps
-- Wrong `root-dir` (snapshot/parquet/metadata dirs won't be found)
-- Missing `aws` binary (only needed for download steps)
+- Wrong `root-dir` (parquet/metadata dirs won't be found)
+- Missing `aws` binary (only needed for download / verify_download)
 - Low disk space (`check --root-dir <root>` reports estimates)
 - Using `--config` after the subcommand instead of before it
+- Expecting `parquet/works/` without enriching: `download` builds it unless `--no-enrich`
 
 ## Failure phase hints
-- `check_dependency`: missing `aws` binary (duckdb is bundled — not an external dep)
-- `check_download_disk` / `check_convert_disk`: insufficient free space
-- `verify_metrics`: file-level parity mismatch — just re-run `convert` (auto-repair handles it)
+- `check_download_disk`: insufficient free space for the download
 - `download_sync`: S3 sync / auth / endpoint failure
-- `validate_gzip_integrity`: corrupted `.json.gz` file
+- `validate_file_size` / `validate_parquet_rowcount`: local file differs from the manifest — re-run `download`
+- `enrich` / `enrich_rowcount`: enrichment failed or row count drifted — re-run `enrich`
+- `index_stage1` / `index_stage2`: a corpus parquet couldn't be read — re-download then re-index
+- `extract_index_read`: missing/!built index — run `index` for that dataset first
 
-## OOM during convert
-- `safe` is the default profile and should handle the largest works files via DuckDB spill-to-disk.  If you're explicitly running another profile, retry with `--profile safe`.
-- Run `check --root-dir <root>` to see memory estimates.
-- Use `--max-memory-mb <N>` to force a smaller DuckDB cap so spill kicks in earlier.
-- Use `--split-size 256mb` to pre-chunk very large gz files before conversion.
-- If a specific file is always failing, isolate it with `--input-file <rel-path>` and retry.
+## OOM
+- Parquet I/O streams one file at a time, so memory use is modest.
+- If you still hit limits, constrain with `--workers <N>` and/or `--max-memory-mb <N>`.
 "#
             .to_string(),
         ),
@@ -7356,54 +7344,38 @@ Triage failures using metadata and reports.
 Build, test, and deploy `openalex-snapshot` source changes safely.
 
 ## Repository layout
-- All logic lives in `src/main.rs` (single file, ~10 000+ lines).
-- Tests live in `tests/cli_smoke.rs`.
+- Cargo workspace: `openalex-snapshot/` (the CLI binary, `src/main.rs`) and `openalex-core/`
+  (shared library: profile planner + SQL string helpers, used by the R package).
+- CLI tests live in `openalex-snapshot/tests/cli_smoke.rs`; unit tests in `src/main.rs`.
 - Skills templates are embedded in `skills_templates()` near the end of `src/main.rs`.
 - Config templates are embedded as `config_template_*()` functions in `src/main.rs`.
 
 ## Build / test loop
 ```bash
-cargo build --release                     # production binary
-cargo test --all-targets --locked         # run all 27 tests
-cargo clippy --all-targets -- -D warnings # lint (must be clean)
-cargo fmt --all                           # format (CI enforces)
+cargo build --release -p openalex-snapshot   # production binary
+cargo test --workspace --locked              # run all tests
+cargo clippy --all-targets -- -D warnings    # lint (must be clean)
+cargo fmt --all                              # format (CI enforces)
 ```
 
-Tests require the `duckdb` CLI binary in PATH for parquet-reading verification steps;
-they skip gracefully when it is absent. The main binary does NOT need it — DuckDB is
-statically linked via `duckdb = { version = "1", features = ["bundled", "json", "parquet"] }`.
+Some `cli_smoke.rs` tests use a `duckdb` CLI to build small parquet fixtures and skip
+gracefully when it is absent. The binary itself has NO DuckDB dependency.
 
 ## Deploy pattern
 ```bash
-cargo build --release
+cargo build --release -p openalex-snapshot
 cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
 ```
 
-## DuckDB in-process architecture
-- A global `Connection` lives in `OnceLock<Mutex<Connection>>` (see `master_conn()`).
-- Each rayon worker thread calls `master.try_clone()` once and stores it in `thread_local!`.
-- The global DuckDB memory limit (`SET memory_limit`) is shared across ALL connections on
-  the same database.  It's set **per stratum** to `stratum.memory_mb × stratum.workers` at
-  the start of each rayon pass; changes are safe between passes.
-- Spill-to-disk is enabled by `SET temp_directory='<root>/openalex-snapshot_metadata/duckdb_tmp/'`
-  on the master connection (OnceLock-guarded so the assignment runs exactly once per process).
-  Without this, an in-memory connection has no temp dir and OOMs when memory_limit is hit.
-
-## Profiles and the stratified plan
-- `convert` resolves `--profile <name>` against a `ProfileRegistry`
-  populated from `builtin_profiles()` plus an optional user `openalex-snapshot.performance.yaml`.
-- Built-in profiles:
-  - `safe` (default) — single pass, workers clamped 1..=2, generous per-worker memory
-    (`auto_profile_single_worker_safe_memory_mb` returns 45% of usable RAM clamped 8–24 GiB
-    on workers=1).
-  - `stratified-36` — 4 strata tuned for ~36 GB hosts (4×4800 / 3×6400 / 2×9600 / 1×13000).
-- `build_convert_plan(profile, workers_override, max_mem_mb_override, total_ram_mb, todo, &registry)`
-  produces a `ConvertPlan { strata: Vec<StratumPlan>, flat: bool }`.
-  - Safe → one flat stratum.
-  - Stratified → file list partitioned by `gz_size_bytes`; one StratumPlan per non-empty
-    bucket; largest-files-first execution order.
-  - `--workers N` collapses stratified into one flat pass (largest stratum's memory).
-- `run_convert` iterates `plan.strata`, reconfiguring DuckDB + rayon per stratum.
+## Parquet I/O (pure Rust)
+- All parquet reads/writes use the `arrow` + `parquet` crates — no DuckDB.
+- Row counts come from parquet footer metadata (`parquet_rowcount_meta`); `verify_download --full`
+  decodes all row groups to catch data-page corruption.
+- `index` projects the `id` column, derives `id_block`/`file_row_number`, and writes shards with
+  `ArrowWriter` (SNAPPY); `extract` filters rows with `arrow::compute::filter` (preserving nested
+  columns); `enrich` reconstructs `abstract` from the JSON inverted index (duplicate-key-preserving
+  parse) and builds `citation` from the nested `authorships` struct.
+- `rayon` provides per-file parallelism (`--workers`); memory is modest since one file streams at a time.
 
 ## Worktree and PR conventions
 - All changes go through a PR from a `claude/<name>` worktree branch.
@@ -7429,7 +7401,7 @@ cp target/release/openalex-snapshot <target-dir>/openalex-snapshot
 6. Update `NEWS.md`, `docs/commands/<name>.md`, `AI_SKILLS_USAGE.md`.
 
 ## Done Criteria
-- `cargo test --all-targets --locked` passes (all 27 tests green).
+- `cargo test --workspace --locked` passes (all tests green).
 - `cargo clippy --all-targets -- -D warnings` is clean.
 - Binary deployed and smoke-tested against real data.
 - `NEWS.md` and affected docs updated in the same commit.
@@ -7448,15 +7420,13 @@ Keep docs, help text, and release notes in sync with behavior changes.
 - `docs/commands/<name>.md` — update command-specific docs
 - `CLAUDE.md` — update if architecture or build model changed
 - `ARCHITECTURE_AND_DECISIONS.md` — update if invariants changed
-- Help text in `src/main.rs` (`*_LONG_ABOUT`, `#[arg(help = ...)]`, profile tables)
+- Help text in `src/main.rs` (`*_LONG_ABOUT`, `#[arg(help = ...)]`)
 - Config template in `src/main.rs` (if new options added)
 - Skills templates in `skills_templates()` in `src/main.rs` (if operational behavior changed)
 - `AI_SKILLS_USAGE.md` — if skill structure changes
 
 ## Acceptance criteria
 - New flags/commands appear in: `--help`, `README.md`, `docs/`, and `NEWS.md`
-- Profile/memory tables in docs and help text match `builtin_profiles()` (in particular
-  `stratified_baseline_36gb_strata()`) and `auto_profile_single_worker_safe_memory_mb`
 - Tests cover CLI parsing + behavior + edge cases
 - `openalex-snapshot --version` reflects the correct `Cargo.toml` version
 
