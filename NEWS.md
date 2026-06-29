@@ -4,6 +4,79 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+### Removed — DuckDB dependency dropped entirely
+
+- **The `duckdb` crate is gone from the binary.** `enrich` is now pure Rust: the abstract is
+  reconstructed from the JSON `abstract_inverted_index` with a duplicate-key-preserving parser, and
+  the citation is built from the nested `authorships` struct — output verified **byte-identical** to
+  the previous DuckDB SQL across a full 142,844-row works partition (and ~12× faster). With `index`,
+  `extract`, and the verify commands already ported (below), no code path uses DuckDB, so the
+  bundled-DuckDB dependency was removed. Result: a ~11 MB binary (down from ~100 MB+), much faster
+  builds, and no C++ toolchain needed to build the CLI. `openalex-core` keeps `duckdb` only behind an
+  optional, default-off `conversion` feature for the R package.
+
+### Removed — orphaned convert profile system from the CLI
+
+- Dropped the CLI's stratified-profile feature, now unused since `convert` is gone:
+  `config --create-profiles` / `--list-profiles`, the global `--performance-config` flag, the
+  `performance.yaml` generator, and the now-no-op `all --retry` flag (hidden, still accepted).
+  `openalex-core::profile` (the planner types) is retained for the R package; the CLI no longer
+  references it beyond `detect_total_memory_mb` (used by `check`). Config back-compat preserved:
+  legacy `profile:` / `convert:` keys still parse and are ignored.
+
+### Removed — deprecated JSON commands; parquet/arrow port
+
+- **Deleted the deprecated `convert` / `verify_convert` / `schema` / `verify_schema` subcommands**
+  and ~3,600 lines of JSON-pipeline machinery (schema inference + cache, the convert profile
+  planner integration, verify-convert metrics + auto-repair). Existing config files still load:
+  the `convert`/`verify_convert`/`schema` sections and `all.enable_convert`/`enable_verify_convert`
+  keys are parsed-and-ignored. The `openalex-core` profile/conversion modules are kept (R package).
+- **`index`, `extract`, `verify_index`, and `verify_download` are now pure Rust** using the
+  `arrow` / `parquet` crates instead of DuckDB:
+  - row counts use parquet footer metadata (zero scan; `verify_download --full` decodes pages),
+  - `index` reads only the `id` column and writes shards with `ArrowWriter` (id_block/file_row_number
+    semantics byte-identical to the previous DuckDB formula),
+  - `extract` resolves ids via a `HashSet` over the index and filters rows with
+    `arrow::compute::filter`, preserving all columns including nested `authorships` structs.
+  DuckDB is now used **only by `enrich`** (the abstract/citation derivation).
+
+### Changed — parquet-native pipeline
+
+OpenAlex now publishes the snapshot **natively in parquet** (`s3://openalex/data/parquet/`),
+so the tool is now a parquet-native pipeline: **download → verify_download → enrich → index →
+extract**. The JSON→parquet `convert` step is obsolete.
+
+- **`download` rewritten for parquet.** Syncs `s3://openalex/data/parquet/<dataset>/`
+  **per-dataset** into `<root>/parquet/`. Works lands in `parquet/works_aws/` (the stable
+  `aws s3 sync` target) and is **auto-enriched** into the canonical `parquet/works/` (opt out
+  with `--no-enrich`). The dataset list and disk preflight come from the published
+  `manifest.json`. New transfer-tuning flags (`--max-concurrent-requests` [default 10],
+  `--max-queue-size`, `--multipart-chunksize`) are applied via a temporary `AWS_CONFIG_FILE`
+  so your global `~/.aws/config` is never touched.
+
+- **`verify_download` rewritten to use `manifest.json`.** Validates per-file presence, size
+  (`content_length`), and row count (`record_count`) — a stronger check than the old gzip
+  integrity test. Default reads footer metadata (`parquet_file_metadata`); `--full` does a row
+  scan; `--quick` skips row counts.
+
+- **New `enrich` subcommand** (and `works_abstract_expr_from_json` in `openalex-core`). Builds
+  `parquet/works/` from `parquet/works_aws/`, adding `abstract` (reconstructed from the JSON
+  `abstract_inverted_index`) and `citation`. Incremental and row-parity checked; the raw
+  `works_aws/` is never modified, so it stays manifest-verifiable and incremental sync is
+  unaffected. `index --dataset all` skips `*_aws` staging dirs; `extract` routes `W` IDs to
+  `works/`.
+
+- **`all` no longer converts by default.** `all.enable_convert` / `all.enable_verify_convert`
+  now default to `false`; the pipeline is `download → verify_download → index → verify_index`.
+
+- **`convert` / `verify_convert` / `schema` / `verify_schema` are deprecated.** The code is kept
+  (marked deprecated in `--help`) for legacy `snapshot/` JSON trees, but their docs and man pages
+  have been removed.
+
+- **Slimmer metadata/logging.** Per-step `.log` files, manifest JSONL snapshots, and schema
+  caches are no longer written by the active pipeline; reports are written only when a command
+  has failures.
+
 ## [0.5.0] - 2026-05-23
 
 ### Added

@@ -7,7 +7,7 @@
 
 # openalex-snapshot
 
-Standalone CLI for OpenAlex snapshot download, conversion, verification, schema inspection, and indexing.
+Standalone CLI for the OpenAlex parquet snapshot: download, verify, enrich, index, and extract.
 
 ## AI Contribution
 
@@ -20,25 +20,28 @@ All AI-generated code was directed and tested by the project author.
 
 ## What It Does
 
-`openalex-snapshot` manages the full snapshot pipeline in one CLI:
+OpenAlex now publishes the snapshot **natively in parquet**, so `openalex-snapshot` is a
+parquet-native pipeline — no JSON→parquet conversion:
 
-- `download` + `verify_download` for snapshot sync and integrity checks
-- `convert` + `verify_convert` + `repair_convert` for JSON.GZ -> parquet with validation/recovery
-- `index` + `verify_index` for ID lookup indexes
-- `extract` for targeted parquet extraction by OpenAlex IDs
-- `schema` + `verify_schema` for schema inspection and parity checks
-- `report` / `progress` for run-state visibility
-- `all` for config-driven orchestration
+- `download` + `verify_download` — sync the official parquet snapshot and validate it against
+  the published `manifest.json` (presence, size, row count)
+- `enrich` — add `abstract` + `citation` columns to works (auto-run by `download`)
+- `index` + `verify_index` — ID lookup indexes
+- `extract` — targeted parquet extraction by OpenAlex IDs
+- `report` / `progress` — run-state visibility
+- `all` — config-driven orchestration (`download → verify_download → index → verify_index`)
 
 Default root layout:
-- snapshot: `<root>/snapshot`
-- parquet: `<root>/parquet`
+- parquet corpus: `<root>/parquet` (raw works in `<root>/parquet/works_aws`, enriched in
+  `<root>/parquet/works`)
 - metadata: `<root>/openalex-snapshot_metadata`
 
 ## Requirements
 
-- `duckdb` available in `PATH` (or pass `--duckdb-bin` where supported)
 - `aws` CLI available in `PATH` for `download` / `verify_download`
+- No DuckDB — all parquet I/O uses the pure-Rust `arrow`/`parquet` crates (the test suite uses a
+  `duckdb` CLI only to build fixtures, if present)
+- Building from source needs only a Rust toolchain — no C/C++ compiler (the binary is ~11 MB)
 
 ## Install
 
@@ -56,7 +59,7 @@ cargo build --release
 ```bash
 git clone https://github.com/openalexPro/openalex-snapshot.git
 cd openalex-snapshot
-cargo install --path .
+cargo install --path openalex-snapshot   # this repo is a workspace; install the binary crate
 openalex-snapshot --help
 ```
 
@@ -96,14 +99,10 @@ Argument precedence (highest wins):
 - `check`
 - `download`
 - `verify_download`
-- `convert`
-- `verify_convert`
-- `schema`
-- `verify_schema`
+- `enrich`
 - `index`
 - `extract`
 - `verify_index`
-- `repair_convert`
 - `report`
 - `prune-reports`
 - `progress`
@@ -115,27 +114,15 @@ Argument precedence (highest wins):
 # preflight
 openalex-snapshot check --root-dir /Volumes/openalex --dataset all
 
-# download + verify snapshot
+# download the parquet snapshot (auto-enriches works) + verify against the manifest
 openalex-snapshot download --root-dir /Volumes/openalex
 openalex-snapshot verify_download --root-dir /Volumes/openalex
 
-# convert one dataset (uses safe profile by default — works on any host)
-openalex-snapshot convert \
-  --root-dir /Volumes/openalex \
-  --dataset works
+# (re-)enrich works on demand: works_aws/ -> works/ (abstract + citation)
+openalex-snapshot enrich --root-dir /Volumes/openalex
 
-# …or, on a 32+ GB host, use the empirically tuned stratified profile for a faster run:
-openalex-snapshot convert \
-  --root-dir /Volumes/openalex \
-  --dataset works \
-  --profile stratified-36
-
-# verify conversion
-openalex-snapshot verify_convert \
-  --root-dir /Volumes/openalex \
-  --dataset works \
-  --scope dataset \
-  --metadata-level both
+# build indexes for all datasets (skips the raw works_aws/ staging dir)
+openalex-snapshot index --root-dir /Volumes/openalex --dataset all
 
 # extract by OpenAlex IDs (writes one parquet per resolved dataset)
 openalex-snapshot extract \
@@ -143,10 +130,8 @@ openalex-snapshot extract \
   --ids /Volumes/openalex/ids.csv \
   --output /Volumes/openalex/extract.parquet
 
-# repair from verify report
-openalex-snapshot repair_convert \
-  --root-dir /Volumes/openalex \
-  --from-verify-report /Volumes/openalex/openalex-snapshot_metadata/reports/verify_convert-123456.json
+# or run the whole pipeline from config
+openalex-snapshot all --config ./openalex-snapshot.yaml
 
 # bootstrap AI skills folder
 openalex-snapshot skills --root-dir /Volumes/openalex
@@ -156,14 +141,10 @@ openalex-snapshot skills --root-dir /Volumes/openalex
 
 Under `<root>/openalex-snapshot_metadata`:
 
-- `reports/` — latest report per command (current run)
-- `archived/<timestamp>/` — previous completed runs
-- `download/download.log`
-- `<dataset>/schemata/` — schema cache
-- `<dataset>/convert/` — convert logs (created when convert runs)
-- `<dataset>/conversion-verify/` — verify_convert logs + metrics
-- `<dataset>/index/` — index logs
-- `<dataset>/index-verify/` — verify_index logs
+- `openalex-snapshot.lock` — present while a command runs
+- `reports/` — a JSON report per command, written only when failures occur
+- `download/manifest.json` — the fetched OpenAlex manifest (audit copy)
+- `<dataset>/index/`, `<dataset>/index-verify/` — index logs
 
 ## Documentation
 

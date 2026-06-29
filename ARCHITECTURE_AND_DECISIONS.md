@@ -2,6 +2,30 @@
 
 This document captures project invariants and decision records so human and AI contributors can continue development safely.
 
+## Decision: parquet-native pipeline (supersedes the JSON convert path)
+
+OpenAlex now publishes the snapshot natively in parquet (`s3://openalex/data/parquet/`,
+Hive-partitioned `<entity>/updated_date=YYYY-MM-DD/part_*.parquet`, with a top-level
+`manifest.json`). Decisions:
+
+- The corpus is the **downloaded official parquet**, byte-identical to OpenAlex and verifiable
+  against `manifest.json`. Active pipeline: download → verify_download → enrich → index → extract.
+- `download` syncs **per-dataset** into `<root>/parquet/<dataset>/`; raw works → `parquet/works_aws/`
+  (the stable `aws s3 sync` target — never renamed, so an interrupted run can't trigger a full
+  re-download), enriched works → canonical `parquet/works/`. Other datasets share `parquet/`.
+- Enrichment (`abstract` + `citation`) is **on-the-fly per file** into a separate dir, never
+  mutating the synced data; it auto-runs after a works download (opt out: `--no-enrich`).
+  `index --dataset all` skips `*_aws`; `extract` routes `W` → `works/`.
+- `verify_download` validates presence + size (`content_length`) + row count (`record_count`) from
+  the manifest; default footer-metadata, `--full` row scan, `--quick` size-only.
+- Transfer tuning is applied via a temporary `AWS_CONFIG_FILE` (no global `~/.aws/config` change).
+- Metadata/logging slimmed: lockfile + fetched `manifest.json` + a report written only on failure.
+- `convert` / `verify_convert` / `schema` / `verify_schema` are **deprecated** (code kept for legacy
+  `snapshot/` JSON trees; docs/man removed). `all` defaults `enable_convert`/`enable_verify_convert`
+  to `false`.
+
+The sections below predate this and describe the deprecated JSON convert path.
+
 ## Core Model
 
 - Binary name: `openalex-snapshot`.

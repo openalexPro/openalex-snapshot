@@ -1,8 +1,23 @@
 .TH openalex-snapshot-download 1
 .SH NAME
-openalex-snapshot-download \- download OpenAlex snapshot from S3
+openalex-snapshot-download \- download the OpenAlex parquet snapshot from S3
 .SH SYNOPSIS
 .B openalex-snapshot download
 [OPTIONS]
+.SH DESCRIPTION
+Syncs the official parquet snapshot (s3://openalex/data/parquet/) per-dataset into
+<root>/parquet/. Works lands in works_aws/ and is auto-enriched into works/ unless
+--no-enrich. Dataset list and disk preflight come from the published manifest.json.
+Transfer tuning (--max-concurrent-requests, --max-queue-size, --multipart-chunksize) is
+applied via a temporary AWS config without touching ~/.aws/config.
+.SH OPTIONS
+.TP
+.B --no-enrich
+Skip auto-enrichment of works (download raw works_aws/ only).
+.TP
+.B --max-concurrent-requests N
+aws s3 max_concurrent_requests (default 10).
 .SH EXAMPLE
 openalex-snapshot download --root-dir /data
+.SH SEE ALSO
+openalex-snapshot-verify_download(1), openalex-snapshot-enrich(1)

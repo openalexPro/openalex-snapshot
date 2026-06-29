@@ -8,16 +8,15 @@ Provide operational and development skills specific to `openalex-snapshot` behav
 
 ## Core operational flow
 
-1. `download` / `verify_download`
-2. `convert` (with built-in auto-repair) / `verify_convert`
+1. `download` / `verify_download` (works auto-enriched into `parquet/works/`)
+2. `enrich` (re-run / repair works enrichment)
 3. `index` / `verify_index`
 4. `extract`
-5. `schema` / `verify_schema`
 
 ## Runtime requirements
 
 - `aws` CLI — required for `download` / `verify_download` only
-- No external `duckdb` binary needed — DuckDB is statically linked in the binary
+- No DuckDB dependency — all parquet I/O uses the pure-Rust `arrow`/`parquet` crates
 
 ## Configuration precedence (follow in all skills)
 

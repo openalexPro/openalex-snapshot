@@ -1,43 +1,34 @@
 # Troubleshooting
 
-## Out of memory in convert
+## Download is slow or stalls
 
-`safe` is the default profile and should handle the largest files (≈1 GB compressed) on
-any host via DuckDB spill-to-disk. If you still observe OOM:
+- Tune S3 transfer concurrency: `--max-concurrent-requests`, `--max-queue-size`,
+  `--multipart-chunksize` (applied via a temporary AWS config, so your global `~/.aws/config`
+  is never modified).
+- Re-running `download` resumes incrementally — only missing/changed files are transferred.
 
-- Confirm you're on the default profile: drop `--profile <name>` to inherit `safe`.
-- Lower the memory cap so DuckDB spills earlier: `--max-memory-mb 2048`.
-- Pre-split very large gz files: `--split-size 256mb` (produces numbered parquets per chunk).
-- Isolate the suspect file with `--input-file <rel-path>` and retry.
+## `verify_download` reports a size or row-count mismatch
 
-See [`docs/operations/low-memory.md`](operations/low-memory.md) for the full runbook.
+The local file no longer matches the published `manifest.json`. Re-run `download` to re-fetch
+the affected file(s), then re-run `verify_download`. Use `--full` for a row-scan that also
+catches corrupt data pages, or `--quick` to check presence + size only.
 
-## Verify appears to slow down over time
+## `index` or `extract` can't find works
 
-Expected when remaining files are larger and `id-hash` is enabled.
-Progress is item-based, not byte-based.
+`extract` routes `W` IDs to `parquet/works/` (the enriched corpus). If you only downloaded the
+raw snapshot with `--no-enrich`, run `enrich` first (or re-run `download` without `--no-enrich`).
+`index --dataset all` deliberately skips the raw `*_aws` staging dirs.
 
-## Mixed old/new metadata folders
+## Out of memory
 
-Current canonical location is:
+The pipeline processes one parquet file at a time, so memory use is modest. If you still hit
+limits, constrain workers/memory: `--workers <N>` and `--max-memory-mb <N>`.
 
-- `openalex-snapshot_metadata/`
+## Metadata layout
 
-Expected structure:
+Current canonical location is `openalex-snapshot_metadata/`:
 
-- `openalex-snapshot_metadata/reports/` — latest report per command
-- `openalex-snapshot_metadata/archived/<timestamp>/` — previous runs
-- `openalex-snapshot_metadata/download/download.log`
-- `openalex-snapshot_metadata/<dataset>/schemata/`
-- `openalex-snapshot_metadata/<dataset>/convert/`
-- `openalex-snapshot_metadata/<dataset>/conversion-verify/`
-- `openalex-snapshot_metadata/<dataset>/index/`
-- `openalex-snapshot_metadata/<dataset>/index-verify/`
-
-## Schema errors around nested types
-
-Ensure canonical schema cache exists:
-
-- `.<dataset>_metadata/schemata/unified_schema.csv`
-
-If stale, re-run with schema refresh options.
+- `openalex-snapshot.lock` — present while a command runs
+- `reports/` — a JSON report per command, written only when failures occur
+- `download/manifest.json` — the fetched OpenAlex manifest (audit copy)
+- `<dataset>/index/`, `<dataset>/index-verify/` — index logs

@@ -5,7 +5,8 @@ openalex-snapshot \- OpenAlex snapshot pipeline CLI
 .B openalex-snapshot
 .RI [COMMAND] [OPTIONS]
 .SH DESCRIPTION
-Root-dir-first CLI for OpenAlex snapshot download, conversion, verification, schema inspection, indexing, and repair.
+Root-dir-first CLI for the OpenAlex snapshot, which is now published natively in parquet.
+The pipeline is download -> verify_download -> (auto) enrich -> index -> extract.
 Argument precedence: CLI arguments > config subcommand section > config defaults section > built-in defaults.
 .SH COMMANDS
 .TP
@@ -13,22 +14,13 @@ Argument precedence: CLI arguments > config subcommand section > config defaults
 Environment/capacity preflight checks.
 .TP
 .B download
-Sync snapshot from S3.
+Download the parquet snapshot from S3 (auto-enriches works).
 .TP
 .B verify_download
-Strict snapshot integrity validation.
+Validate the parquet corpus against the published manifest.
 .TP
-.B convert
-Convert JSON.GZ to parquet.
-.TP
-.B verify_convert
-Verify snapshot/parquet parity.
-.TP
-.B schema
-Inspect schema.
-.TP
-.B verify_schema
-Assert schema parity across sources.
+.B enrich
+Add abstract + citation columns to works (works_aws/ -> works/).
 .TP
 .B index
 Build lookup index parquet.
@@ -38,9 +30,6 @@ Extract records by IDs using indexes.
 .TP
 .B verify_index
 Verify index integrity.
-.TP
-.B repair_convert
-Reconvert failed files from verify report.
 .TP
 .B report
 Show run reports.
@@ -56,15 +45,27 @@ Bootstrap `skills/` folder for AI agents.
 .TP
 .B config
 Create/verify YAML config.
+.TP
+.B convert
+[DEPRECATED] Convert legacy JSON.GZ snapshots to parquet.
+.TP
+.B verify_convert
+[DEPRECATED] Verify legacy snapshot/parquet parity.
+.TP
+.B schema
+[DEPRECATED] Inspect schema of a legacy JSON snapshot.
+.TP
+.B verify_schema
+[DEPRECATED] Assert schema parity across legacy sources.
 .SH EXAMPLES
-openalex-snapshot check --root-dir /data --dataset all
+openalex-snapshot download --root-dir /data
 
-openalex-snapshot convert --root-dir /data --dataset works
+openalex-snapshot verify_download --root-dir /data
 
-openalex-snapshot verify_convert --root-dir /data --dataset works --scope dataset --metadata-level both
+openalex-snapshot enrich --root-dir /data
+
+openalex-snapshot index --root-dir /data --dataset all
 
 openalex-snapshot extract --root-dir /data --ids /data/ids.csv --output /data/extract.parquet
-
-openalex-snapshot repair_convert --root-dir /data --from-verify-report /data/.openalex-snapshot_metadata/reports/verify_convert-123456.json
 .SH SEE ALSO
-openalex-snapshot-convert(1), openalex-snapshot-verify(1), openalex-snapshot-schema(1), openalex-snapshot-index(1), openalex-snapshot-extract(1), openalex-snapshot-repair(1), openalex-snapshot-download(1), openalex-snapshot-verify_download(1), openalex-snapshot-skills(1), openalex-snapshot-check(1)
+openalex-snapshot-download(1), openalex-snapshot-verify_download(1), openalex-snapshot-enrich(1), openalex-snapshot-index(1), openalex-snapshot-extract(1), openalex-snapshot-skills(1), openalex-snapshot-check(1)
