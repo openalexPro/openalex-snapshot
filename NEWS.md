@@ -4,6 +4,22 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
+### Removed — deprecated JSON commands; DuckDB use slimmed to `enrich` only
+
+- **Deleted the deprecated `convert` / `verify_convert` / `schema` / `verify_schema` subcommands**
+  and ~3,600 lines of JSON-pipeline machinery (schema inference + cache, the convert profile
+  planner integration, verify-convert metrics + auto-repair). Existing config files still load:
+  the `convert`/`verify_convert`/`schema` sections and `all.enable_convert`/`enable_verify_convert`
+  keys are parsed-and-ignored. The `openalex-core` profile/conversion modules are kept (R package).
+- **`index`, `extract`, `verify_index`, and `verify_download` are now pure Rust** using the
+  `arrow` / `parquet` crates instead of DuckDB:
+  - row counts use parquet footer metadata (zero scan; `verify_download --full` decodes pages),
+  - `index` reads only the `id` column and writes shards with `ArrowWriter` (id_block/file_row_number
+    semantics byte-identical to the previous DuckDB formula),
+  - `extract` resolves ids via a `HashSet` over the index and filters rows with
+    `arrow::compute::filter`, preserving all columns including nested `authorships` structs.
+  DuckDB is now used **only by `enrich`** (the abstract/citation derivation).
+
 ### Changed — parquet-native pipeline
 
 OpenAlex now publishes the snapshot **natively in parquet** (`s3://openalex/data/parquet/`),

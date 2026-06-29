@@ -671,11 +671,14 @@ fn config_create_mode_contracts() {
         .unwrap();
     assert!(complete.status.success());
     let c = String::from_utf8_lossy(&complete.stdout);
-    assert!(c.contains("schema:"));
-    // repair_convert was removed in favour of auto-repair inside `convert`
-    assert!(!c.contains("repair_convert:"));
-    assert!(c.contains("auto_repair"));
+    // Parquet-native template: download/index/progress present; deprecated
+    // convert/verify_convert/schema/repair_convert sections are gone.
+    assert!(c.contains("download:"));
+    assert!(c.contains("index:"));
     assert!(c.contains("progress:"));
+    assert!(!c.contains("\nconvert:"));
+    assert!(!c.contains("\nschema:"));
+    assert!(!c.contains("repair_convert:"));
     assert!(!c.contains("\ncorpus_dir:"));
 
     let safe = Command::new(&exe)
@@ -685,7 +688,6 @@ fn config_create_mode_contracts() {
     assert!(safe.status.success());
     let sf = String::from_utf8_lossy(&safe.stdout);
     assert!(sf.contains("# openalex-snapshot.yaml (safe)"));
-    assert!(sf.contains("profile: safe"));
     assert!(sf.contains("workers: 1"));
 
     // `fast` template was removed in v0.5.0 — the old enum it referenced

@@ -1,4 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray,
+};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::{DataType, Field, Schema};
 use chrono::{Local, TimeZone};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -9,10 +15,15 @@ use openalex_core::profile::{
 };
 use openalex_core::sql::sql_quote;
 use openalex_core::{works_abstract_expr_from_json, works_citation_expr};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::stdout;
 use std::io::Write;
@@ -1451,7 +1462,6 @@ fn main() -> Result<()> {
                 let corpus_dir = args.root_dir.join("parquet").join(&args.dataset);
                 explain_index(
                     &args,
-                    &duckdb_bin_from_option(&args.duckdb_bin),
                     &corpus_dir,
                     &args
                         .index_file
@@ -1471,7 +1481,6 @@ fn main() -> Result<()> {
             if cli.print_effective_config {
                 explain_extract(
                     &args,
-                    &duckdb_bin(&args.shared),
                     &light_tuning_with_override(args.shared.workers, args.max_memory_mb),
                 );
                 return Ok(());
@@ -2518,15 +2527,13 @@ fn config_template(mode: ConfigTemplateMode) -> String {
 fn config_template_safe() -> String {
     r#"# openalex-snapshot.yaml (safe)
 # Minimal low-memory preset.
-# Only profile-relevant overrides are set here.
 # Everything else falls back to built-in defaults (or CLI).
 
 defaults:
   # Keep root explicit so path model remains obvious.
   root_dir: .
 
-  # Safe profile: conservative memory and throughput.
-  profile: safe
+  # Conservative parallelism for constrained systems.
   workers: 1
 
   # Optional explicit cap for constrained systems.
@@ -2636,14 +2643,8 @@ defaults:
 all:
   # ---------------------------------------------------------------------------
   # Full pipeline orchestrator (openalex-snapshot all --config ...)
+  # Pipeline: download -> verify_download -> index -> verify_index
   # ---------------------------------------------------------------------------
-
-  # Max number of extra `convert` retries when verify_convert reports
-  # failures.  Each retry uses convert's auto-repair to delete and re-convert
-  # the parquets flagged by the latest verify_convert report.  0 means: run
-  # verify_convert once and fail immediately on errors.
-  # allowed values: integer >= 0
-  retry: 1
 
   # Stage toggles (default pipeline shown below).
   # Disable stages you do not want in `all` (e.g., skip download for local runs).
@@ -2651,17 +2652,12 @@ all:
   enable_download: true
   # allowed values: true | false
   enable_verify_download: true
-  # [DEPRECATED legacy JSON pipeline] default false in the parquet-native era
-  # allowed values: true | false
-  enable_convert: false
-  # allowed values: true | false
-  enable_verify_convert: false
   # allowed values: true | false
   enable_index: true
   # allowed values: true | false
   enable_verify_index: true
 
-  # Skip disk space checks for all stages that support it (download, convert).
+  # Skip disk space checks for all stages that support it (download).
   # Use when disk check estimates are too conservative for partial dataset runs.
   # allowed values: true | false
   # skip_disk_check: false
@@ -2739,96 +2735,6 @@ verify_download:
   # allowed values: true | false
   check_extra: true
 
-convert:
-  # ---------------------------------------------------------------------------
-  # Convert snapshot JSON.GZ files into parquet (core data build step)
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # profile: safe
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # Parquet write behavior.
-  # row_group_rows:
-  #   Larger row groups can improve scan speed but increase write memory pressure.
-  # batch_rows:
-  #   Controls chunk size for conversion internals; smaller can reduce peak memory.
-  # allowed values: integer >= 1
-  row_group_rows: 100000
-  # allowed values: integer >= 1
-  batch_rows: 5000
-  # allowed values: snappy | zstd | gzip | uncompressed
-  compression: snappy
-
-  # Schema inference behavior.
-  # sample_size controls how many files are sampled during schema inference.
-  # refresh_cache forces schema cache rebuild.
-  # allowed values: integer >= 1
-  sample_size: 100
-  # allowed values: true | false
-  refresh_cache: false
-
-  # allowed values: integer >= 0
-  seed: 42
-
-  # Skip free disk space preflight check for conversion.
-  # Useful when converting a single small dataset where the global estimate is too conservative.
-  # allowed values: true | false
-  # skip_disk_check: false
-
-  # Pre-split large gz files before converting.
-  # Files larger than split_size are decompressed and split into chunks of this size,
-  # then each chunk is converted separately.
-  # 0 (default) = disabled: in-process DuckDB handles large files via streaming
-  # and memory-limit spill without needing pre-splitting.
-  # Only set this if a specific file causes DuckDB to OOM even with memory limits.
-  # Accepts human-readable sizes: 0 | 128mb | 256mb | 512mb | 1gb | 1gib etc.
-  # allowed values: 0 (disabled) | <size with suffix>
-  split_size: 0
-  # Directory for temporary split gz chunks. Must be on the same filesystem as parquet_dir
-  # to allow efficient renames. Defaults to <parquet_dir>/.split_tmp if not set.
-  # allowed values: any valid path
-  # split_temp_dir: /Volumes/openalex/.split_tmp
-
-  # Auto-repair: at startup, read the latest verify_convert report under
-  # <root>/openalex-snapshot_metadata/reports/ and delete any output parquet
-  # it flagged so the normal skip-if-exists filter re-includes it.  Effectively
-  # "run convert twice fixes things" after a verify failure.  Ignored when
-  # --input-file is given (so named-file runs stay predictable).
-  # allowed values: true | false
-  # auto_repair: true
-
-verify_convert:
-  # ---------------------------------------------------------------------------
-  # Verify converted parquet against snapshot source (integrity gate)
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # max_memory_mb: 8192
-  # progress: true
-  # state_flush_every: 25
-
-  # Verification scope:
-  # - file: sample of file pairs
-  # - dataset: all files in dataset
-  # - snapshot: all selected datasets
-  # allowed values: file | dataset | snapshot
-  scope: dataset
-  # allowed values: row-count | id-hash | both
-  metadata_level: both
-  # allowed values: integer >= 1
-  file_sample_n: 50
-  # allowed values: integer >= 0
-  seed: 42
-
 index:
   # ---------------------------------------------------------------------------
   # Build *_id_idx.parquet lookup index for parquet corpus (ID lookups)
@@ -2868,39 +2774,6 @@ verify_index:
   root_dir: .
   # allowed values: any valid path
   # index_file: ./parquet/all_id_idx.parquet
-
-schema:
-  # ---------------------------------------------------------------------------
-  # Schema inspection and cache management (source/cache/parquet)
-  # ---------------------------------------------------------------------------
-  # Shared-default overrides supported here (optional, uncomment to override defaults):
-  # root_dir: .
-  # dataset: all
-  # workers: 4
-  # duckdb_bin: /usr/local/bin/duckdb
-  # max_memory_mb: 8192
-  # state_flush_every: 25
-
-  # Schema source preference: auto|source|cache|parquet
-  # allowed values: auto | source | cache | parquet
-  from: auto
-
-  # Output format: table|json|yaml|arrow-r
-  # allowed values: table | json | yaml | arrow-r
-  format: table
-
-  # Optional comparison source.
-  # allowed values: source | cache | parquet
-  # diff_with: parquet
-
-  # Optional output file (stdout if omitted).
-  # allowed values: any valid path
-  # output: ./schema.json
-
-  # allowed values: integer >= 1
-  sample_size: 100
-  # allowed values: true | false
-  refresh_cache: false
 
 extract:
   # ---------------------------------------------------------------------------
@@ -4664,8 +4537,6 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
         return Ok(());
     }
 
-    let bin = duckdb_bin_from_option(&args.duckdb_bin);
-    ensure_duckdb_bin(&bin)?;
     let parquet_dir = args.root_dir.join("parquet");
     let dataset = args.dataset.clone();
     let corpus_dir = parquet_dir.join(&dataset);
@@ -4676,16 +4547,12 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
         .index_file
         .clone()
         .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
-    let tuning = light_tuning_with_override(args.workers, args.max_memory_mb);
     if args.explain {
         println!("--explain: verify-index");
-        println!("duckdb_bin: {}", bin.display());
         println!("root_dir: {}", args.root_dir.display());
         println!("dataset: {}", dataset);
         println!("corpus_dir: {}", corpus_dir.display());
         println!("index_file: {}", index_file.display());
-        println!("workers: {}", tuning.workers);
-        println!("memory_mb: {:?}", tuning.memory_mb);
         return Ok(());
     }
     if VERIFY_INDEX_ALL_DEPTH.load(Ordering::SeqCst) == 0 {
@@ -4725,9 +4592,9 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
     pb.inc(1);
 
     if report.failures.is_empty() {
-        let cols = describe_parquet_glob(&bin, &index_file.to_string_lossy(), tuning.memory_mb)?;
+        let cols = parquet_top_level_columns(&index_file)?;
         for req in ["id", "id_block", "parquet_file", "file_row_number"] {
-            if !cols.contains_key(req) {
+            if !cols.iter().any(|c| c == req) {
                 ds.failed += 1;
                 report.failures.push(FailureEntry {
                     dataset: dataset.clone(),
@@ -4758,24 +4625,12 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
             suggested_recovery: None,
         });
     } else if report.failures.is_empty() {
-        let count_sql = with_session_settings(
-            &format!(
-                "SELECT (SELECT COUNT(*) FROM read_parquet({})) AS idx_count, (SELECT COUNT(*) FROM read_parquet({})) AS corpus_count;",
-                sql_quote(&index_file.to_string_lossy()),
-                sql_quote(&corpus_dir.join("**/*.parquet").to_string_lossy()),
-            ),
-            tuning.memory_mb,
-            Some(tuning.workers),
-        );
-        let row = query_one_row(&bin, &count_sql)?;
-        let idx_count = row
-            .get("idx_count")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let corpus_count = row
-            .get("corpus_count")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        // Footer-metadata row counts (no data scan): index file vs. the whole corpus.
+        let idx_count = parquet_rowcount_meta(&index_file)?;
+        let mut corpus_count = 0u64;
+        for pf in &parquet_files {
+            corpus_count += parquet_rowcount_meta(pf)?;
+        }
         if idx_count != corpus_count {
             ds.failed += 1;
             report.failures.push(FailureEntry {
@@ -4796,32 +4651,22 @@ fn run_verify_index(args: VerifyIndexArgs) -> Result<()> {
     pb.inc(1);
 
     if report.failures.is_empty() {
-        let refs_sql = with_session_settings(
-            &format!(
-                "SELECT DISTINCT parquet_file FROM read_parquet({});",
-                sql_quote(&index_file.to_string_lossy())
-            ),
-            tuning.memory_mb,
-            Some(tuning.workers),
-        );
-        let refs = run_duckdb_csv(&bin, &refs_sql)?;
-        for r in refs {
-            if let Some(rel) = r.get("parquet_file") {
-                let p = parquet_dir.join(rel);
-                if !p.exists() {
-                    ds.failed += 1;
-                    report.failures.push(FailureEntry {
-                        dataset: dataset.clone(),
-                        phase: "verify_index_path".to_string(),
-                        rel_path: Some(rel.clone()),
-                        source_path: Some(index_file.to_string_lossy().to_string()),
-                        output_path: Some(p.to_string_lossy().to_string()),
-                        error_message: "index references missing parquet file".to_string(),
-                        suggested_recovery: Some(
-                            "re-run convert for missing files then rebuild index".to_string(),
-                        ),
-                    });
-                }
+        let refs = parquet_distinct_strings(&index_file, "parquet_file")?;
+        for rel in refs {
+            let p = parquet_dir.join(&rel);
+            if !p.exists() {
+                ds.failed += 1;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "verify_index_path".to_string(),
+                    rel_path: Some(rel.clone()),
+                    source_path: Some(index_file.to_string_lossy().to_string()),
+                    output_path: Some(p.to_string_lossy().to_string()),
+                    error_message: "index references missing parquet file".to_string(),
+                    suggested_recovery: Some(
+                        "rebuild the index with `openalex-snapshot index --overwrite`".to_string(),
+                    ),
+                });
             }
         }
     }
@@ -4933,6 +4778,141 @@ fn run_prune_reports(args: PruneReportsArgs) -> Result<()> {
     Ok(())
 }
 
+/// id_block = floor(trailing-digit-run(id) / 10000) as i32, or None when the id has no
+/// trailing digits or the run overflows i64. Mirrors the DuckDB
+/// `CAST(FLOOR(TRY_CAST(regexp_extract(id,'([0-9]+)$',1) AS BIGINT)/10000) AS INTEGER)`.
+fn id_block_of(id: &str) -> Option<i32> {
+    let rev_digits: String = id
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if rev_digits.is_empty() {
+        return None;
+    }
+    let digits: String = rev_digits.chars().rev().collect();
+    let v: i64 = digits.parse().ok()?;
+    Some((v / 10000) as i32)
+}
+
+/// Collect a Utf8/LargeUtf8 arrow column into owned `Option<String>` values.
+fn string_col_values(arr: &ArrayRef, ctx: &str) -> Result<Vec<Option<String>>> {
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        Ok((0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+            .collect())
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        Ok((0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+            .collect())
+    } else {
+        bail!("expected a UTF8 string column for {ctx}")
+    }
+}
+
+fn index_shard_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("id_block", DataType::Int32, true),
+        Field::new("parquet_file", DataType::Utf8, false),
+        Field::new("file_row_number", DataType::Int64, false),
+    ]))
+}
+
+fn snappy_writer_props() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build()
+}
+
+/// Stage 1: read the `id` column of one corpus parquet, derive (id, id_block,
+/// parquet_file=rel, file_row_number) and stream it into a shard parquet.
+fn build_index_shard(src: &Path, rel: &str, out: &Path) -> Result<()> {
+    let f = fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("open parquet {}", src.display()))?;
+    let pq = builder.parquet_schema();
+    let id_leaf = (0..pq.num_columns())
+        .find(|&i| pq.column(i).name() == "id")
+        .ok_or_else(|| anyhow!("'id' column not found in {}", src.display()))?;
+    let mask = ProjectionMask::leaves(pq, std::iter::once(id_leaf));
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .with_context(|| format!("read parquet {}", src.display()))?;
+
+    let schema = index_shard_schema();
+    let outf = fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+    let mut writer = ArrowWriter::try_new(outf, schema.clone(), Some(snappy_writer_props()))
+        .with_context(|| format!("init writer {}", out.display()))?;
+    let mut row_no: i64 = 0;
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decode {}", src.display()))?;
+        let n = batch.num_rows();
+        if n == 0 {
+            continue;
+        }
+        let ids = string_col_values(batch.column(0), "id")?;
+        let id_block: Int32Array = ids
+            .iter()
+            .map(|o| o.as_deref().and_then(id_block_of))
+            .collect();
+        let id_arr: StringArray = ids.iter().map(|o| o.as_deref()).collect();
+        let pfile: StringArray = (0..n).map(|_| Some(rel)).collect();
+        let frn: Int64Array = (row_no..row_no + n as i64).map(Some).collect();
+        row_no += n as i64;
+        let rb = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(id_arr) as ArrayRef,
+                Arc::new(id_block) as ArrayRef,
+                Arc::new(pfile) as ArrayRef,
+                Arc::new(frn) as ArrayRef,
+            ],
+        )?;
+        writer
+            .write(&rb)
+            .with_context(|| format!("write {}", out.display()))?;
+    }
+    writer
+        .close()
+        .with_context(|| format!("close {}", out.display()))?;
+    Ok(())
+}
+
+/// Stage 2: concatenate all shard parquets in `shard_dir` into a single `out` parquet.
+fn concat_index_shards(shard_dir: &Path, out: &Path) -> Result<()> {
+    let mut shards: Vec<PathBuf> = fs::read_dir(shard_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .collect();
+    shards.sort();
+    if shards.is_empty() {
+        bail!("no index shards found in {}", shard_dir.display());
+    }
+    let outf = fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+    let mut writer = ArrowWriter::try_new(outf, index_shard_schema(), Some(snappy_writer_props()))
+        .with_context(|| format!("init writer {}", out.display()))?;
+    for sh in &shards {
+        let f = fs::File::open(sh).with_context(|| format!("open {}", sh.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .with_context(|| format!("open parquet {}", sh.display()))?
+            .build()
+            .with_context(|| format!("read parquet {}", sh.display()))?;
+        for batch in reader {
+            let batch = batch.with_context(|| format!("decode {}", sh.display()))?;
+            writer
+                .write(&batch)
+                .with_context(|| format!("write {}", out.display()))?;
+        }
+    }
+    writer
+        .close()
+        .with_context(|| format!("close {}", out.display()))?;
+    Ok(())
+}
+
 fn run_index(args: IndexArgs) -> Result<()> {
     if args.dataset == "all" {
         let _guard = RecursionDepthGuard::enter(&INDEX_ALL_DEPTH);
@@ -4997,8 +4977,6 @@ fn run_index(args: IndexArgs) -> Result<()> {
         return Ok(());
     }
 
-    let bin = duckdb_bin_from_option(&args.duckdb_bin);
-    ensure_duckdb_bin(&bin)?;
     let parquet_dir = args.root_dir.join("parquet");
     let dataset = args.dataset.clone();
     let corpus_dir = parquet_dir.join(&dataset);
@@ -5012,7 +4990,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
         .unwrap_or_else(|| parquet_dir.join(format!("{dataset}_id_idx.parquet")));
     let tuning = light_tuning_with_override(args.workers, args.max_memory_mb);
     if args.explain {
-        explain_index(&args, &bin, &corpus_dir, &index_file, &tuning);
+        explain_index(&args, &corpus_dir, &index_file, &tuning);
         return Ok(());
     }
     if INDEX_ALL_DEPTH.load(Ordering::SeqCst) == 0 {
@@ -5091,7 +5069,6 @@ fn run_index(args: IndexArgs) -> Result<()> {
         .build()
         .context("failed to build rayon thread pool")?;
 
-    let bin_arc = Arc::new(bin.clone());
     let temp_arc = Arc::new(temp_dir.clone());
     let base_arc = Arc::new(parquet_dir.clone());
 
@@ -5112,48 +5089,38 @@ fn run_index(args: IndexArgs) -> Result<()> {
                         Ok(r) => r.to_path_buf(),
                         Err(e) => {
                             stage1.inc(1);
-                            return (false, Some(FailureEntry {
-                                dataset: dataset.clone(),
-                                phase: "index_stage1".to_string(),
-                                rel_path: None,
-                                source_path: Some(pf.to_string_lossy().to_string()),
-                                output_path: Some(out_file.to_string_lossy().to_string()),
-                                error_message: format!("{e:#}"),
-                                suggested_recovery: None,
-                            }));
+                            return (
+                                false,
+                                Some(FailureEntry {
+                                    dataset: dataset.clone(),
+                                    phase: "index_stage1".to_string(),
+                                    rel_path: None,
+                                    source_path: Some(pf.to_string_lossy().to_string()),
+                                    output_path: Some(out_file.to_string_lossy().to_string()),
+                                    error_message: format!("{e:#}"),
+                                    suggested_recovery: None,
+                                }),
+                            );
                         }
                     };
                     let rel_s = rel.to_string_lossy().replace('\\', "/");
-
-                    let mut sql = String::new();
-                    sql.push_str("SET preserve_insertion_order = false;");
-                    sql.push_str("SET threads = 1;");
-                    if let Some(mb) = tuning.memory_mb {
-                        sql.push_str(&format!("SET memory_limit='{}MB';", mb));
-                    }
-                    sql.push_str(&format!(
-                        "COPY (SELECT id, \
-                         CAST(FLOOR(TRY_CAST(regexp_extract(CAST(id AS VARCHAR), '([0-9]+)$', 1) AS BIGINT) / 10000) AS INTEGER) AS id_block, \
-                         '{}' AS parquet_file, \
-                         file_row_number \
-                         FROM read_parquet({}, file_row_number = true)) \
-                         TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
-                        rel_s.replace('\'', "''"),
-                        sql_quote(&pf.to_string_lossy()),
-                        sql_quote(&out_file.to_string_lossy())
-                    ));
                     stage1.inc(1);
-                    match run_duckdb_sql(&bin_arc, &sql) {
+                    match build_index_shard(pf, &rel_s, &out_file) {
                         Ok(()) => (false, None),
-                        Err(e) => (false, Some(FailureEntry {
-                            dataset: dataset.clone(),
-                            phase: "index_stage1".to_string(),
-                            rel_path: Some(rel_s),
-                            source_path: Some(pf.to_string_lossy().to_string()),
-                            output_path: Some(out_file.to_string_lossy().to_string()),
-                            error_message: format!("{e:#}"),
-                            suggested_recovery: Some("repair/reconvert parquet file and rerun index".to_string()),
-                        })),
+                        Err(e) => (
+                            false,
+                            Some(FailureEntry {
+                                dataset: dataset.clone(),
+                                phase: "index_stage1".to_string(),
+                                rel_path: Some(rel_s),
+                                source_path: Some(pf.to_string_lossy().to_string()),
+                                output_path: Some(out_file.to_string_lossy().to_string()),
+                                error_message: format!("{e:#}"),
+                                suggested_recovery: Some(
+                                    "re-download the parquet file and rerun index".to_string(),
+                                ),
+                            }),
+                        ),
                     }
                 })
                 .collect()
@@ -5177,12 +5144,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
 
     if ds.failed == 0 {
         let stage2 = make_progress_bar(args.progress, 1, "index:stage2");
-        let combine_sql = format!(
-            "COPY (SELECT * FROM read_parquet({})) TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
-            sql_quote(&temp_dir.join("*.parquet").to_string_lossy()),
-            sql_quote(&index_file.to_string_lossy())
-        );
-        if let Err(e) = run_duckdb_sql(&bin, &combine_sql) {
+        if let Err(e) = concat_index_shards(&temp_dir, &index_file) {
             ds.failed += 1;
             report.failures.push(FailureEntry {
                 dataset: dataset.clone(),
@@ -5308,15 +5270,16 @@ fn run_enrich(args: EnrichArgs) -> Result<()> {
     ds.items_scanned = files.len() as u64;
 
     // Decide which derived columns the source supports (once, from the first file).
-    let cols = describe_parquet_glob(&bin, &files[0].to_string_lossy(), tuning.memory_mb)?;
+    let cols = parquet_top_level_columns(&files[0])?;
+    let has = |c: &str| cols.iter().any(|x| x == c);
     let mut select_extras = String::new();
-    if cols.contains_key("abstract_inverted_index") {
+    if has("abstract_inverted_index") {
         select_extras.push_str(&format!(
             ", {} AS abstract",
             works_abstract_expr_from_json()
         ));
     }
-    if cols.contains_key("authorships") && cols.contains_key("publication_year") {
+    if has("authorships") && has("publication_year") {
         select_extras.push_str(&format!(", {} AS citation", works_citation_expr()));
     }
     if select_extras.is_empty() {
@@ -5476,12 +5439,106 @@ fn run_enrich(args: EnrichArgs) -> Result<()> {
     Ok(())
 }
 
+/// Scan an `*_id_idx.parquet`, returning the matched ids and the (relative) parquet_file
+/// paths that contain them — the set of `requested` ids that appear in the index.
+fn extract_index_lookup(
+    index_file: &Path,
+    requested: &BTreeSet<String>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let f = fs::File::open(index_file).with_context(|| format!("open {}", index_file.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("open parquet {}", index_file.display()))?;
+    let pq = builder.parquet_schema();
+    let leaves: Vec<usize> = (0..pq.num_columns())
+        .filter(|&i| matches!(pq.column(i).name(), "id" | "parquet_file"))
+        .collect();
+    let mask = ProjectionMask::leaves(pq, leaves);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .with_context(|| format!("read parquet {}", index_file.display()))?;
+    let mut matched: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decode {}", index_file.display()))?;
+        let idcol = batch
+            .column_by_name("id")
+            .ok_or_else(|| anyhow!("index {} missing id column", index_file.display()))?;
+        let pfcol = batch
+            .column_by_name("parquet_file")
+            .ok_or_else(|| anyhow!("index {} missing parquet_file column", index_file.display()))?;
+        let ids = string_col_values(idcol, "id")?;
+        let pfs = string_col_values(pfcol, "parquet_file")?;
+        for (ido, pfo) in ids.iter().zip(pfs.iter()) {
+            if let Some(id) = ido {
+                if requested.contains(id) {
+                    matched.insert(id.clone());
+                    if let Some(pf) = pfo {
+                        files.insert(pf.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok((matched, files))
+}
+
+/// Stream each corpus file, keep rows whose `id` is in `matched`, and write all columns
+/// (including nested struct/list columns) to `out`. Returns the number of rows written.
+fn extract_rows_to_parquet(
+    files: &[PathBuf],
+    matched: &BTreeSet<String>,
+    out: &Path,
+) -> Result<u64> {
+    let first =
+        fs::File::open(&files[0]).with_context(|| format!("open {}", files[0].display()))?;
+    let schema = ParquetRecordBatchReaderBuilder::try_new(first)
+        .with_context(|| format!("open parquet {}", files[0].display()))?
+        .schema()
+        .clone();
+    let outf = fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+    let mut writer = ArrowWriter::try_new(outf, schema, Some(snappy_writer_props()))
+        .with_context(|| format!("init writer {}", out.display()))?;
+    let mut written: u64 = 0;
+    for file in files {
+        let f = fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .with_context(|| format!("open parquet {}", file.display()))?
+            .build()
+            .with_context(|| format!("read parquet {}", file.display()))?;
+        for batch in reader {
+            let batch = batch.with_context(|| format!("decode {}", file.display()))?;
+            let idcol = batch
+                .column_by_name("id")
+                .ok_or_else(|| anyhow!("corpus file {} missing id column", file.display()))?;
+            let ids = string_col_values(idcol, "id")?;
+            let mask: BooleanArray = ids
+                .iter()
+                .map(|o| Some(o.as_deref().is_some_and(|s| matched.contains(s))))
+                .collect();
+            let keep = mask.true_count();
+            if keep == 0 {
+                continue;
+            }
+            let filtered = filter_record_batch(&batch, &mask)
+                .with_context(|| format!("filter {}", file.display()))?;
+            writer
+                .write(&filtered)
+                .with_context(|| format!("write {}", out.display()))?;
+            written += keep as u64;
+        }
+    }
+    writer
+        .close()
+        .with_context(|| format!("close {}", out.display()))?;
+    Ok(written)
+}
+
 fn run_extract(args: ExtractArgs) -> Result<()> {
-    let bin = duckdb_bin(&args.shared);
     let parquet_dir = args.shared.parquet_dir.clone();
     let tuning = light_tuning_with_override(args.shared.workers, args.max_memory_mb);
     if args.explain {
-        explain_extract(&args, &bin, &tuning);
+        explain_extract(&args, &tuning);
         return Ok(());
     }
 
@@ -5604,30 +5661,11 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
             continue;
         }
 
-        let req_ids_tmp = reports_dir.join(format!("extract-req-{}-{}.csv", dataset, ts));
-        {
-            let mut wtr = csv::Writer::from_path(&req_ids_tmp)?;
-            wtr.write_record(["id"])?;
-            for id in ids {
-                wtr.write_record([id])?;
+        let (matched_ids, dataset_files) = match extract_index_lookup(&index_file, ids) {
+            Ok((m, rel)) => {
+                let files: BTreeSet<PathBuf> = rel.iter().map(|r| parquet_dir.join(r)).collect();
+                (m, files)
             }
-            wtr.flush()?;
-        }
-
-        let idx_sql = with_session_settings(
-            &format!(
-                "SELECT DISTINCT CAST(i.id AS VARCHAR) AS id, i.parquet_file AS parquet_file \
-                 FROM read_parquet({}) i \
-                 INNER JOIN read_csv_auto({}, HEADER=true, ALL_VARCHAR=true) r \
-                 ON CAST(i.id AS VARCHAR)=CAST(r.id AS VARCHAR);",
-                sql_quote(&index_file.to_string_lossy()),
-                sql_quote(&req_ids_tmp.to_string_lossy())
-            ),
-            tuning.memory_mb,
-            Some(1),
-        );
-        let idx_rows = match run_duckdb_csv(&bin, &idx_sql) {
-            Ok(v) => v,
             Err(e) => {
                 ds.failed += ds.items_scanned.max(1);
                 report.datasets.push(ds);
@@ -5640,21 +5678,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
                     error_message: format!("{e:#}"),
                     suggested_recovery: Some("rebuild index and retry extract".to_string()),
                 });
-                let _ = fs::remove_file(&req_ids_tmp);
                 pb.inc(1);
                 continue;
             }
         };
-        let mut matched_ids = BTreeSet::<String>::new();
-        let mut dataset_files = BTreeSet::<PathBuf>::new();
-        for row in idx_rows {
-            if let Some(id) = row.get("id") {
-                matched_ids.insert(id.clone());
-            }
-            if let Some(rel_file) = row.get("parquet_file") {
-                dataset_files.insert(parquet_dir.join(rel_file));
-            }
-        }
         let missing: Vec<String> = ids
             .iter()
             .filter(|id| !matched_ids.contains(*id))
@@ -5669,70 +5696,40 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         if matched_ids.is_empty() {
             ds.succeeded = 0;
             report.datasets.push(ds);
-            let _ = fs::remove_file(&req_ids_tmp);
             pb.inc(1);
             continue;
         }
 
-        let matched_tmp = reports_dir.join(format!("extract-match-{}-{}.csv", dataset, ts));
-        {
-            let mut wtr = csv::Writer::from_path(&matched_tmp)?;
-            wtr.write_record(["id"])?;
-            for id in &matched_ids {
-                wtr.write_record([id])?;
+        let files_vec: Vec<PathBuf> = dataset_files.iter().cloned().collect();
+        match extract_rows_to_parquet(&files_vec, &matched_ids, &out_path) {
+            Ok(_n) => {
+                ds.succeeded = matched_ids.len() as u64;
+                try_log_dataset(
+                    &parquet_dir,
+                    dataset,
+                    "extract",
+                    &format!(
+                        "done output={} matched={} missing={}",
+                        out_path.display(),
+                        ds.succeeded,
+                        ds.skipped
+                    ),
+                );
             }
-            wtr.flush()?;
-        }
-        let file_list_sql = format!(
-            "[{}]",
-            dataset_files
-                .iter()
-                .map(|p| sql_quote(&p.to_string_lossy()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let copy_sql = with_session_settings(
-            &format!(
-                "COPY (SELECT s.* \
-                 FROM read_parquet({}) s \
-                 INNER JOIN read_csv_auto({}, HEADER=true, ALL_VARCHAR=true) m \
-                 ON CAST(s.id AS VARCHAR)=CAST(m.id AS VARCHAR)) \
-                 TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
-                file_list_sql,
-                sql_quote(&matched_tmp.to_string_lossy()),
-                sql_quote(&out_path.to_string_lossy())
-            ),
-            tuning.memory_mb,
-            Some(1),
-        );
-        if let Err(e) = run_duckdb_sql(&bin, &copy_sql) {
-            ds.failed += matched_ids.len() as u64;
-            report.failures.push(FailureEntry {
-                dataset: dataset.clone(),
-                phase: "extract_write_output".to_string(),
-                rel_path: None,
-                source_path: Some(index_file.to_string_lossy().to_string()),
-                output_path: Some(out_path.to_string_lossy().to_string()),
-                error_message: format!("{e:#}"),
-                suggested_recovery: Some("verify parquet/index and retry extract".to_string()),
-            });
-        } else {
-            ds.succeeded = matched_ids.len() as u64;
-            try_log_dataset(
-                &parquet_dir,
-                dataset,
-                "extract",
-                &format!(
-                    "done output={} matched={} missing={}",
-                    out_path.display(),
-                    ds.succeeded,
-                    ds.skipped
-                ),
-            );
+            Err(e) => {
+                ds.failed += matched_ids.len() as u64;
+                report.failures.push(FailureEntry {
+                    dataset: dataset.clone(),
+                    phase: "extract_write_output".to_string(),
+                    rel_path: None,
+                    source_path: Some(index_file.to_string_lossy().to_string()),
+                    output_path: Some(out_path.to_string_lossy().to_string()),
+                    error_message: format!("{e:#}"),
+                    suggested_recovery: Some("verify parquet/index and retry extract".to_string()),
+                });
+            }
         }
         report.datasets.push(ds);
-        let _ = fs::remove_file(&req_ids_tmp);
-        let _ = fs::remove_file(&matched_tmp);
         pb.inc(1);
     }
     pb.finish_with_message("extract complete");
@@ -6289,13 +6286,12 @@ fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
             .build()
             .context("failed to build rayon thread pool")?;
         let full = args.full;
-        let mem = tuning.memory_mb;
         let results: Vec<Option<FailureEntry>> = pool.install(|| {
             present_files
                 .par_iter()
                 .map(|(ds, local, expected_rc)| {
                     let got = if full {
-                        duckdb_count_parquet(Path::new("duckdb"), local, mem)
+                        parquet_full_rowcount(local)
                     } else {
                         parquet_rowcount_meta(local)
                     };
@@ -6377,45 +6373,21 @@ fn run_validate_download(args: ValidateDownloadArgs) -> Result<()> {
     Ok(())
 }
 
-fn explain_index(
-    args: &IndexArgs,
-    duckdb_bin: &Path,
-    corpus_dir: &Path,
-    index_file: &Path,
-    tuning: &Tuning,
-) {
+fn explain_index(args: &IndexArgs, corpus_dir: &Path, index_file: &Path, tuning: &Tuning) {
     println!("--explain: index");
-    println!("duckdb_bin: {}", duckdb_bin.display());
     println!("corpus_dir: {}", corpus_dir.display());
     println!("index_file: {}", index_file.display());
     println!("overwrite: {}", args.overwrite);
     println!("workers: {}", tuning.workers);
-    println!("memory_mb: {:?}", tuning.memory_mb);
 }
 
-fn explain_extract(args: &ExtractArgs, duckdb_bin: &Path, tuning: &Tuning) {
+fn explain_extract(args: &ExtractArgs, tuning: &Tuning) {
     println!("--explain: extract");
-    println!("duckdb_bin: {}", duckdb_bin.display());
-    println!("snapshot_dir: {}", args.shared.snapshot_dir.display());
     println!("parquet_dir: {}", args.shared.parquet_dir.display());
     println!("dataset filter: {}", args.shared.dataset);
     println!("ids csv: {}", args.ids.display());
     println!("output base: {}", args.output.display());
     println!("workers: {}", tuning.workers);
-    println!("memory_mb: {:?}", tuning.memory_mb);
-}
-
-fn ensure_duckdb_bin(bin: &Path) -> Result<()> {
-    let out = Command::new(bin).arg("--version").output();
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => bail!(
-            "duckdb check failed for {}: {}",
-            bin.display(),
-            String::from_utf8_lossy(&o.stderr)
-        ),
-        Err(e) => bail!("duckdb binary not available at {}: {}", bin.display(), e),
-    }
 }
 
 fn duckdb_bin(shared: &SharedArgs) -> PathBuf {
@@ -6617,17 +6589,83 @@ fn manifest_url_to_local(parquet_dir: &Path, url: &str) -> Option<PathBuf> {
 }
 
 /// Row count of a single parquet file from its footer metadata (no column scan).
+/// Total row count of a parquet file from its footer metadata (no data scan).
 fn parquet_rowcount_meta(path: &Path) -> Result<u64> {
-    let sql = with_session_settings(
-        &format!(
-            "SELECT CAST(SUM(num_rows) AS BIGINT) AS n FROM parquet_file_metadata({})",
-            sql_quote(&path.to_string_lossy())
-        ),
-        None,
-        Some(1),
-    );
-    let row = query_one_row(Path::new("duckdb"), &sql)?;
-    parse_u64(row.get("n"))
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = SerializedFileReader::new(f)
+        .with_context(|| format!("read parquet footer {}", path.display()))?;
+    Ok(reader.metadata().file_metadata().num_rows().max(0) as u64)
+}
+
+/// Total row count by decoding every row group — catches data-page corruption a footer
+/// read would miss. Used by `verify_download --full`.
+fn parquet_full_rowcount(path: &Path) -> Result<u64> {
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("open parquet {}", path.display()))?
+        .build()
+        .with_context(|| format!("read parquet {}", path.display()))?;
+    let mut n: u64 = 0;
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decode parquet {}", path.display()))?;
+        n += batch.num_rows() as u64;
+    }
+    Ok(n)
+}
+
+/// Top-level (root) column names of a parquet file, from footer metadata (no data scan).
+fn parquet_top_level_columns(path: &Path) -> Result<Vec<String>> {
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = SerializedFileReader::new(f)
+        .with_context(|| format!("read parquet footer {}", path.display()))?;
+    Ok(reader
+        .metadata()
+        .file_metadata()
+        .schema()
+        .get_fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect())
+}
+
+/// Distinct non-null values of a string column, reading only that column (projection).
+fn parquet_distinct_strings(path: &Path, col: &str) -> Result<Vec<String>> {
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("open parquet {}", path.display()))?;
+    let pq = builder.parquet_schema();
+    let leaf = (0..pq.num_columns())
+        .find(|&i| pq.column(i).name() == col)
+        .ok_or_else(|| anyhow!("column {col} not found in {}", path.display()))?;
+    let mask = ProjectionMask::leaves(pq, std::iter::once(leaf));
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .with_context(|| format!("read parquet {}", path.display()))?;
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decode parquet {}", path.display()))?;
+        let arr = batch.column(0);
+        if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+            for i in 0..sa.len() {
+                if !sa.is_null(i) {
+                    set.insert(sa.value(i).to_string());
+                }
+            }
+        } else if let Some(sa) = arr.as_any().downcast_ref::<LargeStringArray>() {
+            for i in 0..sa.len() {
+                if !sa.is_null(i) {
+                    set.insert(sa.value(i).to_string());
+                }
+            }
+        } else {
+            bail!(
+                "column {col} is not a UTF8 string column in {}",
+                path.display()
+            );
+        }
+    }
+    Ok(set.into_iter().collect())
 }
 
 /// Build a per-dataset `aws s3 sync` command:
@@ -7608,60 +7646,6 @@ fn report_finalize(report: &mut RunReport) {
 // works_abstract_expr and works_citation_expr are re-exported from openalex_core.
 // See openalex-core/src/lib.rs for the implementations.
 
-fn duckdb_count_parquet(duckdb_bin: &Path, path: &Path, memory_mb: Option<usize>) -> Result<u64> {
-    let sql = with_session_settings(
-        &format!(
-            "SELECT COUNT(*) AS n FROM read_parquet({})",
-            sql_quote(&path.to_string_lossy())
-        ),
-        memory_mb,
-        Some(1),
-    );
-    let row = query_one_row(duckdb_bin, &sql)?;
-    parse_u64(row.get("n"))
-}
-
-fn parse_u64(v: Option<&String>) -> Result<u64> {
-    v.ok_or_else(|| anyhow!("missing numeric value"))?
-        .parse::<u64>()
-        .context("invalid integer in duckdb output")
-}
-
-fn describe_parquet_glob(
-    duckdb_bin: &Path,
-    glob: &str,
-    memory_mb: Option<usize>,
-) -> Result<BTreeMap<String, String>> {
-    let sql = with_session_settings(
-        &format!(
-            "SELECT * FROM (DESCRIBE SELECT * FROM read_parquet({}))",
-            sql_quote(glob)
-        ),
-        memory_mb,
-        Some(1),
-    );
-    describe_query(duckdb_bin, &sql)
-}
-
-fn describe_query(duckdb_bin: &Path, sql: &str) -> Result<BTreeMap<String, String>> {
-    let rows = run_duckdb_csv(duckdb_bin, sql)?;
-    let mut out = BTreeMap::new();
-    for row in rows {
-        let name = row
-            .get("column_name")
-            .or_else(|| row.get("name"))
-            .cloned()
-            .ok_or_else(|| anyhow!("DESCRIBE row missing column name"))?;
-        let ty = row
-            .get("column_type")
-            .or_else(|| row.get("type"))
-            .cloned()
-            .ok_or_else(|| anyhow!("DESCRIBE row missing column type"))?;
-        out.insert(name, ty);
-    }
-    Ok(out)
-}
-
 // normalize_duckdb_type and sql_quote are imported from openalex_core::sql
 // at the top of this file.
 
@@ -7717,62 +7701,6 @@ where
     })
 }
 
-/// Split "SET a=1; SET b=2; QUERY" into (set_prefix_str, query_str).
-fn split_set_prefix(sql: &str) -> (&str, &str) {
-    let mut cursor = sql;
-    loop {
-        let trimmed = cursor.trim_start();
-        if trimmed.is_empty() {
-            let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
-            return (&sql[..off], "");
-        }
-        if trimmed.to_uppercase().starts_with("SET ") {
-            match trimmed.find(';') {
-                Some(i) => cursor = &trimmed[i + 1..],
-                None => {
-                    let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
-                    return (&sql[..off], "");
-                }
-            }
-        } else {
-            let off = trimmed.as_ptr() as usize - sql.as_ptr() as usize;
-            return (&sql[..off], trimmed);
-        }
-    }
-}
-
-fn arrow_col_to_string(col: &dyn duckdb::arrow::array::Array, idx: usize) -> String {
-    use duckdb::arrow::array::*;
-    use duckdb::arrow::datatypes::DataType;
-    if col.is_null(idx) {
-        return String::new();
-    }
-    macro_rules! cast_to_string {
-        ($array_type:ty) => {
-            col.as_any()
-                .downcast_ref::<$array_type>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        };
-    }
-    match col.data_type() {
-        DataType::Utf8 => cast_to_string!(StringArray),
-        DataType::LargeUtf8 => cast_to_string!(LargeStringArray),
-        DataType::Int8 => cast_to_string!(Int8Array),
-        DataType::Int16 => cast_to_string!(Int16Array),
-        DataType::Int32 => cast_to_string!(Int32Array),
-        DataType::Int64 => cast_to_string!(Int64Array),
-        DataType::UInt8 => cast_to_string!(UInt8Array),
-        DataType::UInt16 => cast_to_string!(UInt16Array),
-        DataType::UInt32 => cast_to_string!(UInt32Array),
-        DataType::UInt64 => cast_to_string!(UInt64Array),
-        DataType::Float32 => cast_to_string!(Float32Array),
-        DataType::Float64 => cast_to_string!(Float64Array),
-        DataType::Boolean => cast_to_string!(BooleanArray),
-        _ => String::new(),
-    }
-}
-
 /// Set the DuckDB spill-to-disk directory on the master connection.
 /// Without this, an in-memory DuckDB connection has no temp_directory and will OOM
 /// instead of spilling when it hits the memory_limit.  Must be called before the
@@ -7805,59 +7733,6 @@ fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("duckdb execute failed:\n{}", &sql[..sql.len().min(500)]))
     })
-}
-
-fn with_session_settings(sql: &str, memory_mb: Option<usize>, threads: Option<usize>) -> String {
-    let mut out = String::new();
-    if let Some(t) = threads {
-        out.push_str(&format!("SET threads = {}; ", t.max(1)));
-    }
-    if let Some(mb) = memory_mb {
-        out.push_str(&format!("SET memory_limit='{}MB'; ", mb));
-    }
-    out.push_str(sql);
-    out
-}
-
-fn run_duckdb_csv(_duckdb_bin: &Path, sql: &str) -> Result<Vec<HashMap<String, String>>> {
-    with_conn(|conn| {
-        let (set_part, query_part) = split_set_prefix(sql);
-        if !set_part.is_empty() {
-            conn.execute_batch(set_part).context("duckdb SET failed")?;
-        }
-        let query_part = query_part.trim();
-        if query_part.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut stmt = conn
-            .prepare(query_part)
-            .with_context(|| format!("duckdb prepare failed:\n{query_part}"))?;
-        // query_arrow executes the statement, populating the schema before iteration
-        let mut arrow = stmt
-            .query_arrow([])
-            .with_context(|| format!("duckdb query failed:\n{query_part}"))?;
-        let schema = arrow.get_schema();
-        let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let mut rows = Vec::new();
-        for batch in &mut arrow {
-            for row_i in 0..batch.num_rows() {
-                let mut map = HashMap::new();
-                for (col_i, name) in col_names.iter().enumerate() {
-                    let s = arrow_col_to_string(batch.column(col_i).as_ref(), row_i);
-                    map.insert(name.clone(), s);
-                }
-                rows.push(map);
-            }
-        }
-        Ok(rows)
-    })
-}
-
-fn query_one_row(duckdb_bin: &Path, sql: &str) -> Result<HashMap<String, String>> {
-    let rows = run_duckdb_csv(duckdb_bin, sql)?;
-    rows.into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("query returned no rows"))
 }
 
 fn make_progress_bar(enabled: bool, len: u64, prefix: &str) -> ProgressBar {
