@@ -16,9 +16,6 @@
 pub mod profile;
 pub mod sql;
 
-#[cfg(feature = "conversion")]
-pub mod conversion;
-
 // Convenience re-exports — callers can `use openalex_core::{works_abstract_expr, …}`.
 pub use sql::{normalize_duckdb_type, parse_size_str, sql_quote};
 
