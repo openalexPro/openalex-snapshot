@@ -3143,9 +3143,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
                     "configured memory={} MB on system={} MB (high ratio)",
                     mem, total_mb
                 ),
-                recommendation: Some(
-                    "reduce --workers or --max-memory-mb, or use --profile safe".to_string(),
-                ),
+                recommendation: Some("reduce --workers or --max-memory-mb".to_string()),
             });
         } else {
             findings.push(CheckFinding {
