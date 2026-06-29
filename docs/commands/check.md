@@ -10,7 +10,7 @@ openalex-snapshot check --root-dir . --dataset all
 
 ## What it checks
 
-- dependency binaries (`aws` — `duckdb` is bundled and reported as ok)
+- dependency binaries (`aws`; DuckDB is no longer required — parquet I/O is pure Rust)
 - path writability for root/parquet/metadata
 - download disk requirement (parquet `manifest.json` size + safety margin)
 

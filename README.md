@@ -39,8 +39,8 @@ Default root layout:
 ## Requirements
 
 - `aws` CLI available in `PATH` for `download` / `verify_download`
-- DuckDB is statically linked into the binary (no external `duckdb` needed at runtime; the test
-  suite uses a `duckdb` CLI if present)
+- No DuckDB — all parquet I/O uses the pure-Rust `arrow`/`parquet` crates (the test suite uses a
+  `duckdb` CLI only to build fixtures, if present)
 
 ## Install
 

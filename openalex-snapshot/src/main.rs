@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, RecordBatch,
-    StringArray,
+    Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -13,8 +13,6 @@ use openalex_core::profile::{
     auto_profile_single_worker_safe_memory_mb, derive_stratified_profile_for_ram,
     detect_total_memory_mb, ProfileDef, ProfileKind, ProfileRegistry,
 };
-use openalex_core::sql::sql_quote;
-use openalex_core::{works_abstract_expr_from_json, works_citation_expr};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Compression;
@@ -22,7 +20,6 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::stdout;
@@ -30,7 +27,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -5223,6 +5220,172 @@ fn explain_enrich(args: &EnrichArgs, src_dir: &Path, out_dir: &Path, tuning: &Tu
     println!("overwrite: {}", args.overwrite);
 }
 
+/// Reconstruct a works abstract from the JSON inverted-index string
+/// (`{"word":[pos,...],...}`): emit one (pos, word) per position, sort by position, join
+/// with single spaces. Returns None on null/empty/invalid input. Mirrors the SQL helper.
+/// Parse `{"word":[pos,...],...}` into (word, positions) entries, **preserving duplicate
+/// keys** — OpenAlex sometimes emits the same word as multiple keys, and DuckDB's JSON→MAP
+/// cast keeps them all, so a plain HashMap (last-key-wins) would drop positions.
+fn parse_inverted_index(json: &str) -> Option<Vec<(String, Vec<i64>)>> {
+    use serde::de::{MapAccess, Visitor};
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<(String, Vec<i64>)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an abstract_inverted_index object")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some((k, v)) = map.next_entry::<String, Vec<i64>>()? {
+                out.push((k, v));
+            }
+            Ok(out)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_str(json);
+    serde::Deserializer::deserialize_map(&mut de, V).ok()
+}
+
+fn reconstruct_abstract(json: &str) -> Option<String> {
+    let entries = parse_inverted_index(json)?;
+    let mut pairs: Vec<(i64, &str)> = Vec::new();
+    for (word, positions) in &entries {
+        for &pos in positions {
+            pairs.push((pos, word.as_str()));
+        }
+    }
+    if pairs.is_empty() {
+        return Some(String::new());
+    }
+    // Sort by (pos, word) to match DuckDB's list_sort over {pos, word} structs.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    let mut out = String::new();
+    for (i, (_, w)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    Some(out)
+}
+
+/// Read `display_name` at `idx` from an `authorships[*].author` struct slice, or None if null.
+fn author_display_name(authors_struct: &StructArray, idx: usize) -> Option<String> {
+    let author = authors_struct.column_by_name("author")?;
+    let author = author.as_any().downcast_ref::<StructArray>()?;
+    let dn = author.column_by_name("display_name")?;
+    let dn = dn.as_any().downcast_ref::<StringArray>()?;
+    if dn.is_null(idx) {
+        None
+    } else {
+        Some(dn.value(idx).to_string())
+    }
+}
+
+/// Build the `citation` column for a batch from `authorships` (List<Struct<author:Struct<…>>>)
+/// and `publication_year` (Int32). Mirrors `works_citation_expr`: "A (yr)" / "A & B (yr)" /
+/// "A et al. (yr)"; null year → "n.d."; null/empty authorships or null first author → null.
+fn build_citation_array(authorships: &ArrayRef, years: &ArrayRef, n: usize) -> Result<StringArray> {
+    let list = authorships
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("authorships is not a List column"))?;
+    let yr = years.as_any().downcast_ref::<Int32Array>();
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if list.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let row = list.value(i);
+        let st = match row.as_any().downcast_ref::<StructArray>() {
+            Some(s) => s,
+            None => {
+                out.push(None);
+                continue;
+            }
+        };
+        let len = st.len();
+        if len == 0 {
+            out.push(None);
+            continue;
+        }
+        let year = match yr {
+            Some(a) if !a.is_null(i) => a.value(i).to_string(),
+            _ => "n.d.".to_string(),
+        };
+        let a0 = author_display_name(st, 0);
+        let cite = match (len, a0) {
+            (_, None) => None,
+            (1, Some(a)) => Some(format!("{a} ({year})")),
+            (2, Some(a)) => author_display_name(st, 1).map(|b| format!("{a} & {b} ({year})")),
+            (_, Some(a)) => Some(format!("{a} et al. ({year})")),
+        };
+        out.push(cite);
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Enrich one works file: copy all columns through and append `abstract` and/or `citation`.
+fn enrich_one(src: &Path, out: &Path, add_abstract: bool, add_citation: bool) -> Result<()> {
+    let f = fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("open parquet {}", src.display()))?;
+    let src_schema = builder.schema().clone();
+    let mut fields: Vec<Arc<Field>> = src_schema.fields().iter().cloned().collect();
+    if add_abstract {
+        fields.push(Arc::new(Field::new("abstract", DataType::Utf8, true)));
+    }
+    if add_citation {
+        fields.push(Arc::new(Field::new("citation", DataType::Utf8, true)));
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+    let reader = builder
+        .build()
+        .with_context(|| format!("read parquet {}", src.display()))?;
+    let outf = fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+    let mut writer = ArrowWriter::try_new(outf, out_schema.clone(), Some(snappy_writer_props()))
+        .with_context(|| format!("init writer {}", out.display()))?;
+    for batch in reader {
+        let batch = batch.with_context(|| format!("decode {}", src.display()))?;
+        let n = batch.num_rows();
+        let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+        if add_abstract {
+            let aii = batch
+                .column_by_name("abstract_inverted_index")
+                .ok_or_else(|| anyhow!("missing abstract_inverted_index in {}", src.display()))?;
+            let vals = string_col_values(aii, "abstract_inverted_index")?;
+            let arr: StringArray = vals
+                .iter()
+                .map(|o| o.as_deref().and_then(reconstruct_abstract))
+                .collect();
+            cols.push(Arc::new(arr) as ArrayRef);
+        }
+        if add_citation {
+            let auth = batch
+                .column_by_name("authorships")
+                .ok_or_else(|| anyhow!("missing authorships in {}", src.display()))?;
+            let yr = batch
+                .column_by_name("publication_year")
+                .ok_or_else(|| anyhow!("missing publication_year in {}", src.display()))?;
+            let arr = build_citation_array(auth, yr, n)?;
+            cols.push(Arc::new(arr) as ArrayRef);
+        }
+        let rb = RecordBatch::try_new(out_schema.clone(), cols)
+            .with_context(|| format!("assemble batch for {}", out.display()))?;
+        writer
+            .write(&rb)
+            .with_context(|| format!("write {}", out.display()))?;
+    }
+    writer
+        .close()
+        .with_context(|| format!("close {}", out.display()))?;
+    Ok(())
+}
+
 /// Enrich raw works (`parquet/works_aws/`) into `parquet/works/` with `abstract`
 /// + `citation` columns, mirroring the partition layout. Incremental + row-parity checked.
 fn run_enrich(args: EnrichArgs) -> Result<()> {
@@ -5232,7 +5395,6 @@ fn run_enrich(args: EnrichArgs) -> Result<()> {
             args.dataset
         );
     }
-    let bin = duckdb_bin_from_option(&args.duckdb_bin);
     let parquet_dir = args.root_dir.join("parquet");
     let src_dir = parquet_dir.join("works_aws");
     let out_dir = parquet_dir.join("works");
@@ -5272,31 +5434,18 @@ fn run_enrich(args: EnrichArgs) -> Result<()> {
     // Decide which derived columns the source supports (once, from the first file).
     let cols = parquet_top_level_columns(&files[0])?;
     let has = |c: &str| cols.iter().any(|x| x == c);
-    let mut select_extras = String::new();
-    if has("abstract_inverted_index") {
-        select_extras.push_str(&format!(
-            ", {} AS abstract",
-            works_abstract_expr_from_json()
-        ));
-    }
-    if has("authorships") && has("publication_year") {
-        select_extras.push_str(&format!(", {} AS citation", works_citation_expr()));
-    }
-    if select_extras.is_empty() {
+    let add_abstract = has("abstract_inverted_index");
+    let add_citation = has("authorships") && has("publication_year");
+    if !add_abstract && !add_citation {
         bail!("[enrich] source works parquet has neither abstract_inverted_index nor authorships+publication_year");
     }
 
     let start = Instant::now();
-    // Give DuckDB a spill directory so the per-file COPY can spill instead of OOMing
-    // on the largest works partitions (the abstract reconstruction materialises lists).
-    set_duckdb_temp_directory(&metadata_root(&parquet_dir).join("duckdb_tmp"));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(tuning.workers)
         .build()
         .context("failed to build rayon thread pool")?;
     let pb = make_progress_bar(args.progress, files.len() as u64, "enrich");
-    let extras = select_extras.as_str();
-    let mem = tuning.memory_mb;
     let overwrite = args.overwrite;
 
     let outcomes: Vec<(bool, Option<FailureEntry>)> = pool.install(|| {
@@ -5351,19 +5500,8 @@ fn run_enrich(args: EnrichArgs) -> Result<()> {
                         );
                     }
                 }
-                let mut sql = String::new();
-                sql.push_str("SET preserve_insertion_order = false;");
-                sql.push_str("SET threads = 1;");
-                if let Some(mb) = mem {
-                    sql.push_str(&format!("SET memory_limit='{}MB';", mb));
-                }
-                sql.push_str(&format!(
-                    "COPY (SELECT *{} FROM read_parquet({})) TO {} (FORMAT PARQUET, COMPRESSION SNAPPY);",
-                    extras,
-                    sql_quote(&pf.to_string_lossy()),
-                    sql_quote(&out_file.to_string_lossy())
-                ));
-                if let Err(e) = run_duckdb_sql(&bin, &sql) {
+                if let Err(e) = enrich_one(pf, &out_file, add_abstract, add_citation) {
+                    let _ = fs::remove_file(&out_file);
                     pb.inc(1);
                     return (
                         false,
@@ -7643,98 +7781,6 @@ fn report_finalize(report: &mut RunReport) {
     report.totals_skipped = report.datasets.iter().map(|d| d.skipped).sum();
 }
 
-// works_abstract_expr and works_citation_expr are re-exported from openalex_core.
-// See openalex-core/src/lib.rs for the implementations.
-
-// normalize_duckdb_type and sql_quote are imported from openalex_core::sql
-// at the top of this file.
-
-// ---------------------------------------------------------------------------
-// In-process DuckDB: one shared database, one Connection per rayon/OS thread.
-//
-// DuckDB's bundled library has global state (signal handlers, allocators) that
-// crashes when multiple separate in-memory databases co-exist in the same
-// process. The safe pattern is ONE database shared by all threads, with each
-// thread holding its own Connection cloned from a master via try_clone().
-// ---------------------------------------------------------------------------
-
-static MASTER_CONN: OnceLock<Mutex<duckdb::Connection>> = OnceLock::new();
-
-fn master_conn() -> &'static Mutex<duckdb::Connection> {
-    MASTER_CONN.get_or_init(|| {
-        let conn =
-            duckdb::Connection::open_in_memory().expect("failed to init master DuckDB database");
-        conn.execute_batch(
-            "SET autoinstall_known_extensions=false; SET autoload_known_extensions=true;",
-        )
-        .ok();
-        Mutex::new(conn)
-    })
-}
-
-thread_local! {
-    static DUCKDB_CONN: RefCell<Option<duckdb::Connection>> = const { RefCell::new(None) };
-}
-
-fn with_conn<F, R>(f: F) -> Result<R>
-where
-    F: FnOnce(&duckdb::Connection) -> Result<R>,
-{
-    DUCKDB_CONN.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        if opt.is_none() {
-            // Clone a new connection from the shared master database.
-            // Connections to the same database are independent and safe to use
-            // concurrently; separate databases in the same process are not.
-            let conn = {
-                let master = master_conn().lock().expect("master conn lock poisoned");
-                master
-                    .try_clone()
-                    .context("failed to clone DuckDB connection")?
-            };
-            // One internal DuckDB thread per connection; rayon provides external
-            // file-level parallelism and must not compete with DuckDB's own pool.
-            conn.execute_batch("SET threads=1;").ok();
-            *opt = Some(conn);
-        }
-        f(opt.as_ref().unwrap())
-    })
-}
-
-/// Set the DuckDB spill-to-disk directory on the master connection.
-/// Without this, an in-memory DuckDB connection has no temp_directory and will OOM
-/// instead of spilling when it hits the memory_limit.  Must be called before the
-/// parallel convert pass so all cloned connections inherit the setting.
-///
-/// DuckDB only allows `SET temp_directory` once per process (switching after first use
-/// is rejected with "Cannot switch temporary directory after the current one has been
-/// used"). The OnceLock ensures this is applied exactly once regardless of how many
-/// datasets are converted in a single run.
-fn set_duckdb_temp_directory(dir: &Path) {
-    static TEMP_DIR_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    TEMP_DIR_INIT.get_or_init(|| {
-        if let Err(e) = fs::create_dir_all(dir) {
-            eprintln!(
-                "[duckdb] warning: could not create temp_directory {}: {e}",
-                dir.display()
-            );
-            return;
-        }
-        let master = master_conn().lock().expect("master conn lock poisoned");
-        let path_str = dir.to_string_lossy();
-        if let Err(e) = master.execute_batch(&format!("SET temp_directory='{path_str}';")) {
-            eprintln!("[duckdb] warning: could not set temp_directory={path_str}: {e}");
-        }
-    });
-}
-
-fn run_duckdb_sql(_duckdb_bin: &Path, sql: &str) -> Result<()> {
-    with_conn(|conn| {
-        conn.execute_batch(sql)
-            .with_context(|| format!("duckdb execute failed:\n{}", &sql[..sql.len().min(500)]))
-    })
-}
-
 fn make_progress_bar(enabled: bool, len: u64, prefix: &str) -> ProgressBar {
     if !enabled {
         return ProgressBar::hidden();
@@ -7756,6 +7802,7 @@ mod tests {
     use openalex_core::profile::{
         build_convert_plan, FilePair, STRATIFIED_MAX_WORKERS, STRATIFIED_MIN_PER_WORKER_MB,
     };
+    use openalex_core::sql::sql_quote;
 
     // -----------------------------------------------------------------------
     // Stratified profile machinery
@@ -7998,5 +8045,32 @@ profiles:
             normalize_openalex_id("http://openalex.org/countries/us"),
             "countries/us"
         );
+    }
+
+    #[test]
+    fn test_reconstruct_abstract() {
+        // words ordered by position
+        assert_eq!(
+            reconstruct_abstract(r#"{"world":[1],"hello":[0]}"#).as_deref(),
+            Some("hello world")
+        );
+        // a word repeated at several positions
+        assert_eq!(
+            reconstruct_abstract(r#"{"the":[0,2],"cat":[1]}"#).as_deref(),
+            Some("the cat the")
+        );
+        // DUPLICATE keys must both be kept (not last-wins): "x" at 0 and 2
+        assert_eq!(
+            reconstruct_abstract(r#"{"x":[0],"y":[1],"x":[2]}"#).as_deref(),
+            Some("x y x")
+        );
+        // escaped key (quote) must not drop the abstract
+        assert_eq!(
+            reconstruct_abstract(r#"{"a\"b":[0]}"#).as_deref(),
+            Some("a\"b")
+        );
+        // empty object -> empty string; invalid JSON -> None
+        assert_eq!(reconstruct_abstract("{}").as_deref(), Some(""));
+        assert_eq!(reconstruct_abstract("not json"), None);
     }
 }

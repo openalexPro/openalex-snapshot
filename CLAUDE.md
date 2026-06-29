@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build --release          # production build
 cargo build                    # dev build
-cargo test --all-targets --locked   # run all tests (requires duckdb in PATH)
+cargo test --all-targets --locked   # run all tests (some build parquet fixtures via a `duckdb` CLI if present)
 cargo test <test_name>         # run a single test by name
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-Tests in `tests/cli_smoke.rs` use the `duckdb` CLI binary for parquet verification steps and will skip gracefully if it is not in `PATH`. The main binary does **not** require an external `duckdb` binary — DuckDB is statically linked via the `duckdb` crate (`features = ["bundled", "json", "parquet"]`).
+Some `tests/cli_smoke.rs` cases use a `duckdb` CLI to build small parquet fixtures and skip gracefully if it is not in `PATH`. The binary itself no longer depends on DuckDB — all parquet I/O uses the pure-Rust `arrow` + `parquet` crates.
 
 ## Architecture
 
@@ -30,10 +30,10 @@ The entire CLI is a single binary implemented in `openalex-snapshot/src/main.rs`
 (`s3://openalex/data/parquet/`), so the active pipeline is **download → verify_download → enrich →
 index → extract** with no JSON→parquet conversion. `download` syncs the official parquet per-dataset
 into `<root>/parquet/`, `verify_download` validates it against the published `manifest.json`, and
-`enrich` adds `abstract`/`citation` to works. The `convert` / `verify_convert` / `schema` /
-`verify_schema` commands are **deprecated** (kept compiling for legacy `snapshot/` JSON trees;
-their docs/man pages were removed). Much of the "Conversion/Schema/Profile/auto-repair" detail
-below describes that deprecated path.
+`enrich` adds `abstract`/`citation` to works. The legacy JSON `convert` / `verify_convert` /
+`schema` / `verify_schema` commands and the DuckDB dependency have been **removed**; the pipeline
+is pure Rust over the `arrow`/`parquet` crates. Some "Conversion/Schema/Profile/auto-repair"
+sections below are stale and describe that removed path.
 
 **Path model** — all runtime paths derive from a single `--root-dir`:
 - `<root>/parquet/` — the parquet corpus. `download` syncs each dataset into `parquet/<dataset>/`;
@@ -58,7 +58,15 @@ below describes that deprecated path.
 
 **Extract routing** — IDs are routed by OpenAlex entity prefix (`W`=works, `A`=authors, etc.) and taxonomy namespace prefixes, resolving to the correct dataset index.
 
-**DuckDB** — all parquet reads and writes use the `duckdb` Rust crate in-process (statically linked; no external binary required). A global `Connection` is held in an `OnceLock<Mutex<Connection>>`; each rayon worker thread clones it via `try_clone()` and stores the clone in `thread_local!` storage. Spill-to-disk is enabled via `SET temp_directory` (OnceLock-guarded so it's only applied once per process). The global memory limit (`SET memory_limit`) is set fresh per stratum — see "Profile / stratified plan" below.
+**No DuckDB** — the active pipeline (download/verify_download/enrich/index/extract/verify_index) is
+pure Rust over the `arrow` + `parquet` crates. Row counts come from parquet footer metadata
+(`verify_download`/`verify_index`); `index` reads the `id` column and writes shards with
+`ArrowWriter`; `extract` filters with `arrow::compute::filter`; `enrich` derives `abstract`
+(from the JSON `abstract_inverted_index`, via a duplicate-key-preserving parse) and `citation`
+(from the nested `authorships` struct) in Rust. The `duckdb` crate has been removed from the binary
+(it was the deprecated JSON-convert path); `openalex-core` keeps it only as an optional, default-off
+`conversion` feature for the R package. Some `tests/cli_smoke.rs` cases shell out to a `duckdb` CLI
+to build parquet fixtures and skip if it is absent.
 
 **Profile / stratified plan** — `convert` resolves `--profile <name>` against a `ProfileRegistry` (built-ins `safe`, `stratified-36`, plus optional user profiles from `performance.yaml`). `build_convert_plan(...)` produces a `ConvertPlan { strata: Vec<StratumPlan>, flat }` where each `StratumPlan` carries its own worker count, per-worker memory cap, and the subset of files in that gz-size bucket. `run_convert` iterates the strata, configuring DuckDB memory + rayon pool fresh per stratum. `--workers N` collapses a stratified plan into a single flat pass for compatibility. All other subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`) have no `--profile` flag — they use `light_tuning_with_override(workers, max_memory_mb)` which returns workers = min(detected_cpus, 4) and memory = 8 GiB by default.
 

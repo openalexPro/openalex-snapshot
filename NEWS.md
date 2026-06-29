@@ -4,7 +4,18 @@ All notable changes to `openalex-snapshot` are documented in this file.
 
 ## [Unreleased]
 
-### Removed — deprecated JSON commands; DuckDB use slimmed to `enrich` only
+### Removed — DuckDB dependency dropped entirely
+
+- **The `duckdb` crate is gone from the binary.** `enrich` is now pure Rust: the abstract is
+  reconstructed from the JSON `abstract_inverted_index` with a duplicate-key-preserving parser, and
+  the citation is built from the nested `authorships` struct — output verified **byte-identical** to
+  the previous DuckDB SQL across a full 142,844-row works partition (and ~12× faster). With `index`,
+  `extract`, and the verify commands already ported (below), no code path uses DuckDB, so the
+  bundled-DuckDB dependency was removed. Result: a ~11 MB binary (down from ~100 MB+), much faster
+  builds, and no C++ toolchain needed to build the CLI. `openalex-core` keeps `duckdb` only behind an
+  optional, default-off `conversion` feature for the R package.
+
+### Removed — deprecated JSON commands; parquet/arrow port
 
 - **Deleted the deprecated `convert` / `verify_convert` / `schema` / `verify_schema` subcommands**
   and ~3,600 lines of JSON-pipeline machinery (schema inference + cache, the convert profile

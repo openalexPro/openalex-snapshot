@@ -13,7 +13,6 @@ anyhow = { workspace = true }
 arrow = "58"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
-duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 parquet = "58"
 indicatif = "0.17"
 flate2 = "1"
