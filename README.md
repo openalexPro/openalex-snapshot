@@ -41,6 +41,7 @@ Default root layout:
 - `aws` CLI available in `PATH` for `download` / `verify_download`
 - No DuckDB — all parquet I/O uses the pure-Rust `arrow`/`parquet` crates (the test suite uses a
   `duckdb` CLI only to build fixtures, if present)
+- Building from source needs only a Rust toolchain — no C/C++ compiler (the binary is ~11 MB)
 
 ## Install
 
@@ -58,7 +59,7 @@ cargo build --release
 ```bash
 git clone https://github.com/openalexPro/openalex-snapshot.git
 cd openalex-snapshot
-cargo install --path .
+cargo install --path openalex-snapshot   # this repo is a workspace; install the binary crate
 openalex-snapshot --help
 ```
 
