@@ -19,7 +19,5 @@ nav:
       - progress: commands/progress.md
       - skills: commands/skills.md
   - Operations:
-      - Low memory: operations/low-memory.md
-      - Cache precompute: operations/cache-precompute.md
       - Recovery: operations/recovery.md
   - Troubleshooting: troubleshooting.md

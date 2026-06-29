@@ -7,7 +7,7 @@
 
 # openalex-snapshot
 
-Standalone CLI for OpenAlex snapshot download, conversion, verification, schema inspection, and indexing.
+Standalone CLI for the OpenAlex parquet snapshot: download, verify, enrich, index, and extract.
 
 ## AI Contribution
 
@@ -30,9 +30,6 @@ parquet-native pipeline — no JSON→parquet conversion:
 - `extract` — targeted parquet extraction by OpenAlex IDs
 - `report` / `progress` — run-state visibility
 - `all` — config-driven orchestration (`download → verify_download → index → verify_index`)
-
-The `convert` / `verify_convert` / `schema` / `verify_schema` commands are **deprecated** —
-they operated on the old JSON.GZ snapshot and remain only for legacy `snapshot/` trees.
 
 Default root layout:
 - parquet corpus: `<root>/parquet` (raw works in `<root>/parquet/works_aws`, enriched in
@@ -109,8 +106,6 @@ Argument precedence (highest wins):
 - `prune-reports`
 - `progress`
 - `skills`
-
-Deprecated (legacy JSON snapshot): `convert`, `verify_convert`, `schema`, `verify_schema`.
 
 ## Quick examples
 

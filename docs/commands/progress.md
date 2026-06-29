@@ -7,7 +7,7 @@ Monitor active/recent runs from report/log files, including from another termina
 ```bash
 openalex-snapshot progress --root-dir /data
 openalex-snapshot progress --root-dir /data --once
-openalex-snapshot progress --root-dir /data --command convert --dataset works
+openalex-snapshot progress --root-dir /data --command index --dataset works
 ```
 
 ## Notes

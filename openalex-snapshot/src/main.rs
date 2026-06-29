@@ -5106,7 +5106,6 @@ fn run_all(args: AllArgs, cfg: &AppConfig, performance_config: Option<&Path>) ->
         return Ok(());
     }
     let _lock = acquire_lock(&parquet_dir, "all")?;
-    let _ = archive_completed_run(&parquet_dir, &snapshot_dir);
     let _ = cleanup_command_reports(&parquet_dir, "all");
 
     let mut report_args = BTreeMap::new();
@@ -5829,8 +5828,7 @@ fn run_convert(args: ConvertArgs, performance_config: Option<&Path>) -> Result<(
         args.max_memory_mb,
     );
 
-    // Capture auto-repair targets BEFORE `archive_completed_run` moves the
-    // latest verify_convert report out of `reports/` into archived/.  The
+    // Capture auto-repair targets from the latest verify_convert report; the
     // per-dataset loop below consumes these to delete the flagged parquets.
     let auto_repair_targets_by_dataset: std::collections::HashMap<String, Vec<RepairTarget>> =
         if args.auto_repair && args.input_files.is_empty() {
@@ -5850,7 +5848,6 @@ fn run_convert(args: ConvertArgs, performance_config: Option<&Path>) -> Result<(
             std::collections::HashMap::new()
         };
 
-    let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "convert");
     let mut report_args = BTreeMap::new();
@@ -6582,9 +6579,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
         let _ = cleanup_command_reports(&parquet_dir, "index");
         let _ = cleanup_command_dataset_logs(&parquet_dir, "index");
     }
-    let snapshot_dir = args.root_dir.join("snapshot");
     let _lock = acquire_lock(&parquet_dir, "index")?;
-    let _ = archive_completed_run(&parquet_dir, &snapshot_dir);
     let mut report_args = BTreeMap::new();
     report_args.insert(
         "root_dir".to_string(),
@@ -7462,7 +7457,6 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
         return Ok(());
     }
     let _lock = acquire_lock(&args.shared.parquet_dir, "verify")?;
-    let _ = archive_completed_run(&args.shared.parquet_dir, &args.shared.snapshot_dir);
     let _ = cleanup_command_reports(&args.shared.parquet_dir, "verify_convert");
     let _ = cleanup_command_dataset_logs(&args.shared.parquet_dir, "verify");
     let mut report_args = BTreeMap::new();
@@ -9568,10 +9562,6 @@ fn dataset_index_verify_dir(parquet_dir: &Path, dataset: &str) -> PathBuf {
     dataset_metadata_dir(parquet_dir, dataset).join("index-verify")
 }
 
-fn archived_root_dir(parquet_dir: &Path) -> PathBuf {
-    metadata_root(parquet_dir).join("archived")
-}
-
 fn lock_file_path(parquet_dir: &Path) -> PathBuf {
     metadata_root(parquet_dir).join("openalex-snapshot.lock")
 }
@@ -9823,70 +9813,6 @@ fn check_lock(parquet_dir: &Path) -> Option<LockInfo> {
     } else {
         None // stale lock
     }
-}
-
-fn archive_completed_run(parquet_dir: &Path, _snapshot_dir: &Path) -> Result<()> {
-    let meta_root = metadata_root(parquet_dir);
-    let archived_root = archived_root_dir(parquet_dir);
-    let timestamp = now_unix();
-    let archive_base = archived_root.join(timestamp.to_string());
-
-    let mut moved_any = false;
-
-    // Move finished reports
-    let reports_dir = global_reports_dir(parquet_dir);
-    if reports_dir.exists() {
-        for entry in fs::read_dir(&reports_dir)?.flatten() {
-            let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            let txt = fs::read_to_string(&p).unwrap_or_default();
-            if let Ok(r) = serde_json::from_str::<RunReport>(&txt) {
-                if r.finished_at_unix.is_some() {
-                    let dest = archive_base.join("reports").join(p.file_name().unwrap());
-                    fs::create_dir_all(dest.parent().unwrap())?;
-                    fs::rename(&p, &dest)?;
-                    moved_any = true;
-                }
-            }
-        }
-    }
-
-    // Move dataset logs — schemata/ is intentionally excluded: it is a persistent
-    // cache that should survive across runs and must not be archived or removed.
-    if meta_root.exists() {
-        for entry in fs::read_dir(&meta_root)?.flatten() {
-            let ds_dir = entry.path();
-            if !ds_dir.is_dir() {
-                continue;
-            }
-            let name = ds_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(name, "reports" | "archived" | "download") {
-                continue;
-            }
-            for step in &["convert", "conversion-verify", "index", "index-verify"] {
-                let log_dir = ds_dir.join(step);
-                if log_dir.exists() {
-                    let dest = archive_base.join(name).join(step);
-                    fs::create_dir_all(&dest)?;
-                    for f in fs::read_dir(&log_dir)?.flatten() {
-                        let fp = f.path();
-                        if fp.is_file() {
-                            fs::rename(&fp, dest.join(fp.file_name().unwrap()))?;
-                            moved_any = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !moved_any && archive_base.exists() {
-        let _ = fs::remove_dir_all(&archive_base);
-    }
-
-    Ok(())
 }
 
 fn check_path_writable(path: &Path) -> Result<()> {

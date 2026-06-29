@@ -69,6 +69,3 @@ Checks every file against the published `manifest.json` (presence + size + row c
 ```bash
 ./target/release/openalex-snapshot all --config ./openalex-snapshot.yaml
 ```
-
-> The `convert` / `verify_convert` / `schema` / `verify_schema` commands are deprecated — they
-> operated on the old JSON.GZ snapshot and remain only for legacy `snapshot/` trees.

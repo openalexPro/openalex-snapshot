@@ -11,7 +11,6 @@ Argument precedence (highest wins): CLI arguments > config subcommand section > 
 
 OpenAlex now publishes the snapshot natively in parquet, so `openalex-snapshot` is a
 parquet-native pipeline: **download → verify_download → (auto) enrich → index → extract**.
-The JSON→parquet `convert`/`schema` commands are deprecated (kept for legacy snapshots).
 
 Recommended page order:
 
