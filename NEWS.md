@@ -15,6 +15,15 @@ All notable changes to `openalex-snapshot` are documented in this file.
   builds, and no C++ toolchain needed to build the CLI. `openalex-core` keeps `duckdb` only behind an
   optional, default-off `conversion` feature for the R package.
 
+### Removed — orphaned convert profile system from the CLI
+
+- Dropped the CLI's stratified-profile feature, now unused since `convert` is gone:
+  `config --create-profiles` / `--list-profiles`, the global `--performance-config` flag, the
+  `performance.yaml` generator, and the now-no-op `all --retry` flag (hidden, still accepted).
+  `openalex-core::profile` (the planner types) is retained for the R package; the CLI no longer
+  references it beyond `detect_total_memory_mb` (used by `check`). Config back-compat preserved:
+  legacy `profile:` / `convert:` keys still parse and are ignored.
+
 ### Removed — deprecated JSON commands; parquet/arrow port
 
 - **Deleted the deprecated `convert` / `verify_convert` / `schema` / `verify_schema` subcommands**

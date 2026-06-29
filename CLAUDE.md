@@ -32,8 +32,7 @@ index → extract** with no JSON→parquet conversion. `download` syncs the offi
 into `<root>/parquet/`, `verify_download` validates it against the published `manifest.json`, and
 `enrich` adds `abstract`/`citation` to works. The legacy JSON `convert` / `verify_convert` /
 `schema` / `verify_schema` commands and the DuckDB dependency have been **removed**; the pipeline
-is pure Rust over the `arrow`/`parquet` crates. Some "Conversion/Schema/Profile/auto-repair"
-sections below are stale and describe that removed path.
+is pure Rust over the `arrow`/`parquet` crates.
 
 **Path model** — all runtime paths derive from a single `--root-dir`:
 - `<root>/parquet/` — the parquet corpus. `download` syncs each dataset into `parquet/<dataset>/`;
@@ -68,9 +67,11 @@ pure Rust over the `arrow` + `parquet` crates. Row counts come from parquet foot
 `conversion` feature for the R package. Some `tests/cli_smoke.rs` cases shell out to a `duckdb` CLI
 to build parquet fixtures and skip if it is absent.
 
-**Profile / stratified plan** — `convert` resolves `--profile <name>` against a `ProfileRegistry` (built-ins `safe`, `stratified-36`, plus optional user profiles from `performance.yaml`). `build_convert_plan(...)` produces a `ConvertPlan { strata: Vec<StratumPlan>, flat }` where each `StratumPlan` carries its own worker count, per-worker memory cap, and the subset of files in that gz-size bucket. `run_convert` iterates the strata, configuring DuckDB memory + rayon pool fresh per stratum. `--workers N` collapses a stratified plan into a single flat pass for compatibility. All other subcommands (`verify_convert`, `schema`, `verify_schema`, `index`, `extract`, `verify_index`, `validate_download`, `check`) have no `--profile` flag — they use `light_tuning_with_override(workers, max_memory_mb)` which returns workers = min(detected_cpus, 4) and memory = 8 GiB by default.
-
-**Convert auto-repair** — at startup `run_convert` (before `archive_completed_run`) reads the latest `verify_convert` report and collects `RepairTarget`s via `verify_failures_for_repair` (helper around `collect_repair_targets`). For each target whose output parquet exists, the parquet is deleted so the normal *skip-if-exists* filter re-includes the file in the convert pass. There is no separate `repair_convert` subcommand. Disabled by `--auto-repair=false` or when `--input-file` is given.
+**Tuning** — every command uses `light_tuning_with_override(workers, max_memory_mb)`: workers =
+`min(detected_cpus, 4)` and an 8 GiB default cap unless overridden by `--workers` / `--max-memory-mb`.
+`rayon` provides per-file parallelism; memory stays modest because parquet I/O streams one file at a
+time. (The old convert stratified-profile system is gone; `openalex-core::profile` still ships the
+planner types for the R package, but the CLI no longer uses them.)
 
 ## Invariants (from ARCHITECTURE_AND_DECISIONS.md)
 
