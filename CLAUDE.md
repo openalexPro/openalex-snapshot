@@ -19,12 +19,12 @@ Some `tests/cli_smoke.rs` cases use a `duckdb` CLI to build small parquet fixtur
 
 This repository is a **Cargo workspace** with two members:
 
-- **`openalex-core/`** — shared library crate (`openalex-core`).  Starts with two pure SQL-string helpers (`works_abstract_expr`, `works_citation_expr`) extracted from the CLI.  This is where logic shared with the future `openalexPro` R package (via `extendr`) will live.
-- **`openalex-snapshot/`** — the CLI binary (`openalex-snapshot`).  Its source is `openalex-snapshot/src/main.rs` (~10,400 lines).  The binary name, install path, and behaviour are unchanged.
+- **`openalex-core/`** — shared library crate (`openalex-core`).  Home of the **parquet pipeline operations** — the single implementation called by both the CLI and the `openalexPro` R package (via `extendr`), so the two produce identical results.  Modules: `parquetio` (footer row counts, columns, distinct values, UTF-8 collection, SNAPPY writer props), `manifest` (the OpenAlex parquet `manifest.json` model + corpus path mapping), `enrich` (`reconstruct_abstract` + `build_citation_array` + `enrich_one`), `index` (`build_index_shard` + `concat_index_shards` + `id_block_of`), `extract` (`extract_index_lookup` + `extract_rows_to_parquet`).  Plus `profile` (convert-plan planner) and `sql` (SQL string helpers) used by the R package.  The crate depends on `arrow` + `parquet`.
+- **`openalex-snapshot/`** — the CLI binary (`openalex-snapshot`).  Its source is `openalex-snapshot/src/main.rs` (~6,900 lines).  It is a **thin orchestration layer**: clap argument parsing, config precedence, locking, rayon per-file fan-out, progress bars, and JSON reporting — the per-file/row work is delegated to `openalex-core`.  The CLI no longer depends on `arrow`/`parquet` directly (it reaches them through `openalex-core`).  The binary name, install path, and behaviour are unchanged.
 
-The binary is built with `cargo build --release -p openalex-snapshot`; the release workflow passes `-p openalex-snapshot` to avoid building the library unnecessarily.  All workspace members are tested with `cargo test --workspace`.
+The binary is built with `cargo build --release -p openalex-snapshot`; the release workflow passes `-p openalex-snapshot`.  All workspace members are tested with `cargo test --workspace`.
 
-The entire CLI is a single binary implemented in `openalex-snapshot/src/main.rs`. There are no additional library crates or submodules beyond `openalex-core`.
+The CLI is a single binary in `openalex-snapshot/src/main.rs`; all reusable pipeline logic lives in `openalex-core`.
 
 **Parquet-native pipeline (current)** — OpenAlex now publishes the snapshot natively in parquet
 (`s3://openalex/data/parquet/`), so the active pipeline is **download → verify_download → enrich →
@@ -58,14 +58,15 @@ is pure Rust over the `arrow`/`parquet` crates.
 **Extract routing** — IDs are routed by OpenAlex entity prefix (`W`=works, `A`=authors, etc.) and taxonomy namespace prefixes, resolving to the correct dataset index.
 
 **No DuckDB** — the active pipeline (download/verify_download/enrich/index/extract/verify_index) is
-pure Rust over the `arrow` + `parquet` crates. Row counts come from parquet footer metadata
-(`verify_download`/`verify_index`); `index` reads the `id` column and writes shards with
-`ArrowWriter`; `extract` filters with `arrow::compute::filter`; `enrich` derives `abstract`
-(from the JSON `abstract_inverted_index`, via a duplicate-key-preserving parse) and `citation`
-(from the nested `authorships` struct) in Rust. The `duckdb` crate has been removed from the binary
-(it was the deprecated JSON-convert path); `openalex-core` keeps it only as an optional, default-off
-`conversion` feature for the R package. Some `tests/cli_smoke.rs` cases shell out to a `duckdb` CLI
-to build parquet fixtures and skip if it is absent.
+pure Rust over the `arrow` + `parquet` crates, implemented in **`openalex-core`** (see the module
+list above). Row counts come from parquet footer metadata (`openalex_core::parquetio`); `index`
+reads the `id` column and writes shards with `ArrowWriter` (`openalex_core::index`); `extract`
+filters with `arrow::compute::filter_record_batch` (`openalex_core::extract`); `enrich` derives
+`abstract` (from the JSON `abstract_inverted_index`, via a duplicate-key-preserving parse) and
+`citation` (from the nested `authorships` struct) in `openalex_core::enrich`. The `duckdb` crate has
+been removed from **both** crates entirely (it was only the deprecated JSON-convert path). Some
+`tests/cli_smoke.rs` cases shell out to a `duckdb` CLI to build parquet fixtures and skip if it is
+absent.
 
 **Tuning** — every command uses `light_tuning_with_override(workers, max_memory_mb)`: workers =
 `min(detected_cpus, 4)` and an 8 GiB default cap unless overridden by `--workers` / `--max-memory-mb`.

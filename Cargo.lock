@@ -972,7 +972,10 @@ name = "openalex-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "arrow",
+ "parquet",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 
@@ -981,14 +984,12 @@ name = "openalex-snapshot"
 version = "0.5.0"
 dependencies = [
  "anyhow",
- "arrow",
  "chrono",
  "clap",
  "csv",
  "flate2",
  "indicatif",
  "openalex-core",
- "parquet",
  "rand",
  "rayon",
  "serde",

@@ -5,6 +5,18 @@
 //!
 //! # Modules
 //!
+//! Pure-Rust parquet pipeline operations — the shared implementation behind both
+//! the CLI and the R package (the CLI is a thin orchestration layer over these):
+//!
+//! - [`parquetio`] — parquet I/O primitives (row counts, columns, distinct values,
+//!   UTF-8 collection, writer settings)
+//! - [`manifest`] — the official OpenAlex parquet manifest model + corpus path mapping
+//! - [`enrich`] — derive `abstract` + `citation` for works
+//! - [`index`] — build the per-dataset id index
+//! - [`extract`] — look up ids in an index and write matching rows
+//!
+//! Planning / SQL helpers (used by the R package):
+//!
 //! - [`profile`] — performance-profile types, registry, and convert-plan builder
 //! - [`sql`] — SQL string utilities (`normalize_duckdb_type`, `sql_quote`, `parse_size_str`)
 //!
@@ -13,6 +25,11 @@
 //! The two works-enrichment SQL helpers are re-exported at the crate root for
 //! backwards compatibility and convenience.
 
+pub mod enrich;
+pub mod extract;
+pub mod index;
+pub mod manifest;
+pub mod parquetio;
 pub mod profile;
 pub mod sql;
 
