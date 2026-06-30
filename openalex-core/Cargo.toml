@@ -2,9 +2,12 @@
 name = "openalex-core"
 version = { workspace = true }
 edition = { workspace = true }
-description = "Core logic shared between the openalex-snapshot CLI and the openalexPro R package (profile planner + SQL string helpers)"
+description = "Core logic shared between the openalex-snapshot CLI and the openalexPro R package (parquet pipeline ops + profile planner + SQL string helpers)"
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = "58"
+parquet = "58"
 serde = { workspace = true }
+serde_json = "1"
 serde_yaml = { workspace = true }

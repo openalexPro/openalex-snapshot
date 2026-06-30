@@ -2,7 +2,20 @@
 
 All notable changes to `openalex-snapshot` are documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-06-29
+
+### Changed — pipeline logic moved into the `openalex-core` library
+
+- **The parquet pipeline operations now live in `openalex-core`, not the CLI.** The download/
+  verify/enrich/index/extract algorithms were extracted from `openalex-snapshot/src/main.rs` into
+  library modules — `openalex_core::{parquetio, manifest, enrich, index, extract}` — so the CLI and
+  the `openalexPro` R package (via `extendr`) call **one shared implementation** and produce
+  identical results. The CLI is now a thin orchestration layer (clap parsing, config precedence,
+  locking, rayon fan-out, progress bars, JSON reports) that delegates the per-file/row work to the
+  library. No behaviour change: the CLI output and all commands are unchanged.
+- **`arrow`/`parquet` are no longer direct dependencies of the CLI crate** — it reaches them through
+  `openalex-core`. `main.rs` dropped ~540 lines of moved code. New `openalex-core` unit tests cover
+  abstract reconstruction (ordering, duplicate words, escaped keys, empty/invalid input).
 
 ### Removed — DuckDB dependency dropped entirely
 
@@ -12,8 +25,8 @@ All notable changes to `openalex-snapshot` are documented in this file.
   the previous DuckDB SQL across a full 142,844-row works partition (and ~12× faster). With `index`,
   `extract`, and the verify commands already ported (below), no code path uses DuckDB, so the
   bundled-DuckDB dependency was removed. Result: a ~11 MB binary (down from ~100 MB+), much faster
-  builds, and no C++ toolchain needed to build the CLI. `openalex-core` keeps `duckdb` only behind an
-  optional, default-off `conversion` feature for the R package.
+  builds, and no C++ toolchain needed to build the CLI. `duckdb` has been removed from `openalex-core`
+  as well — neither workspace crate depends on it.
 
 ### Removed — orphaned convert profile system from the CLI
 
